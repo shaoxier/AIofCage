@@ -69,6 +69,9 @@ func TestRemoteServiceToolListAndNoAuth(t *testing.T) {
 	if _, err := app.SaveMCPService(SaveMCPServiceRequest{ID: view.ID, Name: "Docs", URL: "https://example.com/mcp"}); err == nil {
 		t.Fatal("switching to a token without giving one must be refused")
 	}
+	if _, err := app.SaveMCPService(SaveMCPServiceRequest{ID: view.ID, Name: "Docs", URL: "https://example.com/mcp", Token: "short"}); err == nil {
+		t.Fatal("a token this short would be masked inside ordinary words of every reply")
+	}
 	if _, err := app.SaveMCPService(SaveMCPServiceRequest{ID: view.ID, Name: "Docs", URL: "https://example.com/mcp", Token: "docs-token-1"}); err != nil {
 		t.Fatal(err)
 	}

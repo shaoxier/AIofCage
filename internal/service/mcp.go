@@ -94,18 +94,33 @@ func (a *App) SaveMCPService(request SaveMCPServiceRequest) (MCPServiceView, err
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	existing := request.ID != ""
+	id := request.ID
+	if !existing {
+		var err error
+		if id, err = a.newMCPID(request.Preset); err != nil {
+			return MCPServiceView{}, err
+		}
+	}
+	// The address and the credential change together under the service's lock, which readers of
+	// the pair also take (runtime.ServiceLock). It is released before tools are listed.
+	unlock, err := a.store.LockOperation(ctx, runtime.ServiceLock(id), true)
+	if err != nil {
+		return MCPServiceView{}, err
+	}
+	locked := true
+	defer func() {
+		if locked {
+			unlock()
+		}
+	}()
 	var service mcp.Service
 	if existing {
-		current, err := a.store.MCPService(request.ID)
+		current, err := a.store.MCPService(id)
 		if err != nil {
 			return MCPServiceView{}, err
 		}
 		service = current
 	} else {
-		id, err := a.newMCPID(request.Preset)
-		if err != nil {
-			return MCPServiceView{}, err
-		}
 		// The kind is fixed at creation: switching between HTTP and connector services would leave
 		// sandboxes configured for the other one.
 		service = mcp.Service{ID: id, Kind: mcp.Kind(request.Kind), KeyRef: mcp.KeyRefFor(id), CreatedAt: a.now().UTC()}
@@ -164,6 +179,9 @@ func (a *App) SaveMCPService(request SaveMCPServiceRequest) (MCPServiceView, err
 			}
 		}
 	case token != "":
+		if len(token) < mcp.MinTokenLength {
+			return MCPServiceView{}, fmt.Errorf("访问令牌太短（至少 %d 个字符），请检查是否粘贴完整", mcp.MinTokenLength)
+		}
 		if err := a.vault.Put(ctx, service.KeyRef, []byte(token)); err != nil {
 			return MCPServiceView{}, err
 		}
@@ -181,6 +199,8 @@ func (a *App) SaveMCPService(request SaveMCPServiceRequest) (MCPServiceView, err
 	if err := a.store.SaveMCPService(service); err != nil {
 		return MCPServiceView{}, err
 	}
+	unlock()
+	locked = false
 	toolsErr := ""
 	if !service.IsConnector() && !service.IsOAuth() {
 		// The user chooses tools per sandbox, so list them now; OAuth services list after login.
@@ -204,32 +224,49 @@ func (a *App) SaveMCPService(request SaveMCPServiceRequest) (MCPServiceView, err
 // listServiceTools fetches a remote service's tools from the Mac with the credential the app
 // holds and saves them as the service's tool list. Grants in sandboxes are not changed.
 func (a *App) listServiceTools(ctx context.Context, service mcp.Service) (mcp.Service, error) {
-	upstream, err := service.Upstream()
+	current, token, err := a.serviceCredential(ctx, service.ID)
 	if err != nil {
 		return service, err
 	}
-	token := ""
-	switch {
-	case service.Auth == mcp.AuthNone:
-	case service.IsOAuth():
-		creds, _, err := a.oauth.AccessToken(ctx, a.vault, service.KeyRef, time.Minute)
-		if err != nil {
-			return service, err
-		}
-		token = creds.AccessToken
-	default:
-		data, err := a.vault.Read(ctx, service.KeyRef)
-		if err != nil {
-			return service, errors.New("钥匙串中没有这个服务的令牌")
-		}
-		token = string(data)
-		clear(data)
+	upstream, err := current.Upstream()
+	if err != nil {
+		return service, err
 	}
 	tools, err := mcp.ListTools(ctx, a.client, upstream, token)
 	if err != nil {
-		return service, toolListError(service, err)
+		return service, toolListError(current, err)
 	}
-	return runtime.SaveCatalog(a.store, service, tools, a.now())
+	return runtime.SaveCatalog(a.store, current, tools, a.now())
+}
+
+// serviceCredential reads a remote service and its token together, under the service's lock, so
+// the token goes only to the address it was saved for.
+func (a *App) serviceCredential(ctx context.Context, id string) (mcp.Service, string, error) {
+	unlock, err := a.store.LockOperation(ctx, runtime.ServiceLock(id), true)
+	if err != nil {
+		return mcp.Service{}, "", err
+	}
+	defer unlock()
+	service, err := a.store.MCPService(id)
+	if err != nil {
+		return service, "", err
+	}
+	switch {
+	case service.Auth == mcp.AuthNone:
+		return service, "", nil
+	case service.IsOAuth():
+		creds, _, err := a.oauth.AccessToken(ctx, a.vault, service.KeyRef, time.Minute)
+		if err != nil {
+			return service, "", err
+		}
+		return service, creds.AccessToken, nil
+	}
+	data, err := a.vault.Read(ctx, service.KeyRef)
+	if err != nil {
+		return service, "", errors.New("钥匙串中没有这个服务的令牌")
+	}
+	defer clear(data)
+	return service, string(data), nil
 }
 
 func hostOf(service mcp.Service) string {
