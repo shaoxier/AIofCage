@@ -27,6 +27,7 @@
 - [2026-10-25 智能体镜像下载加速](2026-10-25-agent-image-mirror.md)：Debian 系统依赖换源、实际构建耗时与适用范围。
 - [2026-10-25 设置页精简](2026-10-25-settings-cleanup.md)
 - [2026-10-25 沙箱重置](2026-10-25-sandbox-reset.md)：保留项目和配置，按选项保留 Agent home 并恢复运行。
+- [2026-10-30 DMG 安装包](2026-10-30-dmg-release.md)：`make dmg` 打包、SHA256 校验、签名与 Gatekeeper 检查；另一台 Mac 试装待用户完成。
 
 ## 安全、MCP 与授权
 

@@ -19,6 +19,17 @@ make dev                 # Wails 热开发
 make gatekeeper-linux connector-linux
 ```
 
+## 打包安装包
+
+```bash
+make dmg                 # 生成 bin/AiofCage-<版本>-arm64.dmg 和同名 .sha256
+```
+
+- 版本号取自 `packaging/macos/Info.plist` 的 `CFBundleShortVersionString`，同时写进应用里显示的版本；发新版本前先改它。
+- 脚本 `scripts/package-dmg.sh` 会校验应用签名，打包后再挂载检查一遍：镜像完整，里面的应用签名仍然有效。
+- 安装包只有本机临时签名（ad-hoc），没有 Developer ID 证书和公证。用户第一次打开要在「隐私与安全性」里放行，步骤见 [README](../README.md#下载安装)。
+- 发布到 GitHub Releases 前需团队确认，上传 `.dmg` 和 `.sha256` 两个文件。
+
 ## 检查与测试
 
 ```bash

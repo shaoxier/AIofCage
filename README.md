@@ -8,6 +8,42 @@ Qiniu Builder Day 2026 · 赛道一参赛项目，当前面向 macOS Apple Silic
 
 [观看 Ai of Cage 产品演示](docs/demo/demo.mp4)（约 4 分 26 秒，MP4，24 MiB）。
 
+## 下载安装
+
+支持 **macOS 13+、Apple Silicon（M 系列芯片）**。安装包发布在 [Releases](https://github.com/shaoxier/AIofCage/releases) 页面；还没有可下载的版本时，请按下一节从源码安装，或在源码目录运行 `make dmg` 自己打包。
+
+**1. 安装运行环境**
+
+沙箱运行在专用虚拟机里，需要先用 [Homebrew](https://brew.sh/) 安装 Colima 和 Docker CLI，应用的新手教程也会检查：
+
+```bash
+brew install colima docker
+```
+
+**2. 下载并核对**
+
+下载 `AiofCage-版本号-arm64.dmg` 和同名的 `.sha256` 文件，放在同一个文件夹，在终端里核对（把版本号换成实际下载的）：
+
+```bash
+cd ~/Downloads && shasum -a 256 -c AiofCage-0.1.0-arm64.dmg.sha256
+```
+
+显示 `OK` 再继续。
+
+**3. 安装**
+
+双击打开 DMG，把 Ai of Cage 拖进「应用程序」文件夹。
+
+**4. 第一次打开**
+
+安装包没有经过 Apple 公证，第一次双击时系统会提示无法验证它是否包含恶意软件：
+
+1. 点「完成」关掉提示。
+2. 打开「系统设置 → 隐私与安全性」，在页面下方找到“已阻止 Ai of Cage”。
+3. 点「仍要打开」，输入开机密码确认。
+
+之后就可以正常双击打开。首次启动沙箱时会自动下载虚拟机镜像和所选智能体，请保持联网。
+
 ## 从源码安装
 
 支持 **macOS 13+、Apple Silicon（M 系列芯片）**。
