@@ -231,6 +231,10 @@ export function MCPChoices({ services, selected, filesystem, permissions = {}, o
   </div>`;
 }
 
+// 标签只转述服务自己的标注：标了只读、标了可能删改，或者什么都没标。
+const toolTag = (tool) => tool?.read_only ? html`<span class="pill ok">标注只读</span>`
+  : tool?.destructive ? html`<span class="pill bad">标注可能删改</span>` : html`<span class="pill warn">未标注只读</span>`;
+
 function ToolGrant({ service, granted, onToggle, onSet }) {
   const tools = service.tools ?? [];
   const remote = isRemote(service);
@@ -240,7 +244,7 @@ function ToolGrant({ service, granted, onToggle, onSet }) {
   }
   const info = Object.fromEntries((service.catalog ?? []).map((tool) => [tool.name, tool]));
   return html`<div class="mcp-tool-list" aria-label=${`${service.name} 工具权限`}>
-    <div class="mcp-tool-head"><small>允许的工具（${granted.length}/${tools.length}）${remote ? "。“只读”是服务自己的标注，新工具默认不开放" : ""}</small>
+    <div class="mcp-tool-head"><small>允许的工具（${granted.length}/${tools.length}）${remote ? "。标签转述服务自己的标注，新工具默认不开放" : ""}</small>
       ${remote && html`<span class="mcp-tool-actions">
         <button type="button" class="link" onClick=${() => onSet([...(service.default_tools ?? [])])}>只开放标注只读的</button>
         <button type="button" class="link" onClick=${() => onSet([])}>全部关闭</button></span>`}</div>
@@ -248,7 +252,7 @@ function ToolGrant({ service, granted, onToggle, onSet }) {
       ${tools.map((tool) => html`<label class="check" title=${info[tool]?.description ?? ""}>
         <input type="checkbox" checked=${granted.includes(tool)} onChange=${() => onToggle(tool)} />
         <span class="mono">${tool}</span>${info[tool]?.title ? html`<span class="muted">${info[tool].title}</span>` : ""}
-        ${remote && (info[tool]?.read_only ? html`<span class="pill ok">只读</span>` : html`<span class="pill warn">可能写入</span>`)}</label>`)}
+        ${remote && toolTag(info[tool])}</label>`)}
     </div>
   </div>`;
 }
