@@ -12,6 +12,7 @@ import (
 	"github.com/shaoxier/AIofCage/internal/vault"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -34,6 +35,21 @@ func TestLeakCheckSplitsOAuthCredentials(t *testing.T) {
 		if !found[want] {
 			t.Fatalf("leak check would miss %s; it compares %d values", want, len(values))
 		}
+	}
+}
+
+// A database service may keep its password under its own Keychain item.
+func TestLeakCheckReadsTheServiceKeychainItem(t *testing.T) {
+	app, secrets, st := newApp(t)
+	service := mcp.Service{ID: "shopdb", Name: "Shop", Kind: mcp.KindPostgres, URL: "postgresql://reader@localhost/shop",
+		KeyRef: "aiofcage-mcp-shopdb-readonly"}
+	if err := st.SaveMCPService(service); err != nil {
+		t.Fatal(err)
+	}
+	secrets[service.KeyRef] = []byte("synthetic-database-password-0001")
+	values, err := app.realSecrets(context.Background(), sandbox.Sandbox{ID: "sbx-1", MCP: []string{"shopdb"}})
+	if err != nil || !slices.Contains(values, "synthetic-database-password-0001") {
+		t.Fatalf("leak check must compare the item the service records: %v %v", values, err)
 	}
 }
 
