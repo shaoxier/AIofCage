@@ -14,7 +14,6 @@ import (
 	"github.com/shaoxier/AIofCage/internal/mcp"
 	"github.com/shaoxier/AIofCage/internal/oauth"
 	"github.com/shaoxier/AIofCage/internal/runtime"
-	"github.com/shaoxier/AIofCage/internal/sandbox"
 )
 
 // MCPServiceView never contains the token, only whether one is saved. For OAuth services
@@ -121,11 +120,14 @@ func (a *App) SaveMCPService(request SaveMCPServiceRequest) (MCPServiceView, err
 	if request.NoAuth {
 		service.Auth = mcp.AuthNone
 	}
-	moved := existing && service.URL != previousURL && !service.IsConnector()
-	if moved {
-		// Another address may be another server: its tools must be listed again before any is granted.
+	previousHost := hostOf(mcp.Service{URL: previousURL})
+	if existing && service.URL != previousURL && !service.IsConnector() {
+		// Another address may be another server: its tools must be listed again, and grants made
+		// for the old address no longer apply (they are bound to it, see runtime.Grant).
 		service.Catalog, service.CatalogAt = nil, nil
 	}
+	// A credential belongs to the host it was given for and never follows the service elsewhere.
+	newHost := existing && !service.IsConnector() && hostOf(service) != previousHost
 	token := strings.TrimSpace(request.Token)
 	missing := "请填写访问令牌"
 	if service.IsConnector() && !service.IsBuiltin() {
@@ -148,7 +150,13 @@ func (a *App) SaveMCPService(request SaveMCPServiceRequest) (MCPServiceView, err
 			return MCPServiceView{}, errors.New("内置案例无需凭据")
 		}
 	case service.IsOAuth():
-		// Credentials come only from AuthorizeMCPService; a pasted token is ignored.
+		// Credentials come only from AuthorizeMCPService; a pasted token is ignored. A login made
+		// for another host is removed, so the next step is a new login.
+		if newHost {
+			if err := a.vault.Delete(ctx, service.KeyRef); err != nil {
+				return MCPServiceView{}, err
+			}
+		}
 	case service.Auth == mcp.AuthNone:
 		if existing {
 			if err := a.vault.Delete(ctx, service.KeyRef); err != nil {
@@ -161,6 +169,8 @@ func (a *App) SaveMCPService(request SaveMCPServiceRequest) (MCPServiceView, err
 		}
 	case !existing:
 		return MCPServiceView{}, errors.New(missing)
+	case newHost:
+		return MCPServiceView{}, errors.New("MCP 地址换了域名，请重新填写访问令牌；原来的令牌不会发给新地址")
 	default:
 		if saved, err := a.vault.Read(ctx, service.KeyRef); err != nil {
 			return MCPServiceView{}, errors.New(missing)
@@ -170,11 +180,6 @@ func (a *App) SaveMCPService(request SaveMCPServiceRequest) (MCPServiceView, err
 	}
 	if err := a.store.SaveMCPService(service); err != nil {
 		return MCPServiceView{}, err
-	}
-	if moved {
-		if err := a.dropGrants(service.ID); err != nil {
-			return MCPServiceView{}, err
-		}
 	}
 	toolsErr := ""
 	if !service.IsConnector() && !service.IsOAuth() {
@@ -194,28 +199,6 @@ func (a *App) SaveMCPService(request SaveMCPServiceRequest) (MCPServiceView, err
 		return view, a.refreshSandboxesUsing(ctx, service.ID)
 	}
 	return view, nil
-}
-
-// dropGrants removes the tool grants sandboxes hold for a service whose address changed: they
-// name tools of the old server, even when the new one has tools of the same name. Each sandbox
-// then gets the new server's read-only default once its tools are listed.
-func (a *App) dropGrants(serviceID string) error {
-	sandboxes, err := a.store.Sandboxes()
-	if err != nil {
-		return err
-	}
-	for _, sbx := range sandboxes {
-		if _, granted := sbx.MCPPermissions[serviceID]; !granted {
-			continue
-		}
-		if err := a.store.UpdateSandbox(sbx.ID, func(s *sandbox.Sandbox) error {
-			delete(s.MCPPermissions, serviceID)
-			return nil
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // listServiceTools fetches a remote service's tools from the Mac with the credential the app
@@ -246,9 +229,12 @@ func (a *App) listServiceTools(ctx context.Context, service mcp.Service) (mcp.Se
 	if err != nil {
 		return service, toolListError(service, err)
 	}
-	now := a.now().UTC()
-	service.Catalog, service.CatalogAt = tools, &now
-	return service, a.store.SaveMCPService(service)
+	return runtime.SaveCatalog(a.store, service, tools, a.now())
+}
+
+func hostOf(service mcp.Service) string {
+	host, _, _ := service.Endpoint()
+	return host
 }
 
 // toolListError says in plain words why a remote service's tools could not be listed.

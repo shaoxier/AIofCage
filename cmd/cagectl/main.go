@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -207,6 +208,20 @@ func run(args []string) error {
 		service, err := st.MCPService(args[2])
 		if err != nil {
 			return err
+		}
+		// Like the desktop app: a service still enabled in a sandbox is not deleted.
+		sandboxes, err := st.Sandboxes()
+		if err != nil {
+			return err
+		}
+		var users []string
+		for _, sbx := range sandboxes {
+			if slices.Contains(sbx.MCP, service.ID) {
+				users = append(users, sbx.Name)
+			}
+		}
+		if len(users) > 0 {
+			return fmt.Errorf("还有沙箱在用这个 MCP 服务（%s），请先用 cagectl sandbox mcp 停用它", strings.Join(users, "、"))
 		}
 		if err := st.DeleteMCPService(service.ID); err != nil {
 			return err
@@ -461,6 +476,11 @@ func mcpAdd(ctx context.Context, st *store.Store, keychain *vault.Keychain, args
 	}
 	service.Kind = mcp.Kind(*kind)
 	service.KeyRef, service.CreatedAt = mcp.KeyRefFor(service.ID), time.Now().UTC()
+	// Replacing a service in place would hand sandboxes' grants and the saved credential to
+	// another address or kind; remove it first instead.
+	if _, err := st.MCPService(service.ID); err == nil {
+		return fmt.Errorf("MCP 服务 %s 已存在；要改地址或类型，请先 cagectl mcp rm %s 再添加", service.ID, service.ID)
+	}
 	if *noAuth {
 		service.Auth = mcp.AuthNone
 	}

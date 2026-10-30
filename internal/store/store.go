@@ -153,6 +153,26 @@ func (s *Store) SaveMCPService(item mcp.Service) error {
 	})
 }
 
+// UpdateMCPService changes one stored service under the store lock, so a change based on what
+// the store holds now cannot overwrite an edit made in the meantime.
+func (s *Store) UpdateMCPService(id string, change func(*mcp.Service) error) error {
+	return s.update("mcp.json", func(raw *[]json.RawMessage) error {
+		var items []mcp.Service
+		if err := decodeAll(*raw, &items); err != nil {
+			return err
+		}
+		for i := range items {
+			if items[i].ID == id {
+				if err := change(&items[i]); err != nil {
+					return err
+				}
+				return encodeAll(items, raw)
+			}
+		}
+		return fmt.Errorf("MCP 服务 %s %w", id, ErrNotFound)
+	})
+}
+
 func (s *Store) DeleteMCPService(id string) error {
 	return s.update("mcp.json", func(raw *[]json.RawMessage) error {
 		var items []mcp.Service

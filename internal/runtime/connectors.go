@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/shaoxier/AIofCage/internal/gatekeeper"
 	"github.com/shaoxier/AIofCage/internal/mcp"
 	"github.com/shaoxier/AIofCage/internal/sandbox"
+	"github.com/shaoxier/AIofCage/internal/store"
 )
 
 const (
@@ -31,20 +33,37 @@ func connectorName(sandboxID, serviceID string) string {
 	return "aiofcage-" + sandboxID + "-mcp-" + serviceID
 }
 
-// grantedTools is the sandbox's grant for a service. Sandboxes saved before grants existed get
-// the service's default tools until a grant is pinned (see pinGrants).
-func grantedTools(sbx sandbox.Sandbox, service mcp.Service) []string {
-	if tools, ok := sbx.MCPPermissions[service.ID]; ok {
-		return append([]string{}, tools...)
+// Grant returns the tools a sandbox may call on a service, and whether they come from the
+// sandbox's own grant. A remote service's grant applies only to the address it was made for.
+// Without one (e.g. a sandbox saved before grants existed, or a service that moved) the service's
+// default tools apply until a grant is pinned (see prepareRemote).
+func Grant(sbx sandbox.Sandbox, service mcp.Service) ([]string, bool) {
+	tools, ok := sbx.MCPPermissions[service.ID]
+	if ok && !service.IsConnector() {
+		upstream, err := service.Upstream()
+		ok = err == nil && sbx.MCPGrantURLs[service.ID] == upstream
 	}
-	return service.DefaultTools()
+	if !ok {
+		return service.DefaultTools(), false
+	}
+	return append([]string{}, tools...), true
+}
+
+func grantedTools(sbx sandbox.Sandbox, service mcp.Service) []string {
+	tools, _ := Grant(sbx, service)
+	return tools
 }
 
 // prepareRemote lists the tools of remote services whose tools were never listed, and pins the
-// default grant of services the sandbox uses without one once their tools are known: tools a
-// service adds later must not be granted without the user choosing them. services is updated.
+// default grant of services the sandbox uses without an applicable grant once their tools are
+// known: tools a service adds later must not be granted without the user choosing them. It runs
+// under the sandbox's lifecycle lock, like every other writer of grants. services is updated.
 func (m *Manager) prepareRemote(ctx context.Context, sbx sandbox.Sandbox, services map[string]mcp.Service) (sandbox.Sandbox, error) {
-	pins := map[string][]string{}
+	type pin struct {
+		tools []string
+		url   string
+	}
+	pins := map[string]pin{}
 	for _, id := range sortedKeys(services) {
 		service := services[id]
 		if service.IsConnector() {
@@ -59,28 +78,30 @@ func (m *Manager) prepareRemote(ctx context.Context, sbx sandbox.Sandbox, servic
 				services[id] = listed
 			}
 		}
-		if _, ok := sbx.MCPPermissions[id]; !ok && service.CatalogAt != nil {
-			pins[id] = service.DefaultTools()
+		upstream, err := service.Upstream()
+		if _, explicit := Grant(sbx, service); !explicit && err == nil && service.CatalogAt != nil {
+			pins[id] = pin{tools: service.DefaultTools(), url: upstream}
 		}
 	}
 	if len(pins) == 0 {
 		return sbx, nil
 	}
-	pin := func(s *sandbox.Sandbox) {
+	apply := func(s *sandbox.Sandbox) {
 		if s.MCPPermissions == nil {
 			s.MCPPermissions = map[string][]string{}
 		}
-		for id, tools := range pins {
-			if _, ok := s.MCPPermissions[id]; !ok {
-				s.MCPPermissions[id] = append([]string{}, tools...)
-			}
+		if s.MCPGrantURLs == nil {
+			s.MCPGrantURLs = map[string]string{}
+		}
+		for id, p := range pins {
+			s.MCPPermissions[id], s.MCPGrantURLs[id] = append([]string{}, p.tools...), p.url
 		}
 	}
-	if err := m.store.UpdateSandbox(sbx.ID, func(s *sandbox.Sandbox) error { pin(s); return nil }); err != nil {
+	if err := m.store.UpdateSandbox(sbx.ID, func(s *sandbox.Sandbox) error { apply(s); return nil }); err != nil {
 		return sbx, err
 	}
-	sbx.MCPPermissions = cloneMCPPermissions(sbx.MCPPermissions)
-	pin(&sbx)
+	sbx.MCPPermissions, sbx.MCPGrantURLs = cloneMCPPermissions(sbx.MCPPermissions), maps.Clone(sbx.MCPGrantURLs)
+	apply(&sbx)
 	return sbx, nil
 }
 
@@ -101,9 +122,33 @@ func (m *Manager) ListTools(ctx context.Context, service mcp.Service) (mcp.Servi
 	if err != nil {
 		return service, err
 	}
-	now := time.Now().UTC()
-	service.Catalog, service.CatalogAt = tools, &now
-	return service, m.store.SaveMCPService(service)
+	return SaveCatalog(m.store, service, tools, time.Now())
+}
+
+// ErrServiceChanged means a service was edited while its tools were being listed; the list
+// belongs to the old address and is discarded.
+var ErrServiceChanged = errors.New("MCP 服务在获取工具列表期间被修改了，请重新获取")
+
+// SaveCatalog records the tools listed from service's address. Only the tool list is written,
+// and only while the stored service still has that address and credential kind, so an edit
+// made in the meantime is neither overwritten nor given the old server's tools.
+func SaveCatalog(st *store.Store, service mcp.Service, tools []mcp.Tool, now time.Time) (mcp.Service, error) {
+	listedFrom, err := service.Upstream()
+	if err != nil {
+		return service, err
+	}
+	stamp := now.UTC()
+	var saved mcp.Service
+	err = st.UpdateMCPService(service.ID, func(current *mcp.Service) error {
+		upstream, err := current.Upstream()
+		if err != nil || upstream != listedFrom || current.Auth != service.Auth || current.Kind != service.Kind {
+			return ErrServiceChanged
+		}
+		current.Catalog, current.CatalogAt = tools, &stamp
+		saved = *current
+		return nil
+	})
+	return saved, err
 }
 
 func connectorServices(services map[string]mcp.Service) []mcp.Service {

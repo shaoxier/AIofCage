@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/shaoxier/AIofCage/internal/gatekeeper"
 	"github.com/shaoxier/AIofCage/internal/mcp"
@@ -138,8 +139,9 @@ func TestRemoteToolsArePinnedSoNewToolsStayClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	saved, _ := st.Sandbox(sbx.ID)
-	if fmt.Sprint(saved.MCPPermissions) != "map[docs:[search_docs]]" || fmt.Sprint(sbx.MCPPermissions) != "map[docs:[search_docs]]" {
-		t.Fatalf("the read-only default must be pinned once the tools are known: %v %v", saved.MCPPermissions, sbx.MCPPermissions)
+	if fmt.Sprint(saved.MCPPermissions) != "map[docs:[search_docs]]" || fmt.Sprint(sbx.MCPPermissions) != "map[docs:[search_docs]]" ||
+		saved.MCPGrantURLs["docs"] != "https://docs.example.com/mcp" {
+		t.Fatalf("the read-only default must be pinned, with its address, once the tools are known: %+v %v", saved, sbx.MCPPermissions)
 	}
 	if listed, _ := st.MCPService("docs"); len(listed.Catalog) != 2 || listed.CatalogAt == nil {
 		t.Fatalf("catalog not saved: %+v", listed)
@@ -154,19 +156,70 @@ func TestRemoteToolsArePinnedSoNewToolsStayClosed(t *testing.T) {
 	if err != nil || len(config.Connectors) != 1 || fmt.Sprint(config.Connectors[0].Tools) != "[search_docs]" || config.Connectors[0].Token != "" {
 		t.Fatalf("a new tool must stay closed until the user grants it: %+v %v", config.Connectors, err)
 	}
-	permissions, err := m.normalizeMCPPermissions([]string{"docs"}, nil, map[string][]string{"docs": {"search_docs", "gone_tool"}})
-	if err != nil || fmt.Sprint(permissions) != "map[docs:[search_docs]]" {
-		t.Fatalf("existing grants are kept, minus tools the service no longer offers: %v %v", permissions, err)
+	current := sandbox.Sandbox{MCPPermissions: map[string][]string{"docs": {"search_docs", "gone_tool"}},
+		MCPGrantURLs: map[string]string{"docs": "https://docs.example.com/mcp"}}
+	permissions, urls, err := m.normalizeMCPPermissions([]string{"docs"}, nil, current)
+	if err != nil || fmt.Sprint(permissions) != "map[docs:[search_docs]]" || urls["docs"] != "https://docs.example.com/mcp" {
+		t.Fatalf("existing grants are kept, minus tools the service no longer offers: %v %v %v", permissions, urls, err)
 	}
-	if _, err := m.normalizeMCPPermissions([]string{"docs"}, map[string][]string{"docs": {"rm_rf"}}, nil); err == nil {
+	if _, _, err := m.normalizeMCPPermissions([]string{"docs"}, map[string][]string{"docs": {"rm_rf"}}, sandbox.Sandbox{}); err == nil {
 		t.Fatal("a requested tool the service does not offer must be refused")
 	}
 	fresh := mcp.Service{ID: "fresh", Name: "Fresh", URL: "https://docs.example.com/mcp", KeyRef: mcp.KeyRefFor("fresh"), Auth: mcp.AuthNone}
 	if err := st.SaveMCPService(fresh); err != nil {
 		t.Fatal(err)
 	}
-	permissions, err = m.normalizeMCPPermissions([]string{"fresh"}, nil, nil)
+	permissions, _, err = m.normalizeMCPPermissions([]string{"fresh"}, nil, sandbox.Sandbox{})
 	if _, pinned := permissions["fresh"]; err != nil || pinned {
 		t.Fatalf("a service whose tools are unknown is pinned later, not with an empty grant: %v %v", permissions, err)
+	}
+}
+
+// A grant is bound to the address it was made for: however a service is moved (the app, cagectl,
+// or an edit racing a start), the new server never inherits the old server's grant.
+func TestRemoteGrantDoesNotFollowTheServiceToAnotherAddress(t *testing.T) {
+	var tools atomic.Value
+	tools.Store(`[{"name":"search","annotations":{"readOnlyHint":true}},{"name":"update_page"}]`)
+	m, st, _ := newRemoteManager(t, mcpServer(t, &tools))
+	now := time.Now().UTC()
+	docs := mcp.Service{ID: "docs", Name: "Docs", URL: "https://docs.example.com/mcp", KeyRef: mcp.KeyRefFor("docs"), Auth: mcp.AuthNone,
+		Catalog: []mcp.Tool{{Name: "search", ReadOnly: true}, {Name: "update_page"}}, CatalogAt: &now}
+	if err := st.SaveMCPService(docs); err != nil {
+		t.Fatal(err)
+	}
+	sbx := sandbox.Sandbox{ID: "sbx-remote03", Name: "r", ProjectPath: "/Users/u/CageWorkspace/p", MCP: []string{"docs"},
+		Bindings: []sandbox.Binding{{Agent: session.Codex}}, Placeholders: map[string]string{"mcp:docs": "cage-DDDDDDDDDDDDDDDDDDDD"},
+		MCPPermissions: map[string][]string{"docs": {"search", "update_page"}}, MCPGrantURLs: map[string]string{"docs": "https://docs.example.com/mcp"}}
+	if err := st.SaveSandbox(sbx); err != nil {
+		t.Fatal(err)
+	}
+	// Moved without touching grants, as `cagectl mcp add` with the same ID used to do. The new
+	// server lists the same names, but only marks search read-only.
+	moved := docs
+	moved.URL, moved.Catalog, moved.CatalogAt = "https://other.example.com/mcp", []mcp.Tool{{Name: "search"}, {Name: "update_page"}}, &now
+	if err := st.SaveMCPService(moved); err != nil {
+		t.Fatal(err)
+	}
+	if tools, explicit := Grant(sbx, moved); explicit || len(tools) != 0 {
+		t.Fatalf("a grant for the old address must not apply: %v %v", tools, explicit)
+	}
+	config, err := m.gateConfig(context.Background(), sbx, nil, nil)
+	if err != nil || len(config.Connectors) != 1 || config.Connectors[0].Upstream != "https://other.example.com/mcp" || len(config.Connectors[0].Tools) != 0 {
+		t.Fatalf("the moved service starts with its own default, here nothing: %+v %v", config.Connectors, err)
+	}
+	services, _ := m.servicesFor(sbx)
+	pinned, err := m.prepareRemote(context.Background(), sbx, services)
+	if err != nil || pinned.MCPGrantURLs["docs"] != "https://other.example.com/mcp" || len(pinned.MCPPermissions["docs"]) != 0 {
+		t.Fatalf("the new address gets its own pinned default: %+v %v", pinned, err)
+	}
+	// A tool list fetched from the old address is discarded once the service has moved.
+	if _, err := SaveCatalog(st, docs, []mcp.Tool{{Name: "search", ReadOnly: true}}, time.Now()); !errors.Is(err, ErrServiceChanged) {
+		t.Fatalf("a stale tool list must not overwrite the edit: %v", err)
+	}
+	if current, _ := st.MCPService("docs"); current.URL != "https://other.example.com/mcp" || current.Catalog[0].ReadOnly {
+		t.Fatalf("the edit must survive: %+v", current)
+	}
+	if err := m.checkServices(make([]string, MaxMCPServices+1)); err == nil {
+		t.Fatal("more MCP services than the gatekeeper routes must be refused up front")
 	}
 }
