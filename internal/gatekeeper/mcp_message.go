@@ -148,57 +148,30 @@ func (r mcpReply) mask(data []byte) []byte {
 	return redactSecret(data, r.connector.Token)
 }
 
-// maskDecoded hides the token where a message writes it with JSON escapes (e.g. "\u0067hp_" or
-// "\/"): a byte comparison misses those, but the agent's JSON parser decodes them.
-func (r mcpReply) maskDecoded(data []byte) ([]byte, error) {
+// errTokenInReply refuses a reply that writes the service token with JSON escapes (e.g.
+// "\u0067hp_" or "\/"): a byte comparison misses those, but the agent's JSON parser decodes
+// them. Such a reply is withheld rather than rewritten, so masking never rebuilds a large reply.
+var errTokenInReply = errors.New("mcp_token_in_reply")
+
+// checkDecoded scans a JSON message token by token, so memory stays bounded by its largest
+// string, and refuses it when a decoded key or string holds the token. A leading byte order mark
+// is skipped, as the agent's client skips it.
+func (r mcpReply) checkDecoded(data []byte) error {
 	secret := r.connector.Token
-	if !r.connector.Remote || secret == "" {
-		return data, nil
+	if !r.connector.Remote || secret == "" || !bytes.Contains(data, []byte{'\\'}) {
+		return nil // without an escape, the byte mask already saw every string as decoded
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder := json.NewDecoder(bytes.NewReader(bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))))
 	decoder.UseNumber()
-	var value any
-	if decoder.Decode(&value) != nil {
-		return data, nil // not JSON: nothing a JSON parser would decode
-	}
-	if !holdsSecret(value, secret) {
-		return data, nil
-	}
-	return marshalCompact(maskValue(value, secret))
-}
-
-func holdsSecret(value any, secret string) bool {
-	switch v := value.(type) {
-	case string:
-		return strings.Contains(v, secret)
-	case []any:
-		return slices.ContainsFunc(v, func(item any) bool { return holdsSecret(item, secret) })
-	case map[string]any:
-		for key, item := range v {
-			if strings.Contains(key, secret) || holdsSecret(item, secret) {
-				return true
-			}
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return nil // the end, or not JSON: nothing a JSON parser would decode
+		}
+		if text, ok := token.(string); ok && strings.Contains(text, secret) {
+			return errTokenInReply
 		}
 	}
-	return false
-}
-
-func maskValue(value any, secret string) any {
-	switch v := value.(type) {
-	case string:
-		return string(redactSecret([]byte(v), secret))
-	case []any:
-		for i, item := range v {
-			v[i] = maskValue(item, secret)
-		}
-	case map[string]any:
-		masked := make(map[string]any, len(v))
-		for key, item := range v {
-			masked[string(redactSecret([]byte(key), secret))] = maskValue(item, secret)
-		}
-		return masked
-	}
-	return value
 }
 
 // body rewrites a JSON response: one message, or a batch of them.
@@ -237,7 +210,8 @@ func (r mcpReply) message(data []byte) ([]byte, error) {
 		}
 		out = rewritten
 	}
-	return r.maskDecoded(r.mask(out))
+	out = r.mask(out)
+	return out, r.checkDecoded(out)
 }
 
 // rewriteResult applies change to a response's result; errors and notifications pass unchanged.
@@ -370,10 +344,16 @@ func copyEvents(w http.ResponseWriter, body io.Reader, rewrite func([]byte) ([]b
 			}
 		default:
 			name, value, _ := bytes.Cut(line, []byte(":"))
-			if string(name) != "data" {
+			switch string(name) {
+			case "data":
+			case "event", "id", "retry":
 				event.Write(line)
 				event.WriteByte('\n')
-				break
+				continue
+			default:
+				// Clients ignore unknown fields; relaying them unchecked could let a client that
+				// reads the stream differently (e.g. one more byte order mark) see unfiltered data.
+				continue
 			}
 			if hasData {
 				data.WriteByte('\n')

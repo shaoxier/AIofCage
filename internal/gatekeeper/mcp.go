@@ -1,6 +1,7 @@
 package gatekeeper
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"compress/zlib"
@@ -193,13 +194,17 @@ func writeRPCError(w http.ResponseWriter, msg mcpMessage, status int, reason, te
 // decodedBody undoes an answer's content encoding; an encoding the standard library cannot
 // decode is refused rather than passed on unchecked.
 func decodedBody(resp *http.Response) (io.Reader, error) {
+	body := bufio.NewReader(resp.Body)
+	if _, err := body.Peek(1); err == io.EOF {
+		return body, nil // an empty answer (e.g. 202) has nothing to decode, whatever it declares
+	}
 	switch strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))) {
 	case "", "identity":
-		return resp.Body, nil
+		return body, nil
 	case "gzip", "x-gzip":
-		return gzip.NewReader(resp.Body)
+		return gzip.NewReader(body)
 	case "deflate":
-		return zlib.NewReader(resp.Body)
+		return zlib.NewReader(body)
 	}
 	return nil, errMCPReply
 }
@@ -295,6 +300,9 @@ func (g *Gate) forwardMCP(w http.ResponseWriter, r *http.Request, connector Conn
 		// Error bodies may echo the request; decode and mask the token before returning them.
 		var withheld bool
 		out, withheld = readErrorBody(resp, connector.Token)
+		if reply.checkDecoded(out) != nil {
+			out, withheld = []byte(withheldBody), true
+		}
 		if withheld {
 			resp.Header.Set("Content-Type", "application/json")
 		}
@@ -309,6 +317,10 @@ func (g *Gate) forwardMCP(w http.ResponseWriter, r *http.Request, connector Conn
 		}
 		if err == nil && len(bytes.TrimSpace(data)) > 0 {
 			data, err = reply.body(data)
+		}
+		if errors.Is(err, errTokenInReply) {
+			g.failRPC(w, msg, event, started, "mcp_token_in_reply", "MCP 服务的回复里带有服务令牌，AIofCage 门卫没有转交")
+			return
 		}
 		if err != nil {
 			g.failRPC(w, msg, event, started, "mcp_invalid_reply", "MCP 服务的回复无法检查，AIofCage 门卫没有转交")
@@ -343,6 +355,10 @@ func (g *Gate) forwardMCP(w http.ResponseWriter, r *http.Request, connector Conn
 	failed := status >= 400 && !(r.Method == http.MethodDelete && status == http.StatusNotFound)
 	if failed {
 		event.Decision, event.ReasonCode = audit.DecisionError, "upstream_status"
+	} else if errors.Is(copyErr, errTokenInReply) {
+		// The stream was cut before an event that carried the service token.
+		event.Decision, event.ReasonCode = audit.DecisionError, "mcp_token_in_reply"
+		failed = true
 	} else if errors.Is(copyErr, errMCPReply) {
 		// The stream was cut where an event could not be checked.
 		event.Decision, event.ReasonCode = audit.DecisionError, "mcp_invalid_reply"
