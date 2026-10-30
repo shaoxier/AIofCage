@@ -25,8 +25,11 @@ make gatekeeper-linux connector-linux
 make dmg                 # 生成 bin/AiofCage-<版本>-arm64.dmg 和同名 .sha256
 ```
 
-- 版本号取自 `packaging/macos/Info.plist` 的 `CFBundleShortVersionString`，同时写进应用里显示的版本；发新版本前先改它。
-- 脚本 `scripts/package-dmg.sh` 会校验应用签名，打包后再挂载检查一遍：镜像完整，里面的应用签名仍然有效。
+- 版本号取自 `packaging/macos/Info.plist` 的 `CFBundleShortVersionString`，同时写进应用里显示的版本；发新版本前把它和 `CFBundleVersion` 一起改掉。命令行传 `VERSION=` 不起作用。
+- 应用固定按 arm64 构建。打包脚本 `scripts/package-dmg.sh` 由 `make dmg` 调用，会检查以下几项，全部通过后才把安装包放进 `bin/`：
+  - 应用的版本和文件名一致，架构是 arm64，签名有效；
+  - 镜像完整，挂载后里面的应用签名仍然有效。
+- 打包结束时会显示来自哪个提交；工作区有未提交的改动时会给出警告，这样的安装包不要发布。
 - 安装包只有本机临时签名（ad-hoc），没有 Developer ID 证书和公证。用户第一次打开要在「隐私与安全性」里放行，步骤见 [README](../README.md#下载安装)。
 - 发布到 GitHub Releases 前需团队确认，上传 `.dmg` 和 `.sha256` 两个文件。
 
