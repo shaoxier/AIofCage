@@ -118,6 +118,9 @@ function ServiceDialog({ presets, initial, onClose, onSaved }) {
   const [error, setError] = useState("");
   const [saving, setSaving] = useState("");
   const set = (key) => (e) => setForm({ ...form, [key]: e.target.value });
+  // 令牌只属于它当初填写时的域名：换了域名必须重新填写。
+  const hostChanged = editing && hostOf(form?.url) !== hostOf(initial.url);
+  const keepsToken = editing && initial.auth !== "none" && !hostChanged;
   const submit = async (e) => {
     e.preventDefault();
     setSaving("保存中…");
@@ -165,8 +168,9 @@ function ServiceDialog({ presets, initial, onClose, onSaved }) {
                   ${form.preset !== "github" && html`<label class="check"><input type="checkbox" checked=${Boolean(form.no_auth)}
                     onChange=${(e) => setForm({ ...form, no_auth: e.target.checked })} />这个服务不需要令牌（公开服务，例如文档检索）</label>`}
                   ${!form.no_auth && html`<label for="m-token">访问令牌</label>
-                  <input id="m-token" type="password" autocomplete="off" spellcheck="false" class="mono" required=${!editing || initial?.auth === "none"}
-                    placeholder=${editing && initial?.auth !== "none" ? "留空则保持原令牌不变" : "粘贴令牌，例如 GitHub 的 PAT"} value=${form.token} onInput=${set("token")} />`}
+                  <input id="m-token" type="password" autocomplete="off" spellcheck="false" class="mono" required=${!keepsToken}
+                    placeholder=${keepsToken ? "留空则保持原令牌不变" : hostChanged ? "换了域名，请重新填写令牌（原令牌不会发给新地址）" : "粘贴令牌，例如 GitHub 的 PAT"}
+                    value=${form.token} onInput=${set("token")} />`}
                   <p class="caption">${form.no_auth ? "不保存任何凭据。" : "令牌直接写入 macOS 钥匙串，沙箱里只会看到占位符。"}${""
                     }Agent 经门卫访问这个服务，只能调用你在沙箱里勾选的工具；保存后会自动获取工具列表。${preset?.docs ? html` 参考：<span class="mono">${preset.docs}</span>` : ""}</p>`}
               ${error && html`<p class="form-error" role="alert">${error}</p>`}
@@ -180,6 +184,7 @@ function ServiceDialog({ presets, initial, onClose, onSaved }) {
     </div>`;
 }
 
+const hostOf = (url) => { try { return new URL(url).hostname.toLowerCase(); } catch { return ""; } };
 const isOAuth = (service) => service?.kind === "oauth";
 const isBuiltin = (service) => service?.kind === "demo";
 const isDatabase = (service) => service?.kind === "postgres";
