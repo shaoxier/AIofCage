@@ -306,7 +306,7 @@ func (g *Gate) forwardMCP(w http.ResponseWriter, r *http.Request, connector Conn
 		n, err := w.Write(out)
 		written, copyErr = int64(n), err
 	case reply.rewrites():
-		written, copyErr = copyEvents(w, resp.Body, reply.message)
+		written, copyErr = copyEvents(w, resp.Body, reply.message, reply.mask)
 	default:
 		written, copyErr = copyFlushing(w, resp.Body)
 	}

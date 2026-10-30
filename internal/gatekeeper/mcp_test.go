@@ -349,7 +349,7 @@ func newRemoteFixture(t *testing.T) *fixture {
 				`{"name":"search_docs","annotations":{"readOnlyHint":true},"inputSchema":{}},{"name":"delete_page","inputSchema":{}}]}}`)
 		case "tools/call":
 			w.Header().Set("Content-Type", "text/event-stream")
-			io.WriteString(w, "data: {\"jsonrpc\":\"2.0\",\"id\":"+string(msg.ID)+
+			io.WriteString(w, ": "+remoteToken+"\n\nid: "+remoteToken+"\ndata: {\"jsonrpc\":\"2.0\",\"id\":"+string(msg.ID)+
 				",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"<b>echo "+remoteToken+"</b>\"}]}}\n\n")
 		default:
 			w.WriteHeader(http.StatusAccepted)

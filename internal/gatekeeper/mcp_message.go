@@ -140,6 +140,14 @@ func (r mcpReply) rewrites() bool {
 	return r.method == "tools/list" || r.connector.Remote
 }
 
+// mask hides a remote service's token in anything relayed from it.
+func (r mcpReply) mask(data []byte) []byte {
+	if !r.connector.Remote {
+		return data
+	}
+	return redactSecret(data, r.connector.Token)
+}
+
 // body rewrites a JSON response: one message, or a batch of them.
 func (r mcpReply) body(data []byte) ([]byte, error) {
 	trimmed := bytes.TrimSpace(data)
@@ -176,10 +184,7 @@ func (r mcpReply) message(data []byte) ([]byte, error) {
 		}
 		out = rewritten
 	}
-	if r.connector.Remote {
-		out = redactSecret(out, r.connector.Token)
-	}
-	return out, nil
+	return r.mask(out), nil
 }
 
 // rewriteResult applies change to a response's result; errors and notifications pass unchanged.
@@ -257,16 +262,19 @@ func marshalCompact(value any) (json.RawMessage, error) {
 }
 
 // copyEvents relays a server-sent event stream one complete event at a time, passing each
-// event's data through rewrite. Comments and the other fields are kept, and every event is
-// flushed at once so streamed answers are not held back. An event cut off by the end of the
-// stream is dropped, as a client would drop it.
-func copyEvents(w http.ResponseWriter, body io.Reader, rewrite func([]byte) ([]byte, error)) (int64, error) {
+// event's data through rewrite and everything sent through mask. Comments and the other fields
+// are kept, and every event is flushed at once so streamed answers are not held back. An event
+// cut off by the end of the stream is dropped, as a client would drop it.
+func copyEvents(w http.ResponseWriter, body io.Reader, rewrite func([]byte) ([]byte, error), mask func([]byte) []byte) (int64, error) {
 	controller := http.NewResponseController(w)
 	reader := bufio.NewReaderSize(body, 64<<10)
 	var total int64
 	var event, data bytes.Buffer
 	hasData := false
 	send := func(chunk []byte) error {
+		if mask != nil {
+			chunk = mask(chunk)
+		}
 		n, err := w.Write(chunk)
 		total += int64(n)
 		_ = controller.Flush()

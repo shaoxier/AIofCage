@@ -71,7 +71,7 @@ func manyKeys(n int) string {
 func TestCopyEventsKeepsStreamingShape(t *testing.T) {
 	w := httptest.NewRecorder()
 	stream := ": open\n\nretry: 1000\n\nid: 1\ndata: {\"a\":1}\n\n:inner\nevent: message\ndata: {\"b\":\ndata: 2}\n\n"
-	n, err := copyEvents(w, strings.NewReader(stream), func(data []byte) ([]byte, error) { return data, nil })
+	n, err := copyEvents(w, strings.NewReader(stream), func(data []byte) ([]byte, error) { return data, nil }, nil)
 	want := ": open\n\nretry: 1000\n\nid: 1\ndata: {\"a\":1}\n\n:inner\nevent: message\ndata: {\"b\":\ndata: 2}\n\n"
 	if err != nil || w.Body.String() != want || n != int64(len(want)) {
 		t.Fatalf("copyEvents changed the stream: %v %q", err, w.Body.String())
@@ -79,7 +79,7 @@ func TestCopyEventsKeepsStreamingShape(t *testing.T) {
 	w = httptest.NewRecorder()
 	_, err = copyEvents(w, strings.NewReader("data: {}\n\ndata: not json\n\n"), func(data []byte) ([]byte, error) {
 		return mcpReply{method: "tools/list"}.message(data)
-	})
+	}, nil)
 	if err != errMCPReply || w.Body.String() != "data: {}\n\n" {
 		t.Fatalf("an event that cannot be checked stops the stream before it is relayed: %v %q", err, w.Body.String())
 	}
