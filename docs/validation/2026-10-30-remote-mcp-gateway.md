@@ -17,7 +17,7 @@
    - 宿主按 MCP 协议向服务要工具清单，在保存服务、测试连接、OAuth 登录后和首次启动沙箱时获取，并记下服务自己的 `readOnlyHint` 标注（`internal/mcp/client.go`）。
    - 沙箱启用远程服务时，默认只授权标了只读的工具。
    - 授权一旦确定就固定保存（`internal/runtime/connectors.go` 的 `prepareRemote`），服务之后新增的工具要用户勾选才开放。
-   - 服务换了地址，旧工具清单作废，要重新获取。
+   - 服务换了地址，旧工具清单作废，各沙箱对它的授权也一并清掉，拿到新清单后重新按默认只读固定。
 4. **堵住工具名检查的绕过。** 原来门卫用 Go 结构体读 `params.name`：Go 匹配键名不分大小写（还做 Unicode 折叠，`paramſ` 等于 `params`），重复的键以最后一个为准；JavaScript、Python 写的服务按原样匹配。于是 `{"name":"未授权工具","Name":"授权工具"}` 能让门卫检查一个工具、服务执行另一个，`"method"` 和 `"Method"` 同理。
    - 现在消息外层和 `tools/call` 的参数里，只要出现重复的键，或者与已知键名只差大小写的键，整条消息都拒绝（`internal/gatekeeper/mcp_message.go`）。
    - 批量消息、对象后面还跟着内容、非 UTF-8 正文也一并拒绝。
