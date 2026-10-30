@@ -453,11 +453,11 @@ func (g *Gate) response(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Respon
 		return textResponse(ctx.Req, http.StatusForbidden, "redirect_denied")
 	}
 	if resp.StatusCode >= 400 {
-		// Error bodies are small and may echo the credential; redact before returning them.
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+		// Error bodies are small and may echo the credential; decode and redact before returning them.
+		body, withheld := readErrorBody(resp, state.secret)
 		resp.Body.Close()
-		if state.secret != "" {
-			body = bytes.ReplaceAll(body, []byte(state.secret), []byte("[REDACTED]"))
+		if withheld {
+			resp.Header.Set("Content-Type", "application/json")
 		}
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		resp.ContentLength = int64(len(body))

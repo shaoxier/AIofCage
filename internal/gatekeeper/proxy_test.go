@@ -3,13 +3,16 @@ package gatekeeper
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -360,6 +363,45 @@ func TestUpstreamErrorBodyIsRedacted(t *testing.T) {
 	status, body, _ := f.do(t, "POST", "https://model-a.example/v1/responses", bearer(placeholderA), "{}")
 	if status != 401 || strings.Contains(body, secretA) || !strings.Contains(body, "[REDACTED]") {
 		t.Fatalf("got %d %s", status, body)
+	}
+}
+
+func TestCompressedUpstreamErrorBodyIsDecodedAndRedacted(t *testing.T) {
+	f := newFixture(t, true)
+	f.configure(t, testConfig(1))
+	sum := sha256.Sum256([]byte(secretA))
+	hash, tail := hex.EncodeToString(sum[:]), secretA[len(secretA)-4:]
+	f.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(http.StatusUnauthorized)
+		zw := gzip.NewWriter(w)
+		fmt.Fprintf(zw, `{"error":"invalid key %s, received sk-...%s, key hash %s"}`,
+			strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), tail, hash)
+		zw.Close()
+	})
+	// Agents send Accept-Encoding themselves, so the gatekeeper's transport does not decode for us.
+	headers := bearer(placeholderA)
+	headers["Accept-Encoding"] = []string{"gzip"}
+	status, body, header := f.do(t, "POST", "https://model-a.example/v1/responses", headers, "{}")
+	if status != 401 || header.Get("Content-Encoding") != "" || strings.Contains(body, secretA) ||
+		strings.Contains(body, "..."+tail) || strings.Contains(body, hash) || strings.Count(body, "[REDACTED]") != 3 {
+		t.Fatalf("got %d %q %s", status, header.Get("Content-Encoding"), body)
+	}
+}
+
+func TestUndecodableUpstreamErrorBodyIsWithheld(t *testing.T) {
+	f := newFixture(t, true)
+	f.configure(t, testConfig(1))
+	f.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "br")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte("opaque " + strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")))
+	})
+	headers := bearer(placeholderA)
+	headers["Accept-Encoding"] = []string{"br"}
+	status, body, header := f.do(t, "POST", "https://model-a.example/v1/responses", headers, "{}")
+	if status != 400 || header.Get("Content-Encoding") != "" || strings.Contains(body, secretA) || !strings.Contains(body, "aiofcage_withheld") {
+		t.Fatalf("got %d %q %s", status, header.Get("Content-Encoding"), body)
 	}
 }
 
