@@ -24,6 +24,8 @@ type Event struct {
 	PolicyVersion uint64            `json:"policy_version,omitempty"`
 	ServiceID     string            `json:"service_id,omitempty"`
 	ToolID        string            `json:"tool_id,omitempty"`
+	// RedirectHost is where an upstream redirect pointed, when it is a valid host name.
+	RedirectHost string `json:"redirect_host,omitempty"`
 
 	// Network metadata. Path never includes the query string; SecretRef is a name, never a value.
 	Host         string `json:"host,omitempty"`
