@@ -40,6 +40,9 @@ type Gate struct {
 	proxy     *goproxy.ProxyHttpServer
 	transport *http.Transport
 	mcpClient *http.Client
+	// remoteMCP reaches remote MCP services with the proxy's transport: public addresses only,
+	// verified TLS, redirects not followed.
+	remoteMCP *http.Client
 	events    *eventLog
 	now       func() time.Time
 
@@ -104,6 +107,8 @@ func NewGate() (*Gate, error) {
 		TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 5 * time.Minute,
 		IdleConnTimeout: 90 * time.Second, MaxIdleConnsPerHost: 4,
 	}
+	g.remoteMCP = &http.Client{Transport: g.transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	p := goproxy.NewProxyHttpServer()
 	p.Logger = log.New(io.Discard, "", 0) // goproxy errors may contain URLs with query strings.
 	p.Tr = g.transport
