@@ -70,6 +70,7 @@ const (
 	maxSecretBytes = 4096
 	maxConnectors  = 16
 	maxGrantTools  = 512
+	minRemoteToken = 8
 )
 
 var (
@@ -149,8 +150,9 @@ func compile(config Config) (*compiled, error) {
 			if err := validRemote(connector.Upstream); err != nil {
 				return nil, fmt.Errorf("连接器 %s：%w", connector.ID, err)
 			}
-			if len(connector.Token) > maxSecretBytes || strings.ContainsAny(connector.Token, " \t\r\n") ||
-				strings.HasPrefix(connector.Token, "cage-") {
+			// A short token would be masked inside ordinary words and JSON keys of every reply.
+			if connector.Token != "" && len(connector.Token) < minRemoteToken || len(connector.Token) > maxSecretBytes ||
+				strings.ContainsAny(connector.Token, " \t\r\n") || strings.HasPrefix(connector.Token, "cage-") {
 				return nil, fmt.Errorf("连接器 %s 的令牌无效", connector.ID)
 			}
 			connector.ToolsRestricted = true

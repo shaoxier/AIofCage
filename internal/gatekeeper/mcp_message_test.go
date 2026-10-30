@@ -120,17 +120,40 @@ func TestCopyEventsBoundsEveryLine(t *testing.T) {
 	}
 }
 
-// A token written with JSON escapes is what the agent's parser reads, so it is masked as well.
-func TestRemoteRepliesMaskEscapedTokens(t *testing.T) {
+// A token written with JSON escapes is what the agent's parser reads, so such a reply is withheld.
+func TestRemoteRepliesWithEscapedTokensAreWithheld(t *testing.T) {
 	secret := "gsynthetic_TokenValue0123456789"
 	reply := mcpReply{method: "tools/call", connector: Connector{Remote: true, Token: secret}}
-	escaped := `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"\u0067synthetic\u005fTokenValue0123456789"}],"n":1.50}}`
-	out, err := reply.message([]byte(escaped))
-	if err != nil || strings.Contains(string(out), "TokenValue0123456789") || !strings.Contains(string(out), "[REDACTED]") || !strings.Contains(string(out), `"n":1.50`) {
-		t.Fatalf("escaped token: %s %v", out, err)
+	for name, data := range map[string]string{
+		"escaped":         `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"\u0067synthetic\u005fTokenValue0123456789"}]}}`,
+		"escaped key":     `{"jsonrpc":"2.0","id":1,"result":{"\u0067synthetic_TokenValue0123456789":1}}`,
+		"byte order mark": "\xef\xbb\xbf" + `{"jsonrpc":"2.0","id":1,"result":{"text":"\u0067synthetic_TokenValue0123456789"}}`,
+	} {
+		if _, err := reply.message([]byte(data)); err != errTokenInReply {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
-	plain := []byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"\u003cb\u003e nothing secret"}]}}`)
+	plain := []byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"\u003cb\u003e line\nbreak"}],"n":1.50}}`)
 	if out, err := reply.message(plain); err != nil || string(out) != string(plain) {
 		t.Fatalf("a message without the token is relayed byte for byte: %s %v", out, err)
+	}
+	exact := []byte(`{"jsonrpc":"2.0","id":1,"result":{"text":"gsynthetic_TokenValue0123456789"}}`)
+	if out, err := reply.message(exact); err != nil || strings.Contains(string(out), secret) {
+		t.Fatalf("a token written plainly is masked: %s %v", out, err)
+	}
+}
+
+// Clients ignore unknown fields; relaying them could let a client that strips one more byte
+// order mark read a line the gateway took for something else.
+func TestCopyEventsDropsUnknownFields(t *testing.T) {
+	listing := `{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"delete_page"}]}}`
+	reply := mcpReply{method: "tools/list", connector: Connector{Tools: []string{"search"}, ToolsRestricted: true}}
+	w := httptest.NewRecorder()
+	stream := "\xef\xbb\xbf\xef\xbb\xbfdata: " + listing + "\n\nid: 7\nretry: 10\nevent: message\nfoo: bar\ndata: {}\n\n"
+	if _, err := copyEvents(w, strings.NewReader(stream), reply.message, nil); err != nil {
+		t.Fatal(err)
+	}
+	if out := w.Body.String(); strings.Contains(out, "delete_page") || strings.Contains(out, "foo") || !strings.Contains(out, "id: 7\nretry: 10\nevent: message\ndata: {}") {
+		t.Fatalf("unknown fields must be dropped, known ones kept: %q", out)
 	}
 }

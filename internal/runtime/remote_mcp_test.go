@@ -223,3 +223,73 @@ func TestRemoteGrantDoesNotFollowTheServiceToAnotherAddress(t *testing.T) {
 		t.Fatal("more MCP services than the gatekeeper routes must be refused up front")
 	}
 }
+
+// An older version that does not know mcp_grant_urls drops it when it rewrites sandboxes.json.
+// The grant then stays as the user chose it, even "nothing", and is bound again; it is never
+// replaced by the read-only default.
+func TestUnboundGrantIsKeptAndBoundAgain(t *testing.T) {
+	m, st, _ := newRemoteManager(t, nil)
+	now := time.Now().UTC()
+	docs := mcp.Service{ID: "docs", Name: "Docs", URL: "https://docs.example.com/mcp", KeyRef: mcp.KeyRefFor("docs"), Auth: mcp.AuthNone,
+		Catalog: []mcp.Tool{{Name: "search", ReadOnly: true}, {Name: "export_all", ReadOnly: true}}, CatalogAt: &now}
+	if err := st.SaveMCPService(docs); err != nil {
+		t.Fatal(err)
+	}
+	sbx := sandbox.Sandbox{ID: "sbx-remote04", Name: "r", ProjectPath: "/Users/u/CageWorkspace/p", MCP: []string{"docs"},
+		Bindings: []sandbox.Binding{{Agent: session.Codex}}, Placeholders: map[string]string{"mcp:docs": "cage-DDDDDDDDDDDDDDDDDDDD"},
+		MCPPermissions: map[string][]string{"docs": {}}}
+	if err := st.SaveSandbox(sbx); err != nil {
+		t.Fatal(err)
+	}
+	if tools, explicit := Grant(sbx, docs); !explicit || len(tools) != 0 {
+		t.Fatalf("an unbound grant applies as chosen: %v %v", tools, explicit)
+	}
+	services, _ := m.servicesFor(sbx)
+	pinned, err := m.prepareRemote(context.Background(), sbx, services)
+	if err != nil || pinned.MCPGrantURLs["docs"] != "https://docs.example.com/mcp" || len(pinned.MCPPermissions["docs"]) != 0 {
+		t.Fatalf("the grant keeps its tools and gets its address back: %+v %v", pinned, err)
+	}
+	config, err := m.gateConfig(context.Background(), pinned, nil, nil)
+	if err != nil || len(config.Connectors) != 1 || len(config.Connectors[0].Tools) != 0 {
+		t.Fatalf("\"nothing\" must stay nothing: %+v %v", config.Connectors, err)
+	}
+}
+
+// A start may hold a copy of a service read before the user moved it and saved a new token. The
+// tools are listed with the address and token as they are stored now, never the new token at the
+// old address.
+func TestToolsAreListedWithTheCurrentAddressAndToken(t *testing.T) {
+	var tools atomic.Value
+	tools.Store(`[{"name":"search"}]`)
+	client := mcpServer(t, &tools)
+	var seen []string
+	var mu sync.Mutex
+	base := client.Transport
+	client.Transport = roundTripper(func(r *http.Request) (*http.Response, error) {
+		mu.Lock()
+		seen = append(seen, r.URL.Host+" "+r.Header.Get("Authorization"))
+		mu.Unlock()
+		return base.RoundTrip(r)
+	})
+	m, st, secrets := newRemoteManager(t, client)
+	current := mcp.Service{ID: "docs", Name: "Docs", URL: "https://docs.example.com/mcp", KeyRef: mcp.KeyRefFor("docs")}
+	if err := st.SaveMCPService(current); err != nil {
+		t.Fatal(err)
+	}
+	secrets[current.KeyRef] = []byte("token-for-docs-host")
+	stale := current
+	stale.URL = "https://old.example.com/mcp"
+	listed, err := m.ListTools(context.Background(), stale)
+	if err != nil || listed.URL != current.URL || len(seen) == 0 {
+		t.Fatalf("listed %+v %v %v", listed, err, seen)
+	}
+	for _, request := range seen {
+		if request != "docs.example.com Bearer token-for-docs-host" {
+			t.Fatalf("a token went to an address it was not saved for: %v", seen)
+		}
+	}
+}
+
+type roundTripper func(*http.Request) (*http.Response, error)
+
+func (f roundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

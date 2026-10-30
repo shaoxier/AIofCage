@@ -101,7 +101,7 @@ func TestMCPServiceLifecycle(t *testing.T) {
 	if err != nil || view.ID != "github" || !view.KeySaved || string(secrets["aiofcage-mcp-github"]) != "ghtoken-123" {
 		t.Fatalf("save: %+v %v", view, err)
 	}
-	second, err := app.SaveMCPService(SaveMCPServiceRequest{Name: "Another GitHub", URL: "https://api.githubcopilot.com/mcp/", Preset: "github", Token: "t2"})
+	second, err := app.SaveMCPService(SaveMCPServiceRequest{Name: "Another GitHub", URL: "https://api.githubcopilot.com/mcp/", Preset: "github", Token: "synthetic-token-2"})
 	if err != nil || second.ID == "github" || !strings.HasPrefix(second.ID, "mcp-") {
 		t.Fatalf("second id: %+v %v", second, err)
 	}
@@ -121,7 +121,7 @@ func TestMCPServiceLifecycle(t *testing.T) {
 	}
 	items, _ := app.ListMCPServices()
 	for _, item := range items {
-		if strings.Contains(string(mustJSON(t, item)), "t2") {
+		if strings.Contains(string(mustJSON(t, item)), "synthetic-token-2") {
 			t.Fatal("view leaked the token")
 		}
 	}

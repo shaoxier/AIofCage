@@ -521,6 +521,9 @@ func mcpAdd(ctx context.Context, st *store.Store, keychain *vault.Keychain, args
 	if strings.TrimSpace(secret) == "" {
 		return errors.New("令牌或密码不能为空")
 	}
+	if !service.IsConnector() && len(secret) < mcp.MinTokenLength {
+		return fmt.Errorf("访问令牌太短（至少 %d 个字符）", mcp.MinTokenLength)
+	}
 	if err := keychain.Put(ctx, service.KeyRef, []byte(secret)); err != nil {
 		return err
 	}
