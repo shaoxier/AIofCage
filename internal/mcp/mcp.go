@@ -45,6 +45,10 @@ type Service struct {
 // AuthNone marks a remote service that is used without any credential.
 const AuthNone = "none"
 
+// MinTokenLength is the shortest bearer token accepted for a remote service; the gatekeeper masks
+// the token in replies, and a shorter one would be masked inside ordinary words.
+const MinTokenLength = 8
+
 // Tool is one tool a remote service offers. ReadOnly and Destructive repeat the service's own
 // annotations: claims by the service, used only to choose what is granted by default.
 type Tool struct {

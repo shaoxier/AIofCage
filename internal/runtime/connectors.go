@@ -34,14 +34,16 @@ func connectorName(sandboxID, serviceID string) string {
 }
 
 // Grant returns the tools a sandbox may call on a service, and whether they come from the
-// sandbox's own grant. A remote service's grant applies only to the address it was made for.
-// Without one (e.g. a sandbox saved before grants existed, or a service that moved) the service's
-// default tools apply until a grant is pinned (see prepareRemote).
+// sandbox's own grant. A remote service's grant applies only to the address it was made for; a
+// grant without a recorded address (an older version rewrote the file without the field) is
+// taken as made for the current one and gets bound at the next pin, so it is never widened.
+// Without an applicable grant (a sandbox saved before grants existed, or a service that moved)
+// the service's default tools apply until a grant is pinned (see prepareRemote).
 func Grant(sbx sandbox.Sandbox, service mcp.Service) ([]string, bool) {
 	tools, ok := sbx.MCPPermissions[service.ID]
-	if ok && !service.IsConnector() {
+	if bound, recorded := sbx.MCPGrantURLs[service.ID]; ok && recorded && !service.IsConnector() {
 		upstream, err := service.Upstream()
-		ok = err == nil && sbx.MCPGrantURLs[service.ID] == upstream
+		ok = err == nil && bound == upstream
 	}
 	if !ok {
 		return service.DefaultTools(), false
@@ -79,7 +81,15 @@ func (m *Manager) prepareRemote(ctx context.Context, sbx sandbox.Sandbox, servic
 			}
 		}
 		upstream, err := service.Upstream()
-		if _, explicit := Grant(sbx, service); !explicit && err == nil && service.CatalogAt != nil {
+		if err != nil {
+			continue
+		}
+		tools, explicit := Grant(sbx, service)
+		_, bound := sbx.MCPGrantURLs[id]
+		switch {
+		case explicit && !bound:
+			pins[id] = pin{tools: tools, url: upstream} // record the address the grant is now used for
+		case !explicit && service.CatalogAt != nil:
 			pins[id] = pin{tools: service.DefaultTools(), url: upstream}
 		}
 	}
@@ -108,11 +118,13 @@ func (m *Manager) prepareRemote(ctx context.Context, sbx sandbox.Sandbox, servic
 // ListTools asks a remote service for its tools with the token the host holds and saves them as
 // the service's tool list. Grants are not changed.
 func (m *Manager) ListTools(ctx context.Context, service mcp.Service) (mcp.Service, error) {
-	upstream, err := service.Upstream()
+	// The address and the token are read together: a copy of the service read earlier may hold an
+	// address the service has since left, and the token saved now belongs to the new one.
+	current, token, err := m.credential(ctx, service.ID)
 	if err != nil {
 		return service, err
 	}
-	token, err := m.serviceToken(ctx, service)
+	upstream, err := current.Upstream()
 	if err != nil {
 		return service, err
 	}
@@ -122,7 +134,7 @@ func (m *Manager) ListTools(ctx context.Context, service mcp.Service) (mcp.Servi
 	if err != nil {
 		return service, err
 	}
-	return SaveCatalog(m.store, service, tools, time.Now())
+	return SaveCatalog(m.store, current, tools, time.Now())
 }
 
 // ErrServiceChanged means a service was edited while its tools were being listed; the list

@@ -747,7 +747,7 @@ func (m *Manager) gateConfig(ctx context.Context, sbx sandbox.Sandbox, providers
 // checks every tool call against the sandbox's grant. The proxy gets no rule for the service, so
 // the agent cannot reach it any other way.
 func (m *Manager) remoteRoute(ctx context.Context, sbx sandbox.Sandbox, service mcp.Service) (gatekeeper.Connector, error) {
-	token, err := m.serviceToken(ctx, service)
+	service, token, err := m.credential(ctx, service.ID)
 	if err != nil {
 		return gatekeeper.Connector{}, fmt.Errorf("MCP 服务「%s」的令牌不可用：%w", service.Name, err)
 	}
@@ -761,6 +761,25 @@ func (m *Manager) remoteRoute(ctx context.Context, sbx sandbox.Sandbox, service 
 	}
 	return gatekeeper.Connector{ID: service.ID, Placeholder: placeholder, Upstream: upstream, Token: token,
 		Tools: grantedTools(sbx, service), ToolsRestricted: true, Remote: true}, nil
+}
+
+// ServiceLock names the lock under which a remote service's address and credential are changed
+// together and read together, so a token is never paired with an address it was not saved for.
+func ServiceLock(id string) string { return "mcp-service:" + id }
+
+// credential reads a remote service and its token under the service's lock.
+func (m *Manager) credential(ctx context.Context, id string) (mcp.Service, string, error) {
+	unlock, err := m.store.LockOperation(ctx, ServiceLock(id), true)
+	if err != nil {
+		return mcp.Service{}, "", err
+	}
+	defer unlock()
+	service, err := m.store.MCPService(id)
+	if err != nil {
+		return service, "", err
+	}
+	token, err := m.serviceToken(ctx, service)
+	return service, token, err
 }
 
 // OAuthMargin is how long an OAuth access token must stay valid when handed to a gatekeeper.

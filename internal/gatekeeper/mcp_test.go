@@ -337,6 +337,10 @@ func newRemoteFixture(t *testing.T) *fixture {
 			io.WriteString(compressed, `{"jsonrpc":"2.0","id":9,"result":{"content":[{"type":"text","text":"echo `+remoteToken+`"}]}}`)
 			compressed.Close()
 			return
+		case "empty-gzip":
+			w.Header().Set("Content-Encoding", "gzip")
+			w.WriteHeader(http.StatusAccepted)
+			return
 		case "brotli":
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Content-Encoding", "br")
@@ -472,6 +476,9 @@ func TestRemoteMCPGatewayFailures(t *testing.T) {
 	if status != http.StatusAccepted {
 		t.Fatalf("notifications are relayed: %d", status)
 	}
+	if status, body, _ := f.callMCP(t, "empty-gzip", `{"jsonrpc":"2.0","method":"notifications/initialized"}`); status != http.StatusAccepted {
+		t.Fatalf("an empty answer declaring an encoding is still relayed: %d %s", status, body)
+	}
 	r := httptest.NewRequest(http.MethodGet, "/mcp/docs", nil)
 	r.Header.Set("Authorization", "Bearer "+remotePlaceholder)
 	w := httptest.NewRecorder()
@@ -493,6 +500,7 @@ func TestRemoteConnectorConfigValidation(t *testing.T) {
 		"uppercase host":  func(c *Connector) { c.Upstream = "https://MCP.example.com/mcp" },
 		"token spaces":    func(c *Connector) { c.Token = "two words" },
 		"placeholder tok": func(c *Connector) { c.Token = "cage-abcdefghijklmnop" },
+		"short token":     func(c *Connector) { c.Token = "id" },
 		"control in tool": func(c *Connector) { c.Tools = []string{"read\nwrite"} },
 	}
 	for name, mutate := range cases {

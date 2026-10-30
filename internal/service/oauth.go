@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/shaoxier/AIofCage/internal/mcp"
 	"github.com/shaoxier/AIofCage/internal/runtime"
 )
 
@@ -42,7 +43,9 @@ func (a *App) AuthorizeMCPService(id string) (MCPServiceView, error) {
 	if err != nil {
 		return MCPServiceView{}, err
 	}
-	if err := a.vault.Put(ctx, service.KeyRef, data); err != nil {
+	// The login can take minutes; the credential is saved only if the service still has the
+	// address it was obtained for.
+	if err := a.saveLogin(ctx, service, data); err != nil {
 		return MCPServiceView{}, err
 	}
 	toolsErr := ""
@@ -59,6 +62,22 @@ func (a *App) AuthorizeMCPService(id string) (MCPServiceView, error) {
 	return view, a.refreshSandboxesUsing(ctx, service.ID)
 }
 
+func (a *App) saveLogin(ctx context.Context, service mcp.Service, data []byte) error {
+	unlock, err := a.store.LockOperation(ctx, runtime.ServiceLock(service.ID), true)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	current, err := a.store.MCPService(service.ID)
+	if err != nil {
+		return err
+	}
+	if current.URL != service.URL || !current.IsOAuth() {
+		return errors.New("登录期间这个服务的地址被修改了，请重新登录授权")
+	}
+	return a.vault.Put(ctx, service.KeyRef, data)
+}
+
 // DisconnectMCPService removes the locally stored OAuth credentials and refreshes every running
 // sandbox that used the service. Provider-side grants are not revoked unless the provider exposes
 // a revocation endpoint; the local credential is always removed.
@@ -72,7 +91,13 @@ func (a *App) DisconnectMCPService(id string) (MCPServiceView, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := a.vault.Delete(ctx, service.KeyRef); err != nil {
+	unlock, err := a.store.LockOperation(ctx, runtime.ServiceLock(id), true)
+	if err != nil {
+		return MCPServiceView{}, err
+	}
+	err = a.vault.Delete(ctx, service.KeyRef)
+	unlock()
+	if err != nil {
 		return MCPServiceView{}, err
 	}
 	view, err := a.mcpView(service)
@@ -121,8 +146,14 @@ func (a *App) refreshOAuth(ctx context.Context) {
 			if err != nil || !service.IsOAuth() || !a.usedByRunning(ctx, id) {
 				continue
 			}
-			// Renew well before the gatekeeper's copy expires.
+			// Renew well before the gatekeeper's copy expires, under the service's lock so an edit of
+			// its address cannot interleave with writing the renewed credential.
+			unlock, err := a.store.LockOperation(ctx, runtime.ServiceLock(id), true)
+			if err != nil {
+				continue
+			}
 			_, refreshed, err := a.oauth.AccessToken(ctx, a.vault, service.KeyRef, 2*runtime.OAuthMargin)
+			unlock()
 			a.monitor.mu.Lock()
 			alerted := a.monitor.oauthAlerted[id]
 			a.monitor.oauthAlerted[id] = err != nil

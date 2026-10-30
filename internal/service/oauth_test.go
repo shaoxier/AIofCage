@@ -89,7 +89,7 @@ func TestOAuthServiceRefreshesBeforeUse(t *testing.T) {
 	if result, _ = app.TestMCPService(view.ID); result.OK || !strings.Contains(result.Message, "重新登录") {
 		t.Fatalf("expired login: %+v", result)
 	}
-	github, _ := app.SaveMCPService(SaveMCPServiceRequest{Name: "GitHub", URL: "https://api.githubcopilot.com/mcp/", Preset: "github", Token: "t"})
+	github, _ := app.SaveMCPService(SaveMCPServiceRequest{Name: "GitHub", URL: "https://api.githubcopilot.com/mcp/", Preset: "github", Token: "synthetic-token-1"})
 	if _, err := app.AuthorizeMCPService(github.ID); err == nil {
 		t.Fatal("token services have no OAuth login")
 	}
@@ -112,11 +112,31 @@ func TestDisconnectOAuthServiceRemovesLocalCredentials(t *testing.T) {
 	if err != nil || len(updated) != 1 || updated[0].KeySaved {
 		t.Fatalf("disconnected service still appears authorized: %+v %v", updated, err)
 	}
-	github, err := app.SaveMCPService(SaveMCPServiceRequest{Name: "GitHub", URL: "https://api.githubcopilot.com/mcp/", Preset: "github", Token: "token"})
+	github, err := app.SaveMCPService(SaveMCPServiceRequest{Name: "GitHub", URL: "https://api.githubcopilot.com/mcp/", Preset: "github", Token: "synthetic-token-3"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := app.DisconnectMCPService(github.ID); err == nil || !strings.Contains(err.Error(), "OAuth") {
 		t.Fatalf("token service accepted OAuth disconnect: %v", err)
+	}
+}
+
+// A browser login takes minutes; its credential is kept only if the service still has the address
+// it was obtained for.
+func TestLoginForAnEditedServiceIsNotSaved(t *testing.T) {
+	app, secrets, st := newApp(t)
+	view, err := app.SaveMCPService(SaveMCPServiceRequest{Name: "Notion", Kind: "oauth", URL: "https://mcp.notion.com/mcp", Preset: "notion"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedFor, _ := st.MCPService(view.ID)
+	if _, err := app.SaveMCPService(SaveMCPServiceRequest{ID: view.ID, Name: "Notion", Kind: "oauth", URL: "https://mcp.notion.example/mcp"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.saveLogin(context.Background(), startedFor, []byte(`{"access_token":"synthetic-access-0002"}`)); err == nil {
+		t.Fatal("a login for the old address must not be saved for the new one")
+	}
+	if _, saved := secrets[view.KeyRef]; saved {
+		t.Fatal("nothing may be stored")
 	}
 }
