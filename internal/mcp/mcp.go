@@ -1,17 +1,18 @@
 // Package mcp describes MCP services a sandbox may use without holding their secrets.
 //
-// Remote streamable-HTTP servers authenticate with a bearer token: either a static token (e.g.
-// GitHub's official remote MCP) or one obtained by an OAuth login on the host (e.g. Notion,
-// Linear). The sandbox only gets a placeholder and the gatekeeper injects the real token for the
-// service's exact host and path. Connector services (e.g. a PostgreSQL database): a stdio MCP
-// server runs in a trusted connector container that holds the password; the agent reaches it
-// only through the gatekeeper's MCP entrypoint, which checks the placeholder and the tool.
+// Every service is reached through the gatekeeper's MCP entrypoint, which checks the sandbox's
+// placeholder and the granted tools on each message. Remote streamable-HTTP services authenticate
+// with a bearer token: either a static token (e.g. GitHub's official remote MCP) or one obtained by
+// an OAuth login on the host (e.g. Notion, Linear); the gatekeeper adds it when it forwards a
+// message, and a public service may need none. Connector services (e.g. a PostgreSQL database):
+// a stdio MCP server runs in a trusted connector container that holds the password.
 package mcp
 
 import (
 	_ "embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"regexp"
 	"strings"
@@ -28,11 +29,38 @@ type Service struct {
 	Kind Kind `json:"kind,omitempty"`
 	// URL is the service address for HTTP services and the connection URL without password for
 	// connector services.
-	URL       string    `json:"url"`
-	KeyRef    string    `json:"key_ref"`
+	URL    string `json:"url"`
+	KeyRef string `json:"key_ref"`
+	// Auth is empty when a remote service takes the bearer token kept in the Keychain, or AuthNone
+	// for a public service that needs no credential.
+	Auth      string    `json:"auth,omitempty"`
 	Preset    string    `json:"preset,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
+	// Catalog lists a remote service's tools as the service last reported them; tool grants name
+	// these tools. CatalogAt is when that list was fetched.
+	Catalog   []Tool     `json:"catalog,omitempty"`
+	CatalogAt *time.Time `json:"catalog_at,omitempty"`
 }
+
+// AuthNone marks a remote service that is used without any credential.
+const AuthNone = "none"
+
+// Tool is one tool a remote service offers. ReadOnly and Destructive repeat the service's own
+// annotations: claims by the service, used only to choose what is granted by default.
+type Tool struct {
+	Name        string `json:"name"`
+	Title       string `json:"title,omitempty"`
+	Description string `json:"description,omitempty"`
+	ReadOnly    bool   `json:"read_only,omitempty"`
+	Destructive bool   `json:"destructive,omitempty"`
+}
+
+// MaxCatalogTools bounds a remote service's tool list.
+const MaxCatalogTools = 512
+
+// ToolNamePattern accepts the tool names that can be granted: the characters the MCP
+// specification recommends for tool names.
+var ToolNamePattern = regexp.MustCompile(`^[A-Za-z0-9_./-]{1,128}$`)
 
 var nameIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
 
@@ -91,6 +119,19 @@ func (s Service) Validate() error {
 	} else if _, _, err := s.Endpoint(); err != nil {
 		return err
 	}
+	if s.Auth != "" && (s.Auth != AuthNone || s.IsConnector() || s.IsOAuth()) {
+		return errors.New("只有自定义 HTTP MCP 可以设为无需令牌")
+	}
+	if len(s.Catalog) > MaxCatalogTools {
+		return fmt.Errorf("工具不能超过 %d 个", MaxCatalogTools)
+	}
+	seen := map[string]bool{}
+	for _, tool := range s.Catalog {
+		if !ToolNamePattern.MatchString(tool.Name) || seen[tool.Name] {
+			return errors.New("工具列表里有无效或重复的工具名")
+		}
+		seen[tool.Name] = true
+	}
 	if !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`).MatchString(s.KeyRef) {
 		return errors.New("钥匙串条目名称格式无效")
 	}
@@ -120,23 +161,13 @@ func (s Service) Endpoint() (string, string, error) {
 	return host, p, nil
 }
 
-// Rules allows the streamable-HTTP methods on exactly the service endpoint (and sub-paths, which
-// some servers use for sessions), with the token injected.
-func (s Service) Rules() []policy.Rule {
-	if s.IsConnector() {
-		return nil // reached through the MCP entrypoint, never through the proxy
-	}
+// Upstream is the exact endpoint the gatekeeper forwards a remote service's messages to.
+func (s Service) Upstream() (string, error) {
 	host, p, err := s.Endpoint()
 	if err != nil {
-		return nil
+		return "", err
 	}
-	base := strings.TrimSuffix(p, "/")
-	pattern := base + "/*"
-	if base == "" {
-		pattern = "/*"
-	}
-	return []policy.Rule{{ID: "mcp-" + s.ID, Effect: policy.Allow, Host: host,
-		Methods: []string{"GET", "POST", "DELETE"}, Path: pattern, SecretRef: SecretID(s.ID)}}
+	return "https://" + host + p, nil
 }
 
 type Preset struct {

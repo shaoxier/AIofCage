@@ -1,43 +1,60 @@
 package mcp
 
 import (
+	"strings"
 	"testing"
-
-	"github.com/shaoxier/AIofCage/internal/policy"
 )
 
-func TestGitHubServiceRules(t *testing.T) {
-	s := Service{ID: "github", Name: "GitHub", URL: "https://api.githubcopilot.com/mcp/", KeyRef: KeyRefFor("github")}
+func TestRemoteServiceGoesThroughTheGateway(t *testing.T) {
+	s := Service{ID: "github", Name: "GitHub", URL: "https://API.githubcopilot.com/mcp/", KeyRef: KeyRefFor("github")}
 	if err := s.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	snapshot := policy.Snapshot{Version: 1, Rules: s.Rules()}
-	if err := snapshot.Validate(); err != nil {
-		t.Fatal(err)
+	if upstream, err := s.Upstream(); err != nil || upstream != "https://api.githubcopilot.com/mcp/" {
+		t.Fatalf("upstream %q %v", upstream, err)
 	}
-	for _, r := range []policy.Request{{Host: "api.githubcopilot.com", Method: "POST", Path: "/mcp/"},
-		{Host: "api.githubcopilot.com", Method: "GET", Path: "/mcp"}, {Host: "api.githubcopilot.com", Method: "DELETE", Path: "/mcp/"}} {
-		if d := snapshot.Evaluate(r); !d.Allowed || d.SecretRef != "mcp-github" {
-			t.Errorf("should allow %+v: %+v", r, d)
-		}
-	}
-	for _, r := range []policy.Request{{Host: "api.githubcopilot.com", Method: "POST", Path: "/other"},
-		{Host: "api.githubcopilot.com", Method: "PUT", Path: "/mcp/"}, {Host: "api.github.com", Method: "POST", Path: "/mcp/"}} {
-		if d := snapshot.Evaluate(r); d.Allowed {
-			t.Errorf("should deny %+v", r)
-		}
+	if s.AgentURL() != "http://gatekeeper:8890/mcp/github" {
+		t.Fatalf("agents must reach remote services through the gateway, got %s", s.AgentURL())
 	}
 	if EnvVar("my-svc") != "AIOFCAGE_MCP_MY_SVC_TOKEN" {
 		t.Fatal(EnvVar("my-svc"))
 	}
 	for _, bad := range []Service{{ID: "Bad", Name: "x", URL: s.URL, KeyRef: "k"}, {ID: "x", Name: "x", URL: "http://a.example/mcp", KeyRef: "k"},
-		{ID: "x", Name: "x", URL: "https://1.2.3.4/mcp", KeyRef: "k"}, {ID: "x", Name: "", URL: s.URL, KeyRef: "k"}} {
+		{ID: "x", Name: "x", URL: "https://1.2.3.4/mcp", KeyRef: "k"}, {ID: "x", Name: "", URL: s.URL, KeyRef: "k"},
+		{ID: "x", Name: "x", URL: s.URL, KeyRef: "k", Auth: "basic"}, {ID: "x", Name: "x", Kind: KindOAuth, URL: s.URL, KeyRef: "k", Auth: AuthNone},
+		{ID: "x", Name: "x", URL: s.URL, KeyRef: "k", Catalog: []Tool{{Name: "a b"}}},
+		{ID: "x", Name: "x", URL: s.URL, KeyRef: "k", Catalog: []Tool{{Name: "a"}, {Name: "a"}}}} {
 		if bad.Validate() == nil {
 			t.Errorf("accepted %+v", bad)
 		}
 	}
+	public := Service{ID: "docs", Name: "Docs", URL: "https://docs.example.com/mcp", KeyRef: KeyRefFor("docs"), Auth: AuthNone}
+	if err := public.Validate(); err != nil {
+		t.Fatal(err)
+	}
 	if len(Presets()) == 0 {
 		t.Fatal("no presets")
+	}
+}
+
+func TestRemoteToolGrantsDefaultToReadOnly(t *testing.T) {
+	s := Service{ID: "github", Name: "GitHub", URL: "https://api.githubcopilot.com/mcp/", KeyRef: KeyRefFor("github"),
+		Catalog: []Tool{{Name: "get_issue", ReadOnly: true}, {Name: "create_issue"}, {Name: "search_code", ReadOnly: true}}}
+	if got := strings.Join(s.Tools(), ","); got != "get_issue,create_issue,search_code" {
+		t.Fatalf("tools %s", got)
+	}
+	if got := strings.Join(s.DefaultTools(), ","); got != "get_issue,search_code" {
+		t.Fatalf("defaults must be the tools the service marks read-only: %s", got)
+	}
+	if err := ValidateTools(s, []string{"create_issue"}); err != nil {
+		t.Fatalf("a listed tool may be granted explicitly: %v", err)
+	}
+	if err := ValidateTools(s, []string{"delete_repo"}); err == nil {
+		t.Fatal("a tool the service did not list cannot be granted")
+	}
+	empty := Service{ID: "new", Name: "New", URL: "https://mcp.example.com/mcp", KeyRef: "k"}
+	if len(empty.Tools()) != 0 || len(empty.DefaultTools()) != 0 {
+		t.Fatal("a service whose tools were never listed grants nothing")
 	}
 }
 
@@ -63,8 +80,9 @@ func TestConnectorService(t *testing.T) {
 	if err := s.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if s.Rules() != nil || s.AgentURL() != "http://gatekeeper:8890/mcp/shop-db" || len(s.Tools()) != 1 || s.Tools()[0] != "query" {
-		t.Fatalf("rules %v url %s tools %v", s.Rules(), s.AgentURL(), s.Tools())
+	if s.AgentURL() != "http://gatekeeper:8890/mcp/shop-db" || len(s.Tools()) != 1 || s.Tools()[0] != "query" ||
+		len(s.DefaultTools()) != 1 {
+		t.Fatalf("url %s tools %v", s.AgentURL(), s.Tools())
 	}
 	command, redact, err := s.Launch("p@ss word")
 	if err != nil || len(command) != 2 || command[0] != "/opt/aiofcage-postgres/server.mjs" ||
@@ -84,10 +102,6 @@ func TestConnectorService(t *testing.T) {
 	if unknown.Validate() == nil {
 		t.Fatal("unknown kind accepted")
 	}
-	http := Service{ID: "gh", Name: "GitHub", URL: "https://api.githubcopilot.com/mcp/", KeyRef: "k"}
-	if http.AgentURL() != http.URL || http.Tools() != nil {
-		t.Fatal("HTTP services keep their URL and all tools")
-	}
 }
 
 func TestOAuthService(t *testing.T) {
@@ -95,8 +109,8 @@ func TestOAuthService(t *testing.T) {
 	if err := s.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if s.IsConnector() || !s.IsOAuth() || s.AgentURL() != s.URL || len(s.Rules()) != 1 || s.Rules()[0].SecretRef != "mcp-notion" {
-		t.Fatalf("oauth services are remote HTTP services: %+v", s.Rules())
+	if s.IsConnector() || !s.IsOAuth() || s.AgentURL() != GatewayURL("notion") {
+		t.Fatal("oauth services are remote HTTP services reached through the gateway")
 	}
 	s.URL = "http://mcp.notion.com/mcp"
 	if s.Validate() == nil {
@@ -124,9 +138,9 @@ func TestValidateTools(t *testing.T) {
 	}
 	httpService := Service{ID: "github", Name: "GitHub", Kind: KindHTTP, URL: "https://api.githubcopilot.com/mcp/", KeyRef: KeyRefFor("github")}
 	if err := ValidateTools(httpService, []string{"query"}); err == nil {
-		t.Fatal("remote HTTP service must reject connector tool grants")
+		t.Fatal("a remote service without a tool list cannot grant tools")
 	}
 	if err := ValidateTools(httpService, nil); err != nil {
-		t.Fatalf("empty remote grant should be accepted for compatibility: %v", err)
+		t.Fatalf("an empty remote grant is valid: %v", err)
 	}
 }

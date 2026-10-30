@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -56,6 +57,8 @@ type Manager struct {
 	BeforeReplace func(sandboxID string)
 	// OAuth refreshes tokens of OAuth MCP services before they are handed to a gatekeeper.
 	OAuth *oauth.Client
+	// http lists the tools of remote MCP services from the host; nil skips that.
+	http *http.Client
 
 	mu              sync.Mutex
 	environmentMu   sync.RWMutex
@@ -70,7 +73,7 @@ func NewManager(st *store.Store, secrets vault.Store) (*Manager, error) {
 		return nil, err
 	}
 	client := &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{Proxy: nil, TLSHandshakeTimeout: 10 * time.Second}}
-	return &Manager{env: env, docker: env.docker, store: st, vault: secrets, OAuth: oauth.NewClient(client, nil),
+	return &Manager{env: env, docker: env.docker, store: st, vault: secrets, OAuth: oauth.NewClient(client, nil), http: client,
 		gates: map[string]*gateClient{}, locks: map[string]*sync.Mutex{}, connectorTokens: map[string]string{}}, nil
 }
 
@@ -151,7 +154,7 @@ func (m *Manager) Create(_ context.Context, request CreateRequest) (sandbox.Sand
 	if err := m.checkServices(request.MCP); err != nil {
 		return sbx, err
 	}
-	permissions, err := m.normalizeMCPPermissions(request.MCP, request.MCPPermissions)
+	permissions, err := m.normalizeMCPPermissions(request.MCP, request.MCPPermissions, nil)
 	if err != nil {
 		return sbx, err
 	}
@@ -204,7 +207,9 @@ func cloneMCPPermissions(input map[string][]string) map[string][]string {
 	return output
 }
 
-func (m *Manager) normalizeMCPPermissions(ids []string, requested map[string][]string) (map[string][]string, error) {
+// normalizeMCPPermissions returns the tool grant of every enabled service: the requested one,
+// the sandbox's existing one, or the service's default tools.
+func (m *Manager) normalizeMCPPermissions(ids []string, requested, existing map[string][]string) (map[string][]string, error) {
 	permissions := make(map[string][]string)
 	selected := make(map[string]bool, len(ids))
 	for _, id := range ids {
@@ -213,12 +218,18 @@ func (m *Manager) normalizeMCPPermissions(ids []string, requested map[string][]s
 		if err != nil {
 			return nil, err
 		}
-		if !service.IsConnector() {
-			continue
-		}
 		tools, specified := requested[id]
 		if !specified {
-			tools = service.Tools()
+			current, kept := existing[id]
+			switch {
+			case kept:
+				// Keep a grant the request did not mention, minus tools the service no longer offers.
+				tools = slices.DeleteFunc(slices.Clone(current), func(tool string) bool { return !slices.Contains(service.Tools(), tool) })
+			case !service.IsConnector() && service.CatalogAt == nil:
+				continue // pinned once the service's tools are known (see prepareRemote)
+			default:
+				tools = service.DefaultTools()
+			}
 		}
 		if err := mcp.ValidateTools(service, tools); err != nil {
 			return nil, err
@@ -248,7 +259,11 @@ func (m *Manager) SetMCPPermissions(ctx context.Context, id string, ids []string
 	if err := m.checkServices(ids); err != nil {
 		return err
 	}
-	permissions, err := m.normalizeMCPPermissions(ids, requested)
+	current, err := m.store.Sandbox(id)
+	if err != nil {
+		return err
+	}
+	permissions, err := m.normalizeMCPPermissions(ids, requested, current.MCPPermissions)
 	if err != nil {
 		return err
 	}
@@ -426,6 +441,10 @@ func (m *Manager) startSnapshot(ctx context.Context, id string, original *sandbo
 	}
 	services, err := m.servicesFor(sbx)
 	if err != nil {
+		m.stopContainers(context.Background(), n)
+		return err
+	}
+	if sbx, err = m.prepareRemote(ctx, sbx, services); err != nil {
 		m.stopContainers(context.Background(), n)
 		return err
 	}
@@ -661,24 +680,38 @@ func (m *Manager) gateConfig(ctx context.Context, sbx sandbox.Sandbox, providers
 		if service.IsConnector() {
 			continue // its secret goes to the connector, not to the gatekeeper
 		}
-		token, err := m.serviceToken(ctx, service)
+		route, err := m.remoteRoute(ctx, sbx, service)
 		if err != nil && service.IsOAuth() {
 			// An expired login is routine: the sandbox still starts, only this service stays closed.
 			m.progress(sbx.ID, fmt.Sprintf("MCP 服务「%s」需要重新登录授权，本次先不开放（%v）", service.Name, err))
 			continue
 		}
 		if err != nil {
-			return config, fmt.Errorf("MCP 服务「%s」的令牌不可用：%w", service.Name, err)
+			return config, err
 		}
-		placeholder := sbx.Placeholders[mcp.PlaceholderKey(id)]
-		if placeholder == "" {
-			return config, fmt.Errorf("MCP 服务「%s」缺少占位符", service.Name)
-		}
-		config.Secrets = append(config.Secrets, gatekeeper.Secret{ID: mcp.SecretID(id), Placeholder: placeholder,
-			Header: "Authorization", Prefix: "Bearer ", Value: string(token)})
-		config.Policy.Rules = append(config.Policy.Rules, service.Rules()...)
+		config.Connectors = append(config.Connectors, route)
 	}
 	return config, nil
+}
+
+// remoteRoute sends a remote service's messages through the gateway, which holds its token and
+// checks every tool call against the sandbox's grant. The proxy gets no rule for the service, so
+// the agent cannot reach it any other way.
+func (m *Manager) remoteRoute(ctx context.Context, sbx sandbox.Sandbox, service mcp.Service) (gatekeeper.Connector, error) {
+	token, err := m.serviceToken(ctx, service)
+	if err != nil {
+		return gatekeeper.Connector{}, fmt.Errorf("MCP 服务「%s」的令牌不可用：%w", service.Name, err)
+	}
+	placeholder := sbx.Placeholders[mcp.PlaceholderKey(service.ID)]
+	if placeholder == "" {
+		return gatekeeper.Connector{}, fmt.Errorf("MCP 服务「%s」缺少占位符", service.Name)
+	}
+	upstream, err := service.Upstream()
+	if err != nil {
+		return gatekeeper.Connector{}, err
+	}
+	return gatekeeper.Connector{ID: service.ID, Placeholder: placeholder, Upstream: upstream, Token: token,
+		Tools: grantedTools(sbx, service), ToolsRestricted: true, Remote: true}, nil
 }
 
 // OAuthMargin is how long an OAuth access token must stay valid when handed to a gatekeeper.
@@ -687,6 +720,9 @@ const OAuthMargin = 5 * time.Minute
 // serviceToken returns the bearer token of a remote MCP service. OAuth tokens are refreshed on
 // the host first when they would expire soon; refresh tokens never leave the host.
 func (m *Manager) serviceToken(ctx context.Context, service mcp.Service) (string, error) {
+	if service.Auth == mcp.AuthNone {
+		return "", nil
+	}
 	if service.IsOAuth() {
 		creds, _, err := m.OAuth.AccessToken(ctx, m.vault, service.KeyRef, OAuthMargin)
 		if err != nil {
@@ -708,6 +744,9 @@ func (m *Manager) configure(ctx context.Context, client *gateClient, sbx sandbox
 	err = client.putConfig(ctx, config)
 	for i := range config.Secrets {
 		config.Secrets[i].Value = ""
+	}
+	for i := range config.Connectors {
+		config.Connectors[i].Token = ""
 	}
 	return err
 }
@@ -835,6 +874,9 @@ func (m *Manager) refresh(ctx context.Context, sbx sandbox.Sandbox) error {
 	}
 	services, err := m.servicesFor(sbx)
 	if err != nil {
+		return err
+	}
+	if sbx, err = m.prepareRemote(ctx, sbx, services); err != nil {
 		return err
 	}
 	routes, err := m.syncConnectors(ctx, sbx, services)

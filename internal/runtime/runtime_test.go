@@ -122,7 +122,10 @@ func TestMCPConfigUsesPlaceholdersOnly(t *testing.T) {
 		byPath[f.Path] = f
 	}
 	config := byPath[".codex/config.toml"].Content
-	for _, want := range []string{"[mcp_servers.github]", `url = "https://api.githubcopilot.com/mcp/"`,
+	if strings.Contains(config, "api.githubcopilot.com") {
+		t.Errorf("agents must only know the gateway address of a remote service:\n%s", config)
+	}
+	for _, want := range []string{"[mcp_servers.github]", `url = "http://gatekeeper:8890/mcp/github"`,
 		`bearer_token_env_var = "AIOFCAGE_MCP_GITHUB_TOKEN"`, "[mcp_servers.filesystem]", `args = ["/Users/u/CageWorkspace/p"]`,
 		"[mcp_servers.shop]", `url = "http://gatekeeper:8890/mcp/shop"`, `bearer_token_env_var = "AIOFCAGE_MCP_SHOP_TOKEN"`} {
 		if !strings.Contains(config, want) {

@@ -186,7 +186,7 @@ func (a *App) sandboxContext(id string) (map[string]any, error) {
 			if service.IsConnector() {
 				allowed = append(allowed, "MCP "+id+"（数据库，经沙箱外的可信连接器，只读）")
 			} else if host, _, err := service.Endpoint(); err == nil {
-				allowed = append(allowed, host+"（MCP）")
+				allowed = append(allowed, "MCP "+id+"（远程服务 "+host+"：Agent 只能经门卫 MCP 网关调用已授权的工具，不能直连）")
 			}
 		}
 	}

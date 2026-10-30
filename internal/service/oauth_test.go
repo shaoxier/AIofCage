@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -27,7 +28,19 @@ func TestOAuthServiceRefreshesBeforeUse(t *testing.T) {
 			json.NewEncoder(w).Encode(map[string]any{"access_token": "access-2", "refresh_token": "refresh-2", "expires_in": 3600, "token_type": "Bearer"})
 		case "/mcp":
 			mcpAuth = r.Header.Get("Authorization")
-			w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"fake"}}}`))
+			var msg struct {
+				ID     int    `json:"id"`
+				Method string `json:"method"`
+			}
+			json.NewDecoder(r.Body).Decode(&msg)
+			switch msg.Method {
+			case "initialize":
+				fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"fake"}}}`, msg.ID)
+			case "tools/list":
+				fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"tools":[{"name":"search","annotations":{"readOnlyHint":true}},{"name":"create_page"}]}}`, msg.ID)
+			default:
+				w.WriteHeader(http.StatusAccepted)
+			}
 		default:
 			http.NotFound(w, r)
 		}
@@ -58,8 +71,11 @@ func TestOAuthServiceRefreshesBeforeUse(t *testing.T) {
 		t.Fatalf("a refresh token keeps the login usable: %+v", views)
 	}
 	result, err := app.TestMCPService(view.ID)
-	if err != nil || !result.OK || mcpAuth != "Bearer access-2" {
+	if err != nil || !result.OK || mcpAuth != "Bearer access-2" || !strings.Contains(result.Message, "2 个工具，其中 1 个") {
 		t.Fatalf("test must refresh first: %+v %v %q", result, err, mcpAuth)
+	}
+	if listed, _ := app.ListMCPServices(); len(listed[0].Tools) != 2 || len(listed[0].DefaultTools) != 1 || listed[0].DefaultTools[0] != "search" {
+		t.Fatalf("testing a remote service updates its tool list: %+v", listed[0])
 	}
 	saved, _ := oauth.Parse(secrets[view.KeyRef])
 	if saved.AccessToken != "access-2" || saved.RefreshToken != "refresh-2" {

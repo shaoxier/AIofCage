@@ -31,13 +31,79 @@ func connectorName(sandboxID, serviceID string) string {
 	return "aiofcage-" + sandboxID + "-mcp-" + serviceID
 }
 
-func connectorTools(sbx sandbox.Sandbox, service mcp.Service) []string {
+// grantedTools is the sandbox's grant for a service. Sandboxes saved before grants existed get
+// the service's default tools until a grant is pinned (see pinGrants).
+func grantedTools(sbx sandbox.Sandbox, service mcp.Service) []string {
 	if tools, ok := sbx.MCPPermissions[service.ID]; ok {
-		return append([]string(nil), tools...)
+		return append([]string{}, tools...)
 	}
-	// Sandboxes created before per-service grants keep the catalog-defined tools until
-	// their MCP settings are saved again.
-	return service.Tools()
+	return service.DefaultTools()
+}
+
+// prepareRemote lists the tools of remote services whose tools were never listed, and pins the
+// default grant of services the sandbox uses without one once their tools are known: tools a
+// service adds later must not be granted without the user choosing them. services is updated.
+func (m *Manager) prepareRemote(ctx context.Context, sbx sandbox.Sandbox, services map[string]mcp.Service) (sandbox.Sandbox, error) {
+	pins := map[string][]string{}
+	for _, id := range sortedKeys(services) {
+		service := services[id]
+		if service.IsConnector() {
+			continue
+		}
+		if service.CatalogAt == nil && m.http != nil {
+			m.progress(sbx.ID, "获取 MCP 服务「"+service.Name+"」的工具列表")
+			if listed, err := m.ListTools(ctx, service); err != nil {
+				m.progress(sbx.ID, fmt.Sprintf("没能获取「%s」的工具列表，本次不开放它的工具（%v）", service.Name, err))
+			} else {
+				service = listed
+				services[id] = listed
+			}
+		}
+		if _, ok := sbx.MCPPermissions[id]; !ok && service.CatalogAt != nil {
+			pins[id] = service.DefaultTools()
+		}
+	}
+	if len(pins) == 0 {
+		return sbx, nil
+	}
+	pin := func(s *sandbox.Sandbox) {
+		if s.MCPPermissions == nil {
+			s.MCPPermissions = map[string][]string{}
+		}
+		for id, tools := range pins {
+			if _, ok := s.MCPPermissions[id]; !ok {
+				s.MCPPermissions[id] = append([]string{}, tools...)
+			}
+		}
+	}
+	if err := m.store.UpdateSandbox(sbx.ID, func(s *sandbox.Sandbox) error { pin(s); return nil }); err != nil {
+		return sbx, err
+	}
+	sbx.MCPPermissions = cloneMCPPermissions(sbx.MCPPermissions)
+	pin(&sbx)
+	return sbx, nil
+}
+
+// ListTools asks a remote service for its tools with the token the host holds and saves them as
+// the service's tool list. Grants are not changed.
+func (m *Manager) ListTools(ctx context.Context, service mcp.Service) (mcp.Service, error) {
+	upstream, err := service.Upstream()
+	if err != nil {
+		return service, err
+	}
+	token, err := m.serviceToken(ctx, service)
+	if err != nil {
+		return service, err
+	}
+	listCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	tools, err := mcp.ListTools(listCtx, m.http, upstream, token)
+	if err != nil {
+		return service, err
+	}
+	now := time.Now().UTC()
+	service.Catalog, service.CatalogAt = tools, &now
+	return service, m.store.SaveMCPService(service)
 }
 
 func connectorServices(services map[string]mcp.Service) []mcp.Service {
@@ -138,7 +204,7 @@ func (m *Manager) syncConnectors(ctx context.Context, sbx sandbox.Sandbox, servi
 			return nil, fmt.Errorf("MCP 服务「%s」缺少占位符", service.Name)
 		}
 		routes = append(routes, gatekeeper.Connector{ID: service.ID, Placeholder: placeholder,
-			Upstream: "http://" + ip + ":" + connectorPort, Token: token, Tools: connectorTools(sbx, service), ToolsRestricted: true})
+			Upstream: "http://" + ip + ":" + connectorPort, Token: token, Tools: grantedTools(sbx, service), ToolsRestricted: true})
 	}
 	return routes, nil
 }

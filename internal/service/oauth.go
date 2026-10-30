@@ -45,7 +45,14 @@ func (a *App) AuthorizeMCPService(id string) (MCPServiceView, error) {
 	if err := a.vault.Put(ctx, service.KeyRef, data); err != nil {
 		return MCPServiceView{}, err
 	}
+	toolsErr := ""
+	if listed, err := a.listServiceTools(ctx, service); err != nil {
+		toolsErr = err.Error()
+	} else {
+		service = listed
+	}
 	view, err := a.mcpView(service)
+	view.ToolsError = toolsErr
 	if err != nil {
 		return view, err
 	}
