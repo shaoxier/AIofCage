@@ -115,7 +115,39 @@ func (p Provider) Validate() error {
 	if p.Agent == session.DSH && ((p.Protocol == Anthropic && p.Auth != AuthXAPIKey) || (p.Protocol != Anthropic && p.Auth != AuthBearer)) {
 		return errors.New("DeepSeek Harness 的 Anthropic 协议使用 x-api-key，OpenAI 协议使用 bearer")
 	}
-	return nil
+	return p.KeyRefAllowed()
+}
+
+// KeyRefAllowed reports whether this provider may send its key to its endpoint. Items AIofCage
+// created for the provider go anywhere the user points them; a Keychain item named by a preset
+// (such as the competition key) stays bound to that preset's host, so editing the address
+// cannot redirect it elsewhere.
+func (p Provider) KeyRefAllowed() error {
+	if p.KeyRef == KeyRefFor(p.ID) {
+		return nil
+	}
+	host, _, err := p.Endpoint()
+	if err != nil {
+		return err
+	}
+	var hosts []string
+	for _, preset := range Presets() {
+		if preset.ExistingKeyRef == "" || preset.ExistingKeyRef != p.KeyRef {
+			continue
+		}
+		presetHost, _, err := Provider{BaseURL: preset.BaseURL}.Endpoint()
+		if err != nil {
+			continue
+		}
+		if presetHost == host {
+			return nil
+		}
+		hosts = append(hosts, presetHost)
+	}
+	if len(hosts) == 0 {
+		return fmt.Errorf("钥匙串条目 %s 不是 AIofCage 为这个供应商保存的密钥", p.KeyRef)
+	}
+	return fmt.Errorf("钥匙串条目 %s 只能发往 %s；改用其他接口地址时请填写自己的 API Key", p.KeyRef, strings.Join(hosts, "、"))
 }
 
 // Endpoint returns the HTTPS host and base path of BaseURL.

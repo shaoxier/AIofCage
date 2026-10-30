@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/shaoxier/AIofCage/internal/provider"
@@ -94,6 +95,66 @@ func TestSaveProviderValidation(t *testing.T) {
 	chat.Protocol = provider.OpenAIChat
 	if _, err := app.SaveProvider(chat); err == nil {
 		t.Fatal("codex with chat protocol accepted")
+	}
+}
+
+func TestPresetKeyStaysOnPresetHost(t *testing.T) {
+	app, secrets, st := newApp(t)
+	secrets["sbx-builderday-key"] = []byte("competition-key-0001")
+	preset := codexRequest()
+	preset.APIKey, preset.ExistingKeyRef = "", "sbx-builderday-key"
+	view, err := app.SaveProvider(preset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A copy refers to the preset item instead of cloning the key into an item of its own.
+	copied, err := app.DuplicateProvider(view.ID)
+	if err != nil || copied.KeyRef != "sbx-builderday-key" || len(secrets) != 1 {
+		t.Fatalf("copy: %+v %v, %d vault items", copied, err, len(secrets))
+	}
+	moved := preset
+	moved.ID, moved.BaseURL = copied.ID, "https://collector.example/v1"
+	if _, err := app.SaveProvider(moved); err == nil || !strings.Contains(err.Error(), "xapi.qiniu.io") {
+		t.Fatalf("preset key followed the provider to another host: %v", err)
+	}
+	// A record edited before this check existed is still refused when the key would be used.
+	p, _ := st.Provider(view.ID)
+	p.BaseURL = "https://collector.example/v1"
+	if err := st.SaveProvider(p); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := app.TestProvider(view.ID); err != nil || result.OK || !strings.Contains(result.Message, "xapi.qiniu.io") {
+		t.Fatalf("connection test used the preset key on another host: %+v %v", result, err)
+	}
+}
+
+func TestProviderTestDoesNotFollowRedirects(t *testing.T) {
+	app, _, _ := newApp(t)
+	var followed atomic.Bool
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/collect" {
+			followed.Store(true)
+			return
+		}
+		http.Redirect(w, r, "/collect", http.StatusTemporaryRedirect)
+	}))
+	defer server.Close()
+	transport := server.Client().Transport.(*http.Transport).Clone()
+	address := server.Listener.Addr().String()
+	transport.DialContext = func(ctx context.Context, network, _ string) (netConn, error) {
+		return (&dialer{}).DialContext(ctx, network, address)
+	}
+	client := *app.client // keep the redirect policy NewApp sets
+	client.Transport = transport
+	app.client = &client
+	view, err := app.SaveProvider(SaveProviderRequest{Name: "test", Agent: session.Codex, Protocol: provider.OpenAIResponses,
+		BaseURL: "https://example.com/v1", Model: "m", Auth: provider.AuthXAPIKey, APIKey: "redirect-test-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := app.TestProvider(view.ID)
+	if err != nil || result.OK || result.Status != http.StatusTemporaryRedirect || !strings.Contains(result.Message, "跳转") || followed.Load() {
+		t.Fatalf("redirect: %+v %v followed=%v", result, err, followed.Load())
 	}
 }
 

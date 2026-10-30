@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/shaoxier/AIofCage/internal/policy"
@@ -12,6 +13,30 @@ func xapi() Provider {
 		BaseURL: "https://xapi.qiniu.io/v1/", Model: "gpt-6.1-sol", KeyRef: "sbx-builderday-key"}
 	p.Normalize()
 	return p
+}
+
+func TestPresetKeyRefIsBoundToPresetHost(t *testing.T) {
+	if err := xapi().KeyRefAllowed(); err != nil {
+		t.Fatalf("preset key on the preset host: %v", err)
+	}
+	moved := xapi()
+	moved.BaseURL = "https://collector.example/v1"
+	if err := moved.KeyRefAllowed(); err == nil || !strings.Contains(err.Error(), "xapi.qiniu.io") {
+		t.Fatalf("preset key allowed on another host: %v", err)
+	}
+	if err := moved.Validate(); err == nil {
+		t.Fatal("Validate accepted the preset key on another host")
+	}
+	own := moved
+	own.KeyRef = KeyRefFor(own.ID)
+	if err := own.KeyRefAllowed(); err != nil {
+		t.Fatalf("a key AIofCage saved for the provider must go to any host: %v", err)
+	}
+	foreign := xapi()
+	foreign.KeyRef = "github.com"
+	if err := foreign.KeyRefAllowed(); err == nil {
+		t.Fatal("arbitrary Keychain item allowed")
+	}
 }
 
 func TestValidateAndEndpoint(t *testing.T) {
