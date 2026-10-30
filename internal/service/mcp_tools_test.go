@@ -9,10 +9,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/shaoxier/AIofCage/internal/sandbox"
 )
 
 func TestRemoteServiceToolListAndNoAuth(t *testing.T) {
-	app, secrets, _ := newApp(t)
+	app, secrets, st := newApp(t)
 	var mu sync.Mutex
 	var auth []string
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -79,9 +81,16 @@ func TestRemoteServiceToolListAndNoAuth(t *testing.T) {
 	if _, ok := secrets[view.KeyRef]; ok {
 		t.Fatal("a token is removed when the service no longer needs one")
 	}
+	if err := st.SaveSandbox(sandbox.Sandbox{ID: "sbx-docs0001", Name: "docs", MCP: []string{view.ID},
+		MCPPermissions: map[string][]string{view.ID: {"delete"}, "other": {"x"}}}); err != nil {
+		t.Fatal(err)
+	}
 	moved, err := app.SaveMCPService(SaveMCPServiceRequest{ID: view.ID, Name: "Docs", URL: "https://example.com/other", NoAuth: true})
 	if err != nil || moved.ToolsError == "" || len(moved.Tools) != 0 || moved.CatalogAt != nil {
 		t.Fatalf("another address must not keep the old tool list: %+v %v", moved, err)
+	}
+	if saved, _ := st.Sandbox("sbx-docs0001"); fmt.Sprint(saved.MCPPermissions) != "map[other:[x]]" {
+		t.Fatalf("grants naming the old server's tools must be dropped: %v", saved.MCPPermissions)
 	}
 	if _, err := app.RefreshMCPTools(view.ID); err == nil || !strings.Contains(err.Error(), "404") {
 		t.Fatalf("refresh reports why the list is unavailable: %v", err)

@@ -85,6 +85,12 @@
 
 门卫的审计事件里，每次 `tools/call` 都带服务名、主机和工具名，例如 `mcp:cfdocs/search_cloudflare_documentation`。拒绝的调用也有记录，例如 `mcp:deepwiki/ask_wiki_question` 记为 `mcp_tool_denied`。事件里没有提问内容和工具参数。
 
+**数据库连接器回归：** 用新门卫启动已有的 `s9-db` 沙箱（演示商城数据库，专用只读账号）。
+
+- tools/list 只有 `query`，只读查询返回结果；
+- `{"name":"drop_everything","Name":"query"}` 返回 400；
+- 检查后沙箱已停回原状态。
+
 **带令牌的链路：** 用本次生成的合成令牌（不对应任何真实账号）添加了一个指向 Cloudflare 文档的“访问令牌”类服务，经门卫的调用正常返回。随后把沙箱里的环境变量、进程参数、四份 Agent 配置，以及主目录、`/tmp`、`/etc` 下的文件导出到宿主比对，都没有这个令牌。验证结束后已停用这个服务，并删除服务和钥匙串条目。
 
 ## 范围与限制

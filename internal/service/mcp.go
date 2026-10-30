@@ -14,6 +14,7 @@ import (
 	"github.com/shaoxier/AIofCage/internal/mcp"
 	"github.com/shaoxier/AIofCage/internal/oauth"
 	"github.com/shaoxier/AIofCage/internal/runtime"
+	"github.com/shaoxier/AIofCage/internal/sandbox"
 )
 
 // MCPServiceView never contains the token, only whether one is saved. For OAuth services
@@ -120,7 +121,8 @@ func (a *App) SaveMCPService(request SaveMCPServiceRequest) (MCPServiceView, err
 	if request.NoAuth {
 		service.Auth = mcp.AuthNone
 	}
-	if service.URL != previousURL {
+	moved := existing && service.URL != previousURL && !service.IsConnector()
+	if moved {
 		// Another address may be another server: its tools must be listed again before any is granted.
 		service.Catalog, service.CatalogAt = nil, nil
 	}
@@ -169,6 +171,11 @@ func (a *App) SaveMCPService(request SaveMCPServiceRequest) (MCPServiceView, err
 	if err := a.store.SaveMCPService(service); err != nil {
 		return MCPServiceView{}, err
 	}
+	if moved {
+		if err := a.dropGrants(service.ID); err != nil {
+			return MCPServiceView{}, err
+		}
+	}
 	toolsErr := ""
 	if !service.IsConnector() && !service.IsOAuth() {
 		// The user chooses tools per sandbox, so list them now; OAuth services list after login.
@@ -187,6 +194,28 @@ func (a *App) SaveMCPService(request SaveMCPServiceRequest) (MCPServiceView, err
 		return view, a.refreshSandboxesUsing(ctx, service.ID)
 	}
 	return view, nil
+}
+
+// dropGrants removes the tool grants sandboxes hold for a service whose address changed: they
+// name tools of the old server, even when the new one has tools of the same name. Each sandbox
+// then gets the new server's read-only default once its tools are listed.
+func (a *App) dropGrants(serviceID string) error {
+	sandboxes, err := a.store.Sandboxes()
+	if err != nil {
+		return err
+	}
+	for _, sbx := range sandboxes {
+		if _, granted := sbx.MCPPermissions[serviceID]; !granted {
+			continue
+		}
+		if err := a.store.UpdateSandbox(sbx.ID, func(s *sandbox.Sandbox) error {
+			delete(s.MCPPermissions, serviceID)
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // listServiceTools fetches a remote service's tools from the Mac with the credential the app
