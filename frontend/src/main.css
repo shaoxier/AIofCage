@@ -252,6 +252,8 @@ input[type="radio"], input[type="checkbox"] { width: 16px; height: 16px; min-hei
 .input-row button { flex-shrink: 0; }
 .agent-pick { display: grid; gap: 10px; }
 .mcp-choice { display: grid; gap: 5px; }
+.dev-group { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; }
+.dev-group-name { min-width: 44px; color: var(--muted); font-size: var(--text-sm); }
 .mcp-tool-list { display: grid; gap: 4px; margin: 0 0 4px 28px; padding: 8px 10px; border-left: 2px solid var(--line); color: var(--faint); }
 .mcp-tool-list label.check { min-height: 24px; font-size: var(--text-sm); color: var(--ink); flex-wrap: wrap; }
 .mcp-tool-list label.check .muted { font-size: var(--text-xs); }

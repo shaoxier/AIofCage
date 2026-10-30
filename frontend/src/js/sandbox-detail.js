@@ -1,5 +1,6 @@
 // 沙箱详情页（参考 Docker Desktop 点开容器）：终端、概览、日志三个标签。
 import { useEffect, useRef, useState } from "preact/hooks";
+import { DevSourceLine } from "./dev-sources.js";
 import { html, call, AGENTS, agentName, STATES, ConfirmDialog, Icon, agentIcon } from "./core.js";
 import { BindingSelects, MCPLine, UsageStats } from "./sandboxes.js";
 import { HealthPanel } from "./health.js";
@@ -23,7 +24,7 @@ const TABS = [
 ];
 
 export function SandboxDetail({ sandbox, detail, setDetail, providers, services, recoverable, events, usage, vm, busy, progress, run, notify,
-  onAddAgents, onEditMCP, onAttack, onReset, onDelete, onLogs, dialogs }) {
+  onAddAgents, onEditMCP, onAttack, onReset, onDelete, onLogs, dialogs, devSources, onEditDev }) {
   const [restartConfirm, setRestartConfirm] = useState(false);
   const tab = detail.tab ?? "overview";
   const state = STATES[sandbox.state] ?? STATES.unknown;
@@ -69,6 +70,7 @@ export function SandboxDetail({ sandbox, detail, setDetail, providers, services,
         <div><h3>智能体与供应商</h3><button class="link" onClick=${() => setDetail({ ...detail, tab: "agents" })}>管理智能体</button><p class="caption">选择在下次重启沙箱后应用。</p>
           <${BindingSelects} sandbox=${sandbox} providers=${providers} busy=${busy} run=${run} notify=${notify} /></div>
         <div><h3>MCP 服务</h3><${MCPLine} sandbox=${sandbox} services=${services} busy=${busy} onEditMCP=${onEditMCP} /></div>
+        <div><h3>开发环境</h3><${DevSourceLine} sandbox=${sandbox} sources=${devSources ?? []} busy=${busy} onEdit=${onEditDev} /></div>
         <div><h3>用量</h3><${UsageStats} sandbox=${sandbox} usage=${usage} /></div>
       </div>`}
       ${tab === "health" && html`<${HealthPanel} sandbox=${sandbox} vm=${vm} events=${events} />`}

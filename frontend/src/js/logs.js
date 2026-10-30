@@ -60,7 +60,7 @@ export function LogsPage({ events, sandboxes, providers, sandboxFilter, setSandb
                 <span>${REASONS[e.reason_code] ?? e.reason_code}</span>
                 <span class="mono target">${e.action === "mcp.call"
                   ? `MCP ${e.service_id ?? ""} · ${e.tool_id || e.method || ""}`
-                  : `${e.method ? `${e.method} ` : ""}${e.host ?? ""}${e.path ?? ""}`}${e.status ? ` · ${e.status}` : ""}</span>
+                  : `${e.method ? `${e.method} ` : ""}${e.host ?? ""}${e.path ?? ""}${e.redirect_host ? ` → ${e.redirect_host}` : ""}`}${e.status ? ` · ${e.status}` : ""}</span>
                 <span>${e.secret_ref ? providerName(e.secret_ref) : ""}</span>
                 <span class="mono">${e.input_tokens || e.output_tokens ? `${formatTokens(e.input_tokens)}/${formatTokens(e.output_tokens)}` : ""}</span>
                 <span class="mono">${e.duration_ms ? `${e.duration_ms} ms` : ""}</span>
