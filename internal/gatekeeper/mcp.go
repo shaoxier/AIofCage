@@ -2,6 +2,8 @@ package gatekeeper
 
 import (
 	"bytes"
+	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"crypto/subtle"
 	"errors"
@@ -188,6 +190,20 @@ func writeRPCError(w http.ResponseWriter, msg mcpMessage, status int, reason, te
 		"error": map[string]any{"code": -32001, "message": text}})
 }
 
+// decodedBody undoes an answer's content encoding; an encoding the standard library cannot
+// decode is refused rather than passed on unchecked.
+func decodedBody(resp *http.Response) (io.Reader, error) {
+	switch strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))) {
+	case "", "identity":
+		return resp.Body, nil
+	case "gzip", "x-gzip":
+		return gzip.NewReader(resp.Body)
+	case "deflate":
+		return zlib.NewReader(resp.Body)
+	}
+	return nil, errMCPReply
+}
+
 func remoteHost(upstream string) string {
 	u, err := url.Parse(upstream)
 	if err != nil {
@@ -260,7 +276,18 @@ func (g *Gate) forwardMCP(w http.ResponseWriter, r *http.Request, connector Conn
 	}
 	reply := mcpReply{method: msg.Method, connector: connector}
 	var out []byte
+	var answer io.Reader = resp.Body
 	streamed := false
+	if r.Method != http.MethodDelete && status < 400 {
+		// Undo the content encoding, so filtering and masking see what the agent's client would
+		// decode. The agent gets the decoded answer; Content-Encoding is never passed on.
+		decoded, err := decodedBody(resp)
+		if err != nil {
+			g.failRPC(w, msg, event, started, "mcp_invalid_reply", "MCP 服务的回复用了无法检查的压缩格式，AIofCage 门卫没有转交")
+			return
+		}
+		answer = decoded
+	}
 	switch {
 	case r.Method == http.MethodDelete:
 		// A session close carries no data the agent needs.
@@ -276,7 +303,7 @@ func (g *Gate) forwardMCP(w http.ResponseWriter, r *http.Request, connector Conn
 	case strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream"):
 		streamed = true
 	default:
-		data, err := io.ReadAll(io.LimitReader(resp.Body, maxMCPReply+1))
+		data, err := io.ReadAll(io.LimitReader(answer, maxMCPReply+1))
 		if err == nil && len(data) > maxMCPReply {
 			err = errMCPReply
 		}
@@ -306,9 +333,9 @@ func (g *Gate) forwardMCP(w http.ResponseWriter, r *http.Request, connector Conn
 		n, err := w.Write(out)
 		written, copyErr = int64(n), err
 	case reply.rewrites():
-		written, copyErr = copyEvents(w, resp.Body, reply.message, reply.mask)
+		written, copyErr = copyEvents(w, answer, reply.message, reply.mask)
 	default:
-		written, copyErr = copyFlushing(w, resp.Body)
+		written, copyErr = copyFlushing(w, answer)
 	}
 	event.Status, event.BytesOut = status, written
 	event.Decision, event.ReasonCode = audit.DecisionAllow, "mcp_forwarded"

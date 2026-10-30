@@ -33,7 +33,7 @@ func TestParseMCPMessageAcceptsOrdinaryMessages(t *testing.T) {
 		"request":      {`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","Capabilities":{}}}`, "initialize", ""},
 		"notification": {`{"jsonrpc":"2.0","method":"notifications/initialized"}`, "notifications/initialized", ""},
 		"tool call":    {`{"jsonrpc":"2.0","id":"a","method":"tools/call","params":{"name":"query","arguments":{"Name":"x","name":"y"},"_meta":{"progressToken":1}}}`, "tools/call", "query"},
-		"escaped key":  {`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query"}}`, "tools/call", "query"},
+		"escaped key":  {`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"n\u0061me":"query"}}`, "tools/call", "query"},
 		"client reply": {` {"jsonrpc":"2.0","id":7,"result":{"roots":[]}} `, "", ""},
 	}
 	for name, c := range cases {
@@ -49,7 +49,8 @@ func TestParseMCPMessageAcceptsOrdinaryMessages(t *testing.T) {
 		"call without name":  `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}`,
 		"call params array":  `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":["query"]}`,
 		"too many keys":      `{` + manyKeys(70) + `"method":"ping"}`,
-		"escaped repeat":     `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","name":"drop"}}`,
+		"escaped repeat":     `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","n\u0061me":"drop"}}`,
+		"escaped case":       `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"N\u0061me":"query"}}`,
 		"not an object":      `"tools/call"`,
 		"unterminated":       `{"jsonrpc":"2.0","id":1,"method":"ping"`,
 		"method is a number": `{"jsonrpc":"2.0","id":1,"method":7}`,
@@ -82,5 +83,54 @@ func TestCopyEventsKeepsStreamingShape(t *testing.T) {
 	}, nil)
 	if err != errMCPReply || w.Body.String() != "data: {}\n\n" {
 		t.Fatalf("an event that cannot be checked stops the stream before it is relayed: %v %q", err, w.Body.String())
+	}
+}
+
+// Clients end a line at CRLF, LF or a lone CR and drop a byte order mark that opens the stream;
+// the gateway must see the same events, or a filtered listing could slip past it.
+func TestCopyEventsSplitsLinesLikeClients(t *testing.T) {
+	listing := `{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"search"},{"name":"delete_page"}]}}`
+	reply := mcpReply{method: "tools/list", connector: Connector{Tools: []string{"search"}, ToolsRestricted: true}}
+	for name, stream := range map[string]string{
+		"lone CR":         "id: 1\rdata: " + listing + "\r\r",
+		"CRLF":            "id: 1\r\ndata: " + listing + "\r\n\r\n",
+		"CR then CRLF":    "data: " + listing + "\r\r\n",
+		"byte order mark": "\xef\xbb\xbfdata: " + listing + "\n\n",
+	} {
+		w := httptest.NewRecorder()
+		if _, err := copyEvents(w, strings.NewReader(stream), reply.message, nil); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		out := w.Body.String()
+		if !strings.Contains(out, "data: {") || !strings.Contains(out, `"search"`) || strings.Contains(out, "delete_page") {
+			t.Errorf("%s: the listing must arrive filtered: %q", name, out)
+		}
+	}
+	w := httptest.NewRecorder()
+	n, err := copyEvents(w, strings.NewReader("data: {}\r\rdata: {}\r\r"), func(data []byte) ([]byte, error) { return data, nil }, nil)
+	if err != nil || w.Body.String() != "data: {}\n\ndata: {}\n\n" || n != 20 {
+		t.Fatalf("two CR-terminated events must stay two events: %q %v", w.Body.String(), err)
+	}
+}
+
+func TestCopyEventsBoundsEveryLine(t *testing.T) {
+	stream := "x: " + strings.Repeat("a", maxMCPReply) + "\n\n"
+	if _, err := copyEvents(httptest.NewRecorder(), strings.NewReader(stream), func(data []byte) ([]byte, error) { return data, nil }, nil); err != errMCPReply {
+		t.Fatalf("a field line without data must be bounded too: %v", err)
+	}
+}
+
+// A token written with JSON escapes is what the agent's parser reads, so it is masked as well.
+func TestRemoteRepliesMaskEscapedTokens(t *testing.T) {
+	secret := "gsynthetic_TokenValue0123456789"
+	reply := mcpReply{method: "tools/call", connector: Connector{Remote: true, Token: secret}}
+	escaped := `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"\u0067synthetic\u005fTokenValue0123456789"}],"n":1.50}}`
+	out, err := reply.message([]byte(escaped))
+	if err != nil || strings.Contains(string(out), "TokenValue0123456789") || !strings.Contains(string(out), "[REDACTED]") || !strings.Contains(string(out), `"n":1.50`) {
+		t.Fatalf("escaped token: %s %v", out, err)
+	}
+	plain := []byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"\u003cb\u003e nothing secret"}]}}`)
+	if out, err := reply.message(plain); err != nil || string(out) != string(plain) {
+		t.Fatalf("a message without the token is relayed byte for byte: %s %v", out, err)
 	}
 }

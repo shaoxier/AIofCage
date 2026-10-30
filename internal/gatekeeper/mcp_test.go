@@ -1,6 +1,7 @@
 package gatekeeper
 
 import (
+	"compress/zlib"
 	"context"
 	"encoding/json"
 	"io"
@@ -329,6 +330,18 @@ func newRemoteFixture(t *testing.T) *fixture {
 		case "broken":
 			http.Error(w, "bad request for "+remoteToken, http.StatusBadRequest)
 			return
+		case "deflated":
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Encoding", "deflate")
+			compressed := zlib.NewWriter(w)
+			io.WriteString(compressed, `{"jsonrpc":"2.0","id":9,"result":{"content":[{"type":"text","text":"echo `+remoteToken+`"}]}}`)
+			compressed.Close()
+			return
+		case "brotli":
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Encoding", "br")
+			io.WriteString(w, "not decodable")
+			return
 		}
 		body, _ := io.ReadAll(r.Body)
 		var msg struct {
@@ -447,6 +460,14 @@ func TestRemoteMCPGatewayFailures(t *testing.T) {
 	if status != 400 || strings.Contains(body, remoteToken) || !strings.Contains(body, "[REDACTED]") {
 		t.Fatalf("error bodies are relayed with the token masked: %d %s", status, body)
 	}
+	status, body, header = f.callMCP(t, "deflated", `{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"search_docs"}}`)
+	if status != 200 || header.Get("Content-Encoding") != "" || strings.Contains(body, remoteToken) || !strings.Contains(body, "echo [REDACTED]") {
+		t.Fatalf("a compressed answer is decoded before masking and relayed decoded: %d %v %q", status, header, body)
+	}
+	status, body, _ = f.callMCP(t, "brotli", `{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"search_docs"}}`)
+	if status != 200 || !strings.Contains(body, `"code":-32001`) || strings.Contains(body, "not decodable") {
+		t.Fatalf("an encoding the gateway cannot check is not relayed: %d %q", status, body)
+	}
 	status, _, _ = f.callMCP(t, "remote-session", `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
 	if status != http.StatusAccepted {
 		t.Fatalf("notifications are relayed: %d", status)
@@ -496,9 +517,11 @@ func TestRemoteConnectorConfigValidation(t *testing.T) {
 	}
 }
 
-// eventData parses an event stream the way a client does and checks each event's data is JSON.
+// eventData parses an event stream the way a client does (lines end at CRLF, LF or CR) and
+// checks each event's data is JSON.
 func eventData(t *testing.T, stream string) []string {
 	t.Helper()
+	stream = strings.ReplaceAll(strings.ReplaceAll(stream, "\r\n", "\n"), "\r", "\n")
 	var result []string
 	for _, block := range strings.Split(stream, "\n\n") {
 		var lines []string

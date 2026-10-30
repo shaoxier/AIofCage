@@ -148,6 +148,59 @@ func (r mcpReply) mask(data []byte) []byte {
 	return redactSecret(data, r.connector.Token)
 }
 
+// maskDecoded hides the token where a message writes it with JSON escapes (e.g. "\u0067hp_" or
+// "\/"): a byte comparison misses those, but the agent's JSON parser decodes them.
+func (r mcpReply) maskDecoded(data []byte) ([]byte, error) {
+	secret := r.connector.Token
+	if !r.connector.Remote || secret == "" {
+		return data, nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var value any
+	if decoder.Decode(&value) != nil {
+		return data, nil // not JSON: nothing a JSON parser would decode
+	}
+	if !holdsSecret(value, secret) {
+		return data, nil
+	}
+	return marshalCompact(maskValue(value, secret))
+}
+
+func holdsSecret(value any, secret string) bool {
+	switch v := value.(type) {
+	case string:
+		return strings.Contains(v, secret)
+	case []any:
+		return slices.ContainsFunc(v, func(item any) bool { return holdsSecret(item, secret) })
+	case map[string]any:
+		for key, item := range v {
+			if strings.Contains(key, secret) || holdsSecret(item, secret) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func maskValue(value any, secret string) any {
+	switch v := value.(type) {
+	case string:
+		return string(redactSecret([]byte(v), secret))
+	case []any:
+		for i, item := range v {
+			v[i] = maskValue(item, secret)
+		}
+	case map[string]any:
+		masked := make(map[string]any, len(v))
+		for key, item := range v {
+			masked[string(redactSecret([]byte(key), secret))] = maskValue(item, secret)
+		}
+		return masked
+	}
+	return value
+}
+
 // body rewrites a JSON response: one message, or a batch of them.
 func (r mcpReply) body(data []byte) ([]byte, error) {
 	trimmed := bytes.TrimSpace(data)
@@ -184,7 +237,7 @@ func (r mcpReply) message(data []byte) ([]byte, error) {
 		}
 		out = rewritten
 	}
-	return r.mask(out), nil
+	return r.maskDecoded(r.mask(out))
 }
 
 // rewriteResult applies change to a response's result; errors and notifications pass unchanged.
@@ -263,11 +316,12 @@ func marshalCompact(value any) (json.RawMessage, error) {
 
 // copyEvents relays a server-sent event stream one complete event at a time, passing each
 // event's data through rewrite and everything sent through mask. Comments and the other fields
-// are kept, and every event is flushed at once so streamed answers are not held back. An event
-// cut off by the end of the stream is dropped, as a client would drop it.
+// are kept, and every event is flushed at once so streamed answers are not held back. Lines are
+// split as clients split them, and an event cut off by the end of the stream is dropped, as a
+// client would drop it.
 func copyEvents(w http.ResponseWriter, body io.Reader, rewrite func([]byte) ([]byte, error), mask func([]byte) []byte) (int64, error) {
 	controller := http.NewResponseController(w)
-	reader := bufio.NewReaderSize(body, 64<<10)
+	lines := &eventLines{reader: bufio.NewReaderSize(body, 64<<10)}
 	var total int64
 	var event, data bytes.Buffer
 	hasData := false
@@ -281,16 +335,15 @@ func copyEvents(w http.ResponseWriter, body io.Reader, rewrite func([]byte) ([]b
 		return err
 	}
 	for {
-		line, err := readEventLine(reader)
+		line, err := lines.next(maxMCPReply - event.Len() - data.Len())
 		if err == io.EOF {
 			return total, nil // anything read here lacks its terminator, so its event is incomplete
 		}
 		if err != nil {
 			return total, err
 		}
-		text := bytes.TrimRight(line, "\r\n")
 		switch {
-		case len(text) == 0:
+		case len(line) == 0:
 			if hasData {
 				out, err := rewrite(data.Bytes())
 				if err != nil {
@@ -310,15 +363,15 @@ func copyEvents(w http.ResponseWriter, body io.Reader, rewrite func([]byte) ([]b
 			event.Reset()
 			data.Reset()
 			hasData = false
-		case text[0] == ':' && event.Len() == 0 && !hasData:
+		case line[0] == ':' && event.Len() == 0 && !hasData:
 			// A keep-alive comment between events.
-			if err := send(append(text, '\n')); err != nil {
+			if err := send(append(line, '\n')); err != nil {
 				return total, err
 			}
 		default:
-			name, value, _ := bytes.Cut(text, []byte(":"))
+			name, value, _ := bytes.Cut(line, []byte(":"))
 			if string(name) != "data" {
-				event.Write(text)
+				event.Write(line)
 				event.WriteByte('\n')
 				break
 			}
@@ -327,24 +380,48 @@ func copyEvents(w http.ResponseWriter, body io.Reader, rewrite func([]byte) ([]b
 			}
 			data.Write(bytes.TrimPrefix(value, []byte(" ")))
 			hasData = true
-			if data.Len()+event.Len() > maxMCPReply {
-				return total, errMCPReply
-			}
 		}
 	}
 }
 
-// readEventLine reads one line, terminator included, of at most maxMCPReply bytes.
-func readEventLine(reader *bufio.Reader) ([]byte, error) {
+// eventLines splits an event stream into lines the way clients do: a line ends at CRLF, LF or a
+// lone CR, and a byte order mark opening the stream is dropped.
+type eventLines struct {
+	reader  *bufio.Reader
+	started bool
+	afterCR bool
+}
+
+// next returns one line without its terminator; a line longer than limit is an error.
+func (l *eventLines) next(limit int) ([]byte, error) {
+	if !l.started {
+		l.started = true
+		if mark, err := l.reader.Peek(3); err == nil && string(mark) == "\xef\xbb\xbf" {
+			_, _ = l.reader.Discard(3)
+		}
+	}
 	var line []byte
 	for {
-		chunk, err := reader.ReadSlice('\n')
-		if len(line)+len(chunk) > maxMCPReply {
-			return nil, errMCPReply
-		}
-		line = append(line, chunk...)
-		if err != bufio.ErrBufferFull {
+		b, err := l.reader.ReadByte()
+		if err != nil {
 			return line, err
 		}
+		if l.afterCR {
+			l.afterCR = false
+			if b == '\n' {
+				continue // the LF of a CRLF whose CR already ended the line
+			}
+		}
+		switch b {
+		case '\n':
+			return line, nil
+		case '\r':
+			l.afterCR = true
+			return line, nil
+		}
+		if len(line) >= limit {
+			return nil, errMCPReply
+		}
+		line = append(line, b)
 	}
 }
