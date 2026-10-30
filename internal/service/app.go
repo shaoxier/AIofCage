@@ -51,15 +51,20 @@ type App struct {
 	onboardingMu  sync.Mutex
 }
 
+// noRedirect keeps credentials on the host they were sent to. Go would carry custom headers such
+// as X-Api-Key to another site on a redirect, and it does not refuse an https to http downgrade.
+func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
 // NewApp wires the use cases. manager may be nil when Docker or Colima is missing; managerErr then
 // explains why, and environment checks surface it to the user.
 func NewApp(st *store.Store, secrets vault.Store, manager *runtime.Manager, managerErr error, picker DirectoryPicker) *App {
 	// Connection tests and OAuth go straight to the service; shell proxy settings are ignored on purpose.
-	client := &http.Client{Timeout: 12 * time.Second, Transport: &http.Transport{Proxy: nil, TLSHandshakeTimeout: 8 * time.Second}}
+	client := &http.Client{Timeout: 12 * time.Second, Transport: &http.Transport{Proxy: nil, TLSHandshakeTimeout: 8 * time.Second},
+		CheckRedirect: noRedirect}
 	a := &App{store: st, vault: secrets, manager: manager, managerErr: managerErr, picker: picker, now: time.Now,
 		emit: func(string, any) {}, terminal: openInTerminal, monitor: newMonitor(), explain: explainCache{items: map[string]Explanation{}},
 		client: client, oauth: oauth.NewClient(client, openURL), isolationRuns: map[string]SecurityIsolationRun{},
-		explainClient: &http.Client{Transport: &http.Transport{Proxy: nil, TLSHandshakeTimeout: 10 * time.Second}}}
+		explainClient: &http.Client{Transport: &http.Transport{Proxy: nil, TLSHandshakeTimeout: 10 * time.Second}, CheckRedirect: noRedirect}}
 	if manager != nil {
 		manager.BeforeReplace = a.closeSandboxConversations
 		// Progress is remembered as well as emitted, so a page opened later still shows it.
@@ -332,12 +337,16 @@ func (a *App) TestProvider(id string) (TestResult, error) {
 	if err != nil {
 		return TestResult{}, err
 	}
+	if err := p.KeyRefAllowed(); err != nil {
+		return TestResult{Message: err.Error()}, nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	key, err := a.vault.Read(ctx, p.KeyRef)
 	if err != nil {
 		return TestResult{Message: "钥匙串中没有这个供应商的密钥"}, nil
 	}
+	defer clear(key)
 	host, base, err := p.Endpoint()
 	if err != nil {
 		return TestResult{}, err
@@ -367,6 +376,8 @@ func (a *App) TestProvider(id string) (TestResult, error) {
 	switch {
 	case resp.StatusCode == 200:
 		result.OK, result.Message = true, "连接正常，密钥有效"
+	case resp.StatusCode >= 300 && resp.StatusCode < 400:
+		result.Message = fmt.Sprintf("服务返回了跳转（%d）。为保护密钥，AIofCage 不跟随跳转，请检查接口地址", resp.StatusCode)
 	case resp.StatusCode == 401 || resp.StatusCode == 403:
 		result.Message = "服务可达，但密钥无效或没有权限"
 	case resp.StatusCode == 404 || resp.StatusCode == 405:
@@ -510,13 +521,18 @@ func (a *App) DuplicateProvider(id string) (ProviderView, error) {
 	if err != nil {
 		return ProviderView{}, errors.New("原供应商的密钥不可用，无法复制")
 	}
-	defer func() {
-		for i := range key {
-			key[i] = 0
-		}
-	}()
+	defer clear(key)
+	managed := p.KeyRef == provider.KeyRefFor(p.ID)
 	p.ID, p.CreatedAt = newProviderID(), a.now().UTC()
 	p.Name = string([]rune(p.Name)[:min(len([]rune(p.Name)), 55)]) + " 副本"
+	if !managed {
+		// A preset Keychain item stays bound to the preset's host. The copy refers to the same item
+		// instead of cloning the key into an item of its own that could then be sent anywhere.
+		if err := a.store.SaveProvider(p); err != nil {
+			return ProviderView{}, err
+		}
+		return a.view(p, nil), nil
+	}
 	p.KeyRef = provider.KeyRefFor(p.ID)
 	if err := a.vault.Put(ctx, p.KeyRef, key); err != nil {
 		return ProviderView{}, err

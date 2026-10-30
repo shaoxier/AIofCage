@@ -227,12 +227,16 @@ func (a *App) SetExplainerProvider(id string) error {
 const explainTimeout = 90 * time.Second
 
 func (a *App) askExplainer(view ProviderView, system, input string) (Explanation, error) {
+	if err := view.Provider.KeyRefAllowed(); err != nil {
+		return Explanation{}, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), explainTimeout)
 	defer cancel()
 	key, err := a.vault.Read(ctx, view.KeyRef)
 	if err != nil {
 		return Explanation{}, errors.New("钥匙串中没有这个供应商的密钥")
 	}
+	defer clear(key)
 	started := a.now()
 	text, err := complete(ctx, a.explainClient, view.Provider, string(key), system, input)
 	if err != nil {

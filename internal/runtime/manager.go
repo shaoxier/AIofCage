@@ -636,6 +636,9 @@ func (m *Manager) gateConfig(ctx context.Context, sbx sandbox.Sandbox, providers
 	config.Policy.SessionID = sbx.ID
 	for _, id := range sortedKeys(providers) {
 		p := providers[id]
+		if err := p.KeyRefAllowed(); err != nil {
+			return config, fmt.Errorf("供应商「%s」：%w", p.Name, err)
+		}
 		key, err := m.vault.Read(ctx, p.KeyRef)
 		if err != nil {
 			return config, fmt.Errorf("供应商「%s」的密钥不可用：%w", p.Name, err)

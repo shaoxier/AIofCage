@@ -102,3 +102,18 @@ func TestEventStreamPreservesPreviousRunCursor(t *testing.T) {
 		t.Fatalf("真实门卫未先报告跨运行缺口：%+v %v", received, err)
 	}
 }
+
+func TestRuntimeSecretsCoverGateAndConnectorTokens(t *testing.T) {
+	m := &Manager{gates: map[string]*gateClient{"sbx-a": newGateClient("1", "synthetic-admin-token-a")},
+		connectorTokens: map[string]string{
+			connectorName("sbx-a", "db"):  "synthetic-connector-token-a",
+			connectorName("sbx-ab", "db"): "synthetic-connector-token-ab",
+		}}
+	got := map[string]bool{}
+	for _, value := range m.RuntimeSecrets("sbx-a") {
+		got[value] = true
+	}
+	if len(got) != 2 || !got["synthetic-admin-token-a"] || !got["synthetic-connector-token-a"] {
+		t.Fatalf("runtime secrets of sbx-a: %v", got)
+	}
+}

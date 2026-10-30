@@ -618,6 +618,9 @@ func (a *App) ConversationModels(id string) ([]string, error) {
 		return nil, err
 	}
 	p := c.provider
+	if err := p.KeyRefAllowed(); err != nil {
+		return nil, err
+	}
 	host, base, err := p.Endpoint()
 	if err != nil {
 		return nil, err

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/shaoxier/AIofCage/internal/mcp"
+	"github.com/shaoxier/AIofCage/internal/oauth"
 	"github.com/shaoxier/AIofCage/internal/sandbox"
 )
 
@@ -104,13 +105,38 @@ func (a *App) realSecrets(ctx context.Context, sbx sandbox.Sandbox) ([]string, e
 	for _, p := range sbx.AppliedProviders {
 		refs = append(refs, p.KeyRef)
 	}
-	for _, id := range sbx.MCP {
-		refs = append(refs, mcp.KeyRefFor(id))
-	}
 	var values []string
+	add := func(value string) {
+		if len(value) >= 8 {
+			values = append(values, value)
+		}
+	}
 	for _, ref := range refs {
-		if v, err := a.vault.Read(ctx, ref); err == nil && len(v) >= 8 {
-			values = append(values, string(v))
+		if v, err := a.vault.Read(ctx, ref); err == nil {
+			add(string(v))
+			clear(v)
+		}
+	}
+	for _, id := range sbx.MCP {
+		raw, err := a.vault.Read(ctx, mcp.KeyRefFor(id))
+		if err != nil {
+			continue
+		}
+		// OAuth items hold JSON credentials: a leaked access or refresh token on its own must be
+		// caught, not only the whole item.
+		if creds, err := oauth.Parse(raw); err == nil {
+			add(creds.AccessToken)
+			add(creds.RefreshToken)
+			add(creds.ClientSecret)
+		} else {
+			add(string(raw))
+		}
+		clear(raw)
+	}
+	// The management and connector tokens exist only in memory; the agent must not see them either.
+	if a.manager != nil {
+		for _, value := range a.manager.RuntimeSecrets(sbx.ID) {
+			add(value)
 		}
 	}
 	return values, nil

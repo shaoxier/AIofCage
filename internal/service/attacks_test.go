@@ -1,9 +1,13 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"github.com/shaoxier/AIofCage/internal/mcp"
+	"github.com/shaoxier/AIofCage/internal/oauth"
 	"github.com/shaoxier/AIofCage/internal/runtime"
+	"github.com/shaoxier/AIofCage/internal/sandbox"
 	"github.com/shaoxier/AIofCage/internal/store"
 	"github.com/shaoxier/AIofCage/internal/vault"
 	"os"
@@ -11,6 +15,27 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestLeakCheckSplitsOAuthCredentials(t *testing.T) {
+	app, secrets, _ := newApp(t)
+	creds, _ := json.Marshal(oauth.Credentials{ClientID: "client", TokenEndpoint: "https://auth.example/token",
+		AccessToken: "synthetic-oauth-access-0001", RefreshToken: "synthetic-oauth-refresh-0001"})
+	secrets[mcp.KeyRefFor("notion")] = creds
+	secrets[mcp.KeyRefFor("github")] = []byte("synthetic-github-pat-0001")
+	values, err := app.realSecrets(context.Background(), sandbox.Sandbox{ID: "sbx-1", MCP: []string{"notion", "github"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := map[string]bool{}
+	for _, value := range values {
+		found[value] = true
+	}
+	for _, want := range []string{"synthetic-oauth-access-0001", "synthetic-oauth-refresh-0001", "synthetic-github-pat-0001"} {
+		if !found[want] {
+			t.Fatalf("leak check would miss %s; it compares %d values", want, len(values))
+		}
+	}
+}
 
 func TestIsolationEvidenceRequiresSuccessfulExecution(t *testing.T) {
 	for _, tt := range []struct {

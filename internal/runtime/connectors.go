@@ -190,6 +190,25 @@ func (m *Manager) connectorToken(name string) (string, error) {
 	return token, nil
 }
 
+// RuntimeSecrets returns the credentials of a sandbox that exist only in memory: the gatekeeper's
+// management token and the gatekeeper→connector tokens. Isolation checks compare what the agent
+// can see against them.
+func (m *Manager) RuntimeSecrets(id string) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var values []string
+	if gate := m.gates[id]; gate != nil && gate.token != "" {
+		values = append(values, gate.token)
+	}
+	prefix := connectorName(id, "")
+	for name, token := range m.connectorTokens {
+		if strings.HasPrefix(name, prefix) && token != "" {
+			values = append(values, token)
+		}
+	}
+	return values
+}
+
 func randomToken() (string, error) {
 	var raw [32]byte
 	if _, err := rand.Read(raw[:]); err != nil {

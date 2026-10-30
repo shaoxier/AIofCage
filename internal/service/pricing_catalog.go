@@ -42,6 +42,7 @@ func (a *App) PricingSuggestions(model string) ([]PricingSuggestion, error) {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, pricingCatalogURL, nil)
 		client := *a.client
 		client.Timeout = 45 * time.Second
+		client.CheckRedirect = nil // a public catalog fetched without credentials may follow redirects
 		response, err := client.Do(req)
 		if err != nil {
 			return nil, errors.New("读取公开价格失败，请手动填写供应商报价")
