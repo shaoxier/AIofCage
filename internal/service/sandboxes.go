@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/shaoxier/AIofCage/internal/devsource"
 	"github.com/shaoxier/AIofCage/internal/runtime"
 	"github.com/shaoxier/AIofCage/internal/sandbox"
 	"github.com/shaoxier/AIofCage/internal/session"
@@ -57,6 +58,7 @@ type CreateSandboxRequest struct {
 	MCP            []string            `json:"mcp"`
 	MCPPermissions map[string][]string `json:"mcp_permissions"`
 	FilesystemMCP  bool                `json:"filesystem_mcp"`
+	DevSources     []string            `json:"dev_sources"`
 }
 
 func (a *App) CreateSandbox(request CreateSandboxRequest) (SandboxView, error) {
@@ -76,7 +78,7 @@ func (a *App) CreateSandbox(request CreateSandboxRequest) (SandboxView, error) {
 	}
 	sbx, err := a.manager.Create(context.Background(), runtime.CreateRequest{Name: name, ProjectPath: project,
 		Bindings: request.Bindings, Limits: sandbox.Limits{MaxRequests: request.MaxRequests, MaxTokens: request.MaxTokens},
-		MCP: request.MCP, MCPPermissions: request.MCPPermissions, FilesystemMCP: request.FilesystemMCP})
+		MCP: request.MCP, MCPPermissions: request.MCPPermissions, FilesystemMCP: request.FilesystemMCP, DevSources: request.DevSources})
 	if err != nil {
 		return SandboxView{}, err
 	}
@@ -415,4 +417,18 @@ func (a *App) AddSandboxAgents(id string, agents []session.Agent) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Minute)
 	defer cancel()
 	return a.manager.AddAgents(ctx, id, agents)
+}
+
+// ListDevSources lists the development sources a sandbox can open.
+func (a *App) ListDevSources() []devsource.Source { return devsource.Catalog() }
+
+// SetSandboxDevSources chooses the development sources a sandbox may download from; a running
+// sandbox is updated at once.
+func (a *App) SetSandboxDevSources(id string, sources []string) error {
+	if err := a.runtimeReady(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	return a.manager.SetDevSources(ctx, id, sources)
 }

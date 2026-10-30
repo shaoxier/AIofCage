@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/shaoxier/AIofCage/internal/devsource"
 	"github.com/shaoxier/AIofCage/internal/events"
 	"github.com/shaoxier/AIofCage/internal/gatekeeper"
 	"github.com/shaoxier/AIofCage/internal/mcp"
@@ -133,6 +134,7 @@ type CreateRequest struct {
 	MCP            []string            `json:"mcp"`
 	MCPPermissions map[string][]string `json:"mcp_permissions"`
 	FilesystemMCP  bool                `json:"filesystem_mcp"`
+	DevSources     []string            `json:"dev_sources"`
 }
 
 // Create records a sandbox. Docker objects are created on first start.
@@ -140,7 +142,10 @@ func (m *Manager) Create(_ context.Context, request CreateRequest) (sandbox.Sand
 	sbx := sandbox.Sandbox{ID: sandbox.NewID(), Name: strings.TrimSpace(request.Name),
 		ProjectPath: filepath.Clean(request.ProjectPath), Bindings: request.Bindings, Limits: request.Limits,
 		FilesystemMCP: request.FilesystemMCP, MCPPermissions: cloneMCPPermissions(request.MCPPermissions),
-		Placeholders: map[string]string{}, CreatedAt: time.Now().UTC()}
+		DevSources: slices.Clone(request.DevSources), Placeholders: map[string]string{}, CreatedAt: time.Now().UTC()}
+	if err := devsource.Validate(sbx.DevSources); err != nil {
+		return sbx, err
+	}
 	if err := sbx.Validate(); err != nil {
 		return sbx, err
 	}
@@ -295,6 +300,30 @@ func (m *Manager) SetMCPPermissions(ctx context.Context, id string, ids []string
 		return nil
 	})
 	if err != nil {
+		return err
+	}
+	sbx, err := m.store.Sandbox(id)
+	if err != nil {
+		return err
+	}
+	return m.refresh(ctx, sbx)
+}
+
+// SetDevSources changes which development sources a sandbox may download from; a running
+// sandbox gets the new rules and client settings at once.
+func (m *Manager) SetDevSources(ctx context.Context, id string, sources []string) error {
+	if err := devsource.Validate(sources); err != nil {
+		return err
+	}
+	unlock, lockErr := m.lock(ctx, id)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer unlock()
+	if err := m.store.UpdateSandbox(id, func(s *sandbox.Sandbox) error {
+		s.DevSources = slices.Clone(sources)
+		return nil
+	}); err != nil {
 		return err
 	}
 	sbx, err := m.store.Sandbox(id)
@@ -672,6 +701,7 @@ func (m *Manager) gateConfig(ctx context.Context, sbx sandbox.Sandbox, providers
 		BaselineRequests: sbx.Usage.Requests, BaselineTokens: sbx.Usage.Tokens}}
 	config.Policy.Version = uint64(time.Now().UnixMilli())
 	config.Policy.SessionID = sbx.ID
+	config.Policy.Rules = append(config.Policy.Rules, devsource.Rules(sbx.DevSources)...)
 	for _, id := range sortedKeys(providers) {
 		p := providers[id]
 		if err := p.KeyRefAllowed(); err != nil {

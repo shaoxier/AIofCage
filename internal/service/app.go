@@ -419,6 +419,7 @@ type SandboxView struct {
 	MCP            []string            `json:"mcp"`
 	MCPPermissions map[string][]string `json:"mcp_permissions,omitempty"`
 	Filesystem     bool                `json:"filesystem_mcp"`
+	DevSources     []string            `json:"dev_sources"`
 	CreatedAt      time.Time           `json:"created_at"`
 	// Operation is the lifecycle operation in progress (启动、停止、删除) and Progress its latest step.
 	Operation     string `json:"operation,omitempty"`
@@ -489,7 +490,8 @@ func (a *App) ListSandboxes() ([]SandboxView, error) {
 	for _, s := range sandboxes {
 		view := SandboxView{ID: s.ID, Name: s.Name, ProjectPath: s.ProjectPath, DemoCase: s.DemoCase, State: "unknown",
 			Limits: s.Limits, Usage: s.Usage, CreatedAt: s.CreatedAt, Bindings: []BindingView{},
-			MCP: append([]string{}, s.MCP...), MCPPermissions: effectiveGrants(s, services), Filesystem: s.FilesystemMCP}
+			MCP: append([]string{}, s.MCP...), MCPPermissions: effectiveGrants(s, services), Filesystem: s.FilesystemMCP,
+			DevSources: append([]string{}, s.DevSources...)}
 		if a.manager != nil {
 			view.State = a.manager.Status(ctx, s.ID).State
 		}

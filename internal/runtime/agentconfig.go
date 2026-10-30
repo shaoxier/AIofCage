@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/shaoxier/AIofCage/internal/devsource"
 	"github.com/shaoxier/AIofCage/internal/mcp"
 	"github.com/shaoxier/AIofCage/internal/provider"
 	"github.com/shaoxier/AIofCage/internal/sandbox"
@@ -38,6 +39,9 @@ func shellQuote(value string) string {
 // no model configuration and will report that it is not configured.
 func agentFiles(sbx sandbox.Sandbox, providers map[string]provider.Provider, services map[string]mcp.Service) []agentFile {
 	env := map[string]string{"AIOFCAGE_SANDBOX": sbx.Name}
+	for _, setting := range devsource.Env(sbx.DevSources) {
+		env[setting[0]] = setting[1]
+	}
 	for _, id := range sbx.MCP {
 		if _, ok := services[id]; ok {
 			env[mcp.EnvVar(id)] = sbx.Placeholders[mcp.PlaceholderKey(id)]
