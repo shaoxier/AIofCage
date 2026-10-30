@@ -1,7 +1,7 @@
 // 沙箱页：参考 Docker Desktop 的容器列表——创建、启停、打开终端、切换供应商、删除。
 import { useEffect, useState } from "preact/hooks";
 import { html, call, AGENTS, agentName, STATES, formatTokens, formatBytes, Icon, agentIcon, PageTitle } from "./core.js";
-import { MCPChoices } from "./mcp.js";
+import { cleanGrants, MCPChoices } from "./mcp.js";
 import { AttackDialog } from "./ai.js";
 import { useTerminals } from "./terminal.js";
 import { SandboxDetail } from "./sandbox-detail.js";
@@ -378,10 +378,10 @@ function quotaPercent(used, limit) {
 function MCPDialog({ sandbox, services, onClose, onSave }) {
   const [selected, setSelected] = useState(sandbox.mcp);
   const [permissions, setPermissions] = useState(() => {
-    const grants = { ...(sandbox.mcp_permissions ?? {}) };
+    const grants = cleanGrants(services, sandbox.mcp_permissions ?? {});
     services.forEach((service) => {
       if (selected.includes(service.id) && service.tools?.length && !Object.prototype.hasOwnProperty.call(grants, service.id)) {
-        grants[service.id] = [...service.tools];
+        grants[service.id] = [...(service.default_tools ?? service.tools)];
       }
     });
     return grants;

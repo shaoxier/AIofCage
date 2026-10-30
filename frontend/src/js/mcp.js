@@ -1,6 +1,6 @@
 // MCP 页：令牌、OAuth 授权和数据库密码只保存在钥匙串，沙箱里只有占位符。
-// 远程 HTTP 服务由门卫在请求发出时注入令牌（OAuth 令牌由应用在浏览器登录后获取并自动续期）；
-// 数据库由沙箱外的可信连接器代持密码，Agent 经门卫访问。
+// Agent 一律经门卫的 MCP 入口访问服务，门卫逐条检查，只放行沙箱里勾选的工具。远程服务的令牌
+// 由门卫转发时加上（OAuth 令牌由应用在浏览器登录后获取并自动续期）；数据库由沙箱外的可信连接器代持密码。
 import { useState } from "preact/hooks";
 import { html, call, ConfirmDialog, Icon, PageTitle } from "./core.js";
 import { DemoCases } from "./demo-cases.js";
@@ -20,10 +20,14 @@ export function MCPPage({ services, presets, providers, reload, notify, onCreate
         </article>
         ${services.map((s) => html`<${ServiceCard} key=${s.id} service=${s} onEdit=${() => setDialog({ service: s })} reload=${reload} notify=${notify} />`)}
       </div>
-      <p class="caption">在沙箱的“概览”中选择启用工具连接。支持 Codex、Claude Code 与 DeepSeek Harness。</p>
+      <p class="caption">在沙箱的“概览”中选择启用工具连接，并逐个勾选允许的工具。支持 Codex、Claude Code 与 DeepSeek Harness。</p>
       <${DemoCases} providers=${providers} reload=${reload} notify=${notify} onCreated=${onCreated} />
       ${dialog && html`<${ServiceDialog} presets=${presets} initial=${dialog.service} onClose=${() => { setDialog(null); reload(); }}
-        onSaved=${async (saved) => { setDialog(null); notify(`已保存「${saved.name}」`); await reload(); }} />`}
+        onSaved=${async (saved) => {
+          setDialog(null);
+          notify(saved.tools_error ? `已保存「${saved.name}」，但还没拿到工具列表：${saved.tools_error}` : `已保存「${saved.name}」`, Boolean(saved.tools_error));
+          await reload();
+        }} />`}
     </section>`;
 }
 
@@ -49,7 +53,10 @@ function ServiceCard({ service, onEdit, reload, notify }) {
   const test = async () => {
     setTesting(true);
     setResult(null);
-    try { setResult(await call("TestMCPService", service.id)); } catch (e) { setResult({ ok: false, message: e.message }); }
+    try {
+      setResult(await call("TestMCPService", service.id));
+      if (isRemote(service)) await reload(); // 测试远程服务会顺带更新它的工具列表
+    } catch (e) { setResult({ ok: false, message: e.message }); }
     finally { setTesting(false); }
   };
   const [confirming, setConfirming] = useState(false);
@@ -64,11 +71,12 @@ function ServiceCard({ service, onEdit, reload, notify }) {
   const oauth = isOAuth(service);
   const secret = database ? "密码" : "令牌";
   const builtin = isBuiltin(service);
-  const status = builtin ? html`<span class="pill ok">内置 · 无需凭据</span>` : oauth
+  const open = service.auth === "none";
+  const status = builtin ? html`<span class="pill ok">内置 · 无需凭据</span>` : open ? html`<span class="pill ok">无需令牌</span>` : oauth
     ? (service.key_saved ? html`<span class="pill ok">已授权</span>` : html`<span class="pill warn">未登录</span>`)
     : (service.key_saved ? html`<span class="pill ok">${secret}已保存</span>` : html`<span class="pill warn">缺少${secret}</span>`);
   const kind = builtin ? "合成业务案例 · 只读工具" : database ? "PostgreSQL · 只读查询"
-    : oauth ? "远程 MCP · 浏览器授权" : "远程 MCP · 访问令牌";
+    : oauth ? "远程 MCP · 浏览器授权" : open ? "远程 MCP · 公开服务" : "远程 MCP · 访问令牌";
   return html`
     <article class="panel provider-card">
       <div class="card-top"><div class="card-identity"><span class="card-icon"><${Icon} name=${database ? "database" : "plug"} size=${22} /></span><h3>${service.name}</h3></div>${status}</div>
@@ -76,6 +84,7 @@ function ServiceCard({ service, onEdit, reload, notify }) {
       <dl class="facts">
         <div><dt>类型</dt><dd>${kind}</dd></div>
         <div><dt>名称</dt><dd class="mono">${service.id}</dd></div>
+        <div><dt>工具</dt><dd>${toolSummary(service)}</dd></div>
         <div><dt>使用中</dt><dd>${service.used_by.length ? service.used_by.join("、") : "暂无沙箱"}</dd></div>
       </dl>
       ${result && html`<p class=${result.ok ? "test-result ok" : "test-result bad"} role="status">${result.ok ? "✓" : "✕"} ${result.message}</p>`}
@@ -95,9 +104,16 @@ function ServiceCard({ service, onEdit, reload, notify }) {
     </article>`;
 }
 
+// 远程服务的工具来自服务自己列出的清单；“只读”是服务的标注，只用来决定默认开放哪些。
+function toolSummary(service) {
+  if (!isRemote(service)) return `${service.tools?.length ?? 0} 个（由 AIofCage 固定）`;
+  if (!service.catalog_at) return "还没获取，点“测试连接”获取";
+  return `${service.tools.length} 个，其中 ${service.default_tools.length} 个标注只读`;
+}
+
 function ServiceDialog({ presets, initial, onClose, onSaved }) {
   const editing = Boolean(initial);
-  const [form, setForm] = useState(() => editing ? { ...initial, token: "" } : null);
+  const [form, setForm] = useState(() => editing ? { ...initial, token: "", no_auth: initial.auth === "none" } : null);
   const [preset, setPreset] = useState(null);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState("");
@@ -108,7 +124,7 @@ function ServiceDialog({ presets, initial, onClose, onSaved }) {
     setError("");
     try {
       let saved = await call("SaveMCPService", { id: form.id ?? "", name: form.name, kind: form.kind ?? "", url: form.url,
-        preset: form.preset ?? "", token: form.token });
+        preset: form.preset ?? "", token: form.no_auth ? "" : form.token, no_auth: Boolean(form.no_auth) });
       setForm({ ...form, id: saved.id, token: "" });
       if (isOAuth(saved) && !saved.key_saved) {
         setSaving("等待浏览器授权…");
@@ -146,10 +162,13 @@ function ServiceDialog({ presets, initial, onClose, onSaved }) {
                     }必须使用专用只读账号，管理账号或带写权限的账号无法查询。本机数据库填 localhost 即可。</p>`
                 : html`<label for="m-url">地址（streamable HTTP）</label>
                   <input id="m-url" required class="mono" placeholder="https://" value=${form.url} onInput=${set("url")} />
-                  <label for="m-token">访问令牌</label>
-                  <input id="m-token" type="password" autocomplete="off" spellcheck="false" class="mono" required=${!editing}
-                    placeholder=${editing ? "留空则保持原令牌不变" : "粘贴令牌，例如 GitHub 的 PAT"} value=${form.token} onInput=${set("token")} />
-                  <p class="caption">令牌直接写入 macOS 钥匙串，沙箱里只会看到占位符。${preset?.docs ? html` 参考：<span class="mono">${preset.docs}</span>` : ""}</p>`}
+                  ${form.preset !== "github" && html`<label class="check"><input type="checkbox" checked=${Boolean(form.no_auth)}
+                    onChange=${(e) => setForm({ ...form, no_auth: e.target.checked })} />这个服务不需要令牌（公开服务，例如文档检索）</label>`}
+                  ${!form.no_auth && html`<label for="m-token">访问令牌</label>
+                  <input id="m-token" type="password" autocomplete="off" spellcheck="false" class="mono" required=${!editing || initial?.auth === "none"}
+                    placeholder=${editing && initial?.auth !== "none" ? "留空则保持原令牌不变" : "粘贴令牌，例如 GitHub 的 PAT"} value=${form.token} onInput=${set("token")} />`}
+                  <p class="caption">${form.no_auth ? "不保存任何凭据。" : "令牌直接写入 macOS 钥匙串，沙箱里只会看到占位符。"}${""
+                    }Agent 经门卫访问这个服务，只能调用你在沙箱里勾选的工具；保存后会自动获取工具列表。${preset?.docs ? html` 参考：<span class="mono">${preset.docs}</span>` : ""}</p>`}
               ${error && html`<p class="form-error" role="alert">${error}</p>`}
               <div class="dialog-actions">
                 ${!editing && html`<button type="button" onClick=${() => setForm(null)}>返回</button>`}
@@ -164,28 +183,40 @@ function ServiceDialog({ presets, initial, onClose, onSaved }) {
 const isOAuth = (service) => service?.kind === "oauth";
 const isBuiltin = (service) => service?.kind === "demo";
 const isDatabase = (service) => service?.kind === "postgres";
+const isRemote = (service) => !isBuiltin(service) && !isDatabase(service);
 
-// 沙箱里勾选启用哪些 MCP；创建向导和沙箱行共用。连接器会显示可授予的工具。
+// cleanGrants 去掉服务已经不再提供的工具，避免保存时引用不存在的工具。
+export function cleanGrants(services, grants = {}) {
+  const result = {};
+  for (const [id, tools] of Object.entries(grants)) {
+    const service = services.find((item) => item.id === id);
+    result[id] = service ? tools.filter((tool) => (service.tools ?? []).includes(tool)) : tools;
+  }
+  return result;
+}
+
+// 沙箱里勾选启用哪些 MCP；创建向导和沙箱行共用。每个服务按工具授权：连接器的工具由 AIofCage 固定，
+// 远程服务的工具来自服务列出的清单，默认只开放它标注为只读的工具，之后新出现的工具默认不开放。
 export function MCPChoices({ services, selected, filesystem, permissions = {}, onChange }) {
   const update = (ids, fs, grants = permissions) => onChange(ids, fs, grants);
+  const granted = (service) => (permissions[service.id] ?? service.default_tools ?? service.tools ?? [])
+    .filter((tool) => (service.tools ?? []).includes(tool));
   const toggle = (service) => {
-    const enabled = selected.includes(service.id);
-    if (enabled) {
-      const grants = { ...permissions };
+    const grants = { ...permissions };
+    if (selected.includes(service.id)) {
       delete grants[service.id];
       update(selected.filter((x) => x !== service.id), filesystem, grants);
       return;
     }
-    const grants = { ...permissions };
     if (service.tools?.length && !Object.prototype.hasOwnProperty.call(grants, service.id)) {
-      grants[service.id] = [...service.tools];
+      grants[service.id] = [...(service.default_tools ?? service.tools)];
     }
     update([...selected, service.id], filesystem, grants);
   };
+  const setTools = (service, tools) => update(selected, filesystem, { ...permissions, [service.id]: tools });
   const toggleTool = (service, tool) => {
-    const current = permissions[service.id] ?? service.tools ?? [];
-    const tools = current.includes(tool) ? current.filter((item) => item !== tool) : [...current, tool];
-    update(selected, filesystem, { ...permissions, [service.id]: tools });
+    const current = granted(service);
+    setTools(service, current.includes(tool) ? current.filter((item) => item !== tool) : [...current, tool]);
   };
   return html`<div class="agent-pick">
     <label class="check"><input type="checkbox" checked=${filesystem} onChange=${(e) => update(selected, e.target.checked)} />
@@ -194,10 +225,30 @@ export function MCPChoices({ services, selected, filesystem, permissions = {}, o
       <label class="check"><input type="checkbox" checked=${selected.includes(s.id)} onChange=${() => toggle(s)} />
         ${s.name}${isDatabase(s) ? "（数据库，只读）" : isBuiltin(s) ? "（合成数据，只读）" : ""}${!s.key_saved && !isBuiltin(s)
           ? html` <span class="pill warn">${isOAuth(s) ? "未登录" : `缺少${isDatabase(s) ? "密码" : "令牌"}`}</span>` : ""}</label>
-      ${selected.includes(s.id) && s.tools?.length ? html`<div class="mcp-tool-list" aria-label=${`${s.name} 工具权限`}>
-        <small>允许的工具（${(permissions[s.id] ?? s.tools).length}/${s.tools.length}）</small>
-        ${s.tools.map((tool) => html`<label class="check"><input type="checkbox" checked=${(permissions[s.id] ?? s.tools).includes(tool)}
-          onChange=${() => toggleTool(s, tool)} />${tool}</label>`)}</div>` : ""}
+      ${selected.includes(s.id) && html`<${ToolGrant} service=${s} granted=${granted(s)}
+        onToggle=${(tool) => toggleTool(s, tool)} onSet=${(tools) => setTools(s, tools)} />`}
     </div>`)}
+  </div>`;
+}
+
+function ToolGrant({ service, granted, onToggle, onSet }) {
+  const tools = service.tools ?? [];
+  const remote = isRemote(service);
+  if (!tools.length) {
+    return remote ? html`<div class="mcp-tool-list"><small>还没获取到这个服务的工具列表，Agent 暂时用不了它的工具。${""
+      }到「工具连接」页点“测试连接”即可获取；启动沙箱时也会自动尝试。</small></div>` : "";
+  }
+  const info = Object.fromEntries((service.catalog ?? []).map((tool) => [tool.name, tool]));
+  return html`<div class="mcp-tool-list" aria-label=${`${service.name} 工具权限`}>
+    <div class="mcp-tool-head"><small>允许的工具（${granted.length}/${tools.length}）${remote ? "。“只读”是服务自己的标注，新工具默认不开放" : ""}</small>
+      ${remote && html`<span class="mcp-tool-actions">
+        <button type="button" class="link" onClick=${() => onSet([...(service.default_tools ?? [])])}>只开放标注只读的</button>
+        <button type="button" class="link" onClick=${() => onSet([])}>全部关闭</button></span>`}</div>
+    <div class="mcp-tool-scroll">
+      ${tools.map((tool) => html`<label class="check" title=${info[tool]?.description ?? ""}>
+        <input type="checkbox" checked=${granted.includes(tool)} onChange=${() => onToggle(tool)} />
+        <span class="mono">${tool}</span>${info[tool]?.title ? html`<span class="muted">${info[tool].title}</span>` : ""}
+        ${remote && (info[tool]?.read_only ? html`<span class="pill ok">只读</span>` : html`<span class="pill warn">可能写入</span>`)}</label>`)}
+    </div>
   </div>`;
 }
