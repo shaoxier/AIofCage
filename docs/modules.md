@@ -70,11 +70,12 @@ cmd/gatekeeper（Linux 版嵌入运行时，在每个沙箱里运行）
 | `RevealAuditLog(id)` | 在访达中显示该沙箱的 JSONL 审计日志 |
 | `ExportAuditTimeline(id)` | 导出该沙箱最近最多 300 条脱敏事件到数据目录 `audit/<id>.timeline.json`，权限 0600；每次覆盖同名快照，不是完整历史归档 |
 | `ListMCPPresets()` / `ListMCPServices()` | MCP 预设与已保存的服务（不含令牌） |
-| `SaveMCPService(request)` / `DeleteMCPService(id)` / `TestMCPService(id)` | 令牌或数据库密码只写入钥匙串（连接串里带的密码会被移走；OAuth 服务不接受粘贴的令牌）；在用时不能删除；HTTP/OAuth 服务测试发送 MCP `initialize`（OAuth 先按需续期）；数据库测试在虚拟机里起一个一次性的连接器容器，用保存的密码登录并执行只读的 `SELECT 1`，能区分密码错误、库不存在、端口不通等原因（连接器镜像还没构建过时退回只测端口，并说明没验证密码） |
+| `SaveMCPService(request)` / `DeleteMCPService(id)` / `TestMCPService(id)` | 令牌或数据库密码只写入钥匙串（连接串里带的密码会被移走；OAuth 服务不接受粘贴的令牌；`no_auth` 表示公开服务、删除旧令牌）；在用时不能删除；HTTP/OAuth 服务保存和测试时按 MCP 协议获取工具清单（OAuth 先按需续期），取不到时 `tools_error` 说明原因；数据库测试在虚拟机里起一个一次性的连接器容器，用保存的密码登录并执行只读的 `SELECT 1`，能区分密码错误、库不存在、端口不通等原因（连接器镜像还没构建过时退回只测端口，并说明没验证密码） |
 | `AuthorizeMCPService(id)` | OAuth 服务在默认浏览器里登录授权（最多等 5 分钟），授权保存到钥匙串，运行中的沙箱立即换上新令牌；应用每分钟检查一次在用的 OAuth 服务，令牌 10 分钟内到期就续期并下发，续期失败时提醒一次 |
 | `DisconnectMCPService(id)` | 删除 OAuth 本机凭据并刷新引用它的运行沙箱，保留服务配置；当前不调用上游撤销端点 |
 | `SetSandboxMCP(id, ids, filesystem)` | 选择沙箱可用的远程 MCP 与内置 filesystem；运行中立即下发 |
-| `SetSandboxMCPPermissions(id, ids, filesystem, permissions)` | 保存固定连接器的工具白名单，运行中立即刷新门卫；显式空数组拒绝所有工具，远程 HTTP/OAuth 仍按服务授权 |
+| `SetSandboxMCPPermissions(id, ids, filesystem, permissions)` | 保存每个服务的工具白名单（固定连接器和远程 HTTP/OAuth 服务），运行中立即刷新门卫；显式空数组拒绝所有工具；没有指定的服务保留原授权，新启用的远程服务默认只开放标注只读的工具 |
+| `RefreshMCPTools(id)` | 重新获取远程服务的工具清单；新出现的工具在各沙箱里默认不开放 |
 | `SecurityDiagnostics(id)` | 返回安全边界说明、门卫状态、MCP 授权、最近拒绝数与最近隔离检查；边界说明不是探针通过结果，最近隔离检查只保存在当前应用进程 |
 | `ListAttacks()` / `SimulateAttacks(id)` | 7 个模拟攻击（偷环境变量里的 key、外传到攻击者域名、绕过代理直连、用外来 key 借白名单域名外传、读写宿主文件、DNS 外传、找数据库密码并直连数据库），各自对应一起真实事件；在沙箱里以 Agent 用户执行，宿主再核对输出中没有真实密钥；全部非破坏性 |
 | `ExplainEvent(sandboxID, eventID)` / `SummarizeSandbox(id)` | AI 安全解说：只把事件元数据和允许的域名发给选定的供应商（桌面进程直接调用），提示词声明元数据是不可信数据；每条事件标明来源（“系统”下发配置等 / “沙箱内程序”），并标出用户运行内置模拟攻击期间的事件，避免把系统动作或演示说成 Agent 的行为；时间统一换成本机时间（与日志页一致），不让模型换算时区；结果按事件和解说供应商缓存，换供应商会重新生成；单次请求最长等 90 秒（推理模型常需十几秒以上，不沿用连接测试的 12 秒超时）；AI 不参与放行 |
