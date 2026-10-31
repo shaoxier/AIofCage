@@ -34,6 +34,7 @@ func TestValidateRejects(t *testing.T) {
 		"anonymous deny":      {ID: "r", Effect: Deny, Host: "example.com", Path: "/a", Anonymous: true},
 		"anonymous secret":    {ID: "r", Effect: Allow, Host: "example.com", Methods: []string{"GET"}, SecretRef: "s", Anonymous: true},
 		"secret on deny":      {ID: "r", Effect: Deny, Host: "example.com", SecretRef: "s"},
+		"wildcard secret":     {ID: "r", Effect: Allow, Host: "example.com", Methods: []string{"POST"}, Path: "/*/responses/*", SecretRef: "s"},
 		"bad effect":          {ID: "r", Effect: "maybe", Host: "example.com"},
 		"bad id":              {ID: "has space", Effect: Deny, Host: "example.com"},
 	}

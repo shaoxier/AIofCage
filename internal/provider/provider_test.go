@@ -62,6 +62,9 @@ func TestValidateAndEndpoint(t *testing.T) {
 		"no name":       func(p *Provider) { p.Name = "" },
 		"unknown agent": func(p *Provider) { p.Agent = "cursor" },
 		"encoded path":  func(p *Provider) { p.BaseURL = "https://xapi.qiniu.io/v%31" },
+		// A "*" segment would make the injecting rules wildcards.
+		"star path":    func(p *Provider) { p.BaseURL = "https://xapi.qiniu.io/*" },
+		"star segment": func(p *Provider) { p.BaseURL = "https://xapi.qiniu.io/v1/*/x" },
 	}
 	for name, mutate := range bad {
 		candidate := xapi()

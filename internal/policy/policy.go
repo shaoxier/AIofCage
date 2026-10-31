@@ -165,6 +165,9 @@ func (r Rule) validate() error {
 	if r.SecretRef != "" && (r.Effect != Allow || !ValidID(r.SecretRef)) {
 		return errors.New("secret_ref 只能用于 allow 规则且须为有效 ID")
 	}
+	if r.SecretRef != "" && strings.Contains(strings.TrimSuffix(r.Path, "/*"), "*") {
+		return errors.New("注入密钥的规则不能用单段通配")
+	}
 	if r.Anonymous && (r.Effect != Allow || r.SecretRef != "") {
 		return errors.New("anonymous 只能用于不注入密钥的 allow 规则")
 	}
