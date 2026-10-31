@@ -46,7 +46,7 @@
     "status": "passed",
     "blocked": true,
     "skipped": false,
-    "evidence": "金丝雀收到：Agent 0 条，内部网络反例 0 条\nAgent：直连金丝雀 本地拒绝，内嵌 DNS 解析失败，UDP 53 → 223.5.5.5 本地拒绝，UDP 53 → 8.8.8.8 本地拒绝，TCP 53 本地拒绝，DoT 853 本地拒绝，IPv6 UDP 53 本地拒绝，解析 example.com 解析失败\n反例（内部网络、DNS 指向金丝雀）：直连 本地拒绝，内嵌 DNS 解析失败\n虚拟机解析公网域名：能",
+    "evidence": "金丝雀收到：Agent 0 条，内部网络反例 0 条\nAgent：直连金丝雀 本地拒绝，内嵌 DNS 解析失败，UDP 53 → 223.5.5.5 本地拒绝，UDP 53 → 8.8.8.8 本地拒绝，TCP 53 本地拒绝，DoT 853 本地拒绝，IPv6 UDP 53 本地拒绝，网关 UDP 53 拒绝连接，网关 TCP 53 拒绝连接，门卫 UDP 53 拒绝连接，门卫 TCP 53 拒绝连接，解析 example.com 解析失败\n反例（内部网络、DNS 指向金丝雀）：直连 本地拒绝，内嵌 DNS 解析失败\nDocker 设置：网络 aiofcage-sbx-d7wljjut-in，DNS 127.0.0.1",
     "controls": [
       {
         "name": "出网侧对照容器直接发给金丝雀",
@@ -55,9 +55,13 @@
       {
         "name": "出网侧对照容器经 Docker 内嵌 DNS 转发给金丝雀",
         "ok": true
+      },
+      {
+        "name": "虚拟机本身能解析公网域名",
+        "ok": true
       }
     ],
-    "note": "金丝雀是临时放在出网网络上的 DNS 服务，代表“虚拟机以外”。只发送 aiofcage.invalid 下的随机测试名，另外解析一次 example.com；未覆盖 DNS 以外的隧道（例如经允许的 HTTPS 域名）。"
+    "note": "金丝雀是临时放在出网网络上的 DNS 服务，代表“虚拟机以外”：它能看到直接发出的查询，以及 Docker 内嵌 DNS 转发出去的查询。Agent 自己的内嵌 DNS 只转发到它容器里的 127.0.0.1，这条路靠解析 example.com 判断，所以要求虚拟机本身能解析公网域名。只发送 aiofcage.invalid 下的随机测试名；未覆盖 DNS 以外的隧道（例如经允许的 HTTPS 域名）。"
   },
   {
     "id": "docker-socket",
@@ -66,7 +70,7 @@
     "status": "passed",
     "blocked": true,
     "skipped": false,
-    "evidence": "未发现 Docker 接口；socket 文件 0 个（不含测试用的假接口）；查看了 982 个文件和目录；127.0.0.1、192.168.144.1、192.168.144.2 的 2375/2376 端口没有 Docker 应答",
+    "evidence": "未发现 Docker 接口\n其他 socket 文件 0 个（不含测试用的假接口）；查看了 982 个文件和目录\n2375/2376 端口：127.0.0.1:2375 拒绝连接，127.0.0.1:2376 拒绝连接，192.168.144.1:2375 拒绝连接，192.168.144.1:2376 拒绝连接，192.168.144.2:2375 拒绝连接，192.168.144.2:2376 拒绝连接",
     "controls": [
       {
         "name": "Agent 容器里临时放的假 Docker 接口被检出",
@@ -78,7 +82,7 @@
         "detail": "挂载 /run/docker.sock，socket /run/docker.sock（Docker 接口应答）"
       }
     ],
-    "note": "查看环境变量、挂载、根目录下 5 层以内的 socket 文件（不进项目、/usr 和 node_modules 等目录），对每个 socket 和 2375/2376 端口发 GET /_ping。不检查容器逃逸。"
+    "note": "查看环境变量、挂载、根目录下 5 层以内的 socket 文件（不进项目、/usr 和 node_modules 等目录），对挂进来的或名字像容器运行时的 socket 和 2375/2376 端口发 GET /_ping。不检查容器逃逸。"
   },
   {
     "id": "project-boundary",
@@ -87,14 +91,14 @@
     "status": "passed",
     "blocked": true,
     "skipped": false,
-    "evidence": "Agent 能看到项目目录：是；能看到项目旁的测试目录：否；上级目录里的其他条目：无",
+    "evidence": "Agent 能看到项目目录：是；项目按自己的路径挂载：是\n共享目录的其他挂载：无\n能看到项目旁的测试目录：无\n上级目录里的其他条目：无",
     "controls": [
       {
         "name": "虚拟机里能看到测试目录",
         "ok": true
       }
     ],
-    "note": "宿主在 ~/CageWorkspace 下临时建一个与项目并列的测试目录，检查后删除；同时列出项目各级上级目录里能看到的条目。只覆盖共享目录内的边界。"
+    "note": "宿主在 ~/CageWorkspace 下临时建一个与项目并列的测试目录，检查后删除。看 Agent 的挂载表里共享目录只挂了项目本身，测试目录从哪个挂载点都看不到，项目各级上级目录里也没有别的条目。只覆盖共享目录内的边界。"
   },
   {
     "id": "remote-mcp-direct",
@@ -103,8 +107,8 @@
     "status": "passed",
     "blocked": true,
     "skipped": false,
-    "evidence": "HTTP 403；代理原因：default_deny；curl 退出码 56",
-    "note": "仅验证本次请求和返回原因。网络错误、超时或其他拒绝原因不判通过。"
+    "evidence": "mcp.deepwiki.com：HTTP 403，代理原因 default_deny",
+    "note": "不带任何凭据，经代理直接请求每个远程 MCP 服务。只有门卫在请求发出前就拒绝才算通过；请求到过服务（包括服务返回 401 或跳转）就是发现问题。"
   },
   {
     "id": "db-direct",
