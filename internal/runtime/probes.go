@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 )
@@ -99,7 +101,9 @@ func (m *Manager) StartProbe(ctx context.Context, id string, probe Probe) (strin
 	if err != nil {
 		return "", "", err
 	}
-	if _, err := m.docker.run(ctx, 30*time.Second, nil, append([]string{"run", "--detach"}, args...)...); err != nil {
+	// --rm as well: a background probe exits on its own after a while, so one left behind by a crash
+	// disappears.
+	if _, err := m.docker.run(ctx, 30*time.Second, nil, append([]string{"run", "--detach", "--rm"}, args...)...); err != nil {
 		m.RemoveProbe(name)
 		return "", "", err
 	}
@@ -155,8 +159,37 @@ func (m *Manager) RemoveProbeVolume(name string) {
 	m.docker.run(ctx, 30*time.Second, nil, "volume", "rm", "--force", name)
 }
 
-// removeProbes removes probes and probe volumes a check left behind, e.g. when the app quit in
-// the middle of one; a probe still attached to a network would keep the network from being removed.
+// AgentNetwork returns the networks the agent container is attached to and the DNS servers it was
+// given: the isolation relies on the internal network only and on 127.0.0.1, where nothing answers.
+func (m *Manager) AgentNetwork(ctx context.Context, id string) ([]string, []string, error) {
+	out, err := m.docker.run(ctx, 15*time.Second, nil, "container", "inspect", "--format",
+		"{{json .NetworkSettings.Networks}}\t{{json .HostConfig.Dns}}", names(id).agent)
+	if err != nil {
+		return nil, nil, err
+	}
+	networksJSON, dnsJSON, _ := strings.Cut(strings.TrimSpace(string(out)), "\t")
+	var networks map[string]json.RawMessage
+	var dns []string
+	if json.Unmarshal([]byte(networksJSON), &networks) != nil || json.Unmarshal([]byte(dnsJSON), &dns) != nil {
+		return nil, nil, errors.New("无法读取 Agent 容器的网络设置")
+	}
+	attached := make([]string, 0, len(networks))
+	for name := range networks {
+		attached = append(attached, name)
+	}
+	slices.Sort(attached)
+	return attached, dns, nil
+}
+
+// InternalNetwork is the name of a sandbox's internal network, the only one its agent may use.
+func InternalNetwork(id string) string { return names(id).internal }
+
+// RemoveProbes removes probes and probe volumes a check left behind, e.g. when the app quit in
+// the middle of one.
+func (m *Manager) RemoveProbes(ctx context.Context, id string) error { return m.removeProbes(ctx, id) }
+
+// removeProbes removes probes and probe volumes a check left behind; a probe still attached to a
+// network would keep the network from being removed.
 func (m *Manager) removeProbes(ctx context.Context, id string) error {
 	filters := []string{"--filter", "label=" + labelKey + "=" + id, "--filter", "label=" + roleLabel + "=" + probeRole}
 	var errs []error

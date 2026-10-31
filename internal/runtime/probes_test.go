@@ -71,3 +71,20 @@ func TestRemovingASandboxRemovesLeftoverProbesFirst(t *testing.T) {
 		t.Fatalf("probes must be looked for before the networks go:\n%s", text)
 	}
 }
+
+func TestAgentNetworkReadsDockersView(t *testing.T) {
+	dir := t.TempDir()
+	tool := dir + "/docker"
+	script := "#!/bin/sh\nprintf '%s\\t%s\\n' '{\"aiofcage-sbx-a-in\":{},\"bridge\":{}}' '[\"127.0.0.1\"]'\n"
+	if err := os.WriteFile(tool, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{docker: runner{path: tool}}
+	networks, dns, err := m.AgentNetwork(context.Background(), "sbx-a")
+	if err != nil || strings.Join(networks, ",") != "aiofcage-sbx-a-in,bridge" || strings.Join(dns, ",") != "127.0.0.1" {
+		t.Fatalf("%v %v %v", networks, dns, err)
+	}
+	if InternalNetwork("sbx-a") != "aiofcage-sbx-a-in" {
+		t.Fatal(InternalNetwork("sbx-a"))
+	}
+}

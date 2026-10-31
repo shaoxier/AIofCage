@@ -54,6 +54,34 @@ esac
 	}
 }
 
+// An isolation check starts and removes helper containers within seconds. They are not part of the
+// sandbox: a probe that is still being created must not make the sandbox look broken, and one that
+// vanished between list and stats must not fail the whole sample.
+func TestHealthIgnoresIsolationProbes(t *testing.T) {
+	dir := t.TempDir()
+	tool, log := filepath.Join(dir, "docker"), filepath.Join(dir, "commands")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> '` + log + `'
+case "$1" in
+ ps) printf 'aiofcage-sbx-live-agent\t\naiofcage-sbx-live-gate\t\naiofcage-sbx-live-probe-0123456789\tprobe\n' ;;
+ container) printf '%s\n' '{"Name":"/aiofcage-sbx-live-agent","State":{"Status":"running","Running":true}}' '{"Name":"/aiofcage-sbx-live-gate","State":{"Status":"running","Running":true}}' ;;
+ stats) printf '%s\n' '{"Name":"aiofcage-sbx-live-agent","CPUPerc":"1%","MemUsage":"10MiB / 6GiB","PIDs":"3","NetIO":"0B / 0B","BlockIO":"0B / 0B"}' '{"Name":"aiofcage-sbx-live-gate","CPUPerc":"1%","MemUsage":"10MiB / 6GiB","PIDs":"3","NetIO":"0B / 0B","BlockIO":"0B / 0B"}' ;;
+esac
+`
+	if err := os.WriteFile(tool, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{docker: runner{path: tool}}
+	h := m.SampleHealth(context.Background(), []string{"sbx-live"})["sbx-live"]
+	if h.State != stateRunning || len(h.Components) != 2 || !h.Stats.Valid || h.Error != "" {
+		t.Fatalf("a probe changed the sandbox's health: %+v", h)
+	}
+	data, _ := os.ReadFile(log)
+	if strings.Contains(string(data), "probe-0123456789") {
+		t.Fatalf("probes must not be inspected or sampled:\n%s", data)
+	}
+}
+
 func TestStatsMalformedAndContainerCounterReset(t *testing.T) {
 	at := time.Now()
 	for _, bad := range []struct{ cpu, mem, pids, net string }{

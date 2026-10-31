@@ -129,11 +129,17 @@ func (m *Manager) SampleHealth(ctx context.Context, ids []string) map[string]San
 	if len(ids) == 0 {
 		return result
 	}
-	out, listErr := m.docker.run(ctx, 10*time.Second, nil, "ps", "-a", "--filter", "label="+labelKey, "--format", "{{.Names}}")
+	out, listErr := m.docker.run(ctx, 10*time.Second, nil, "ps", "-a", "--filter", "label="+labelKey, "--format", "{{.Names}}\t{{.Label \""+roleLabel+"\"}}")
 	owner := map[string]string{}
 	found := map[string]bool{}
 	var targets []string
-	for _, name := range strings.Fields(string(out)) {
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		name, role, _ := strings.Cut(line, "\t")
+		// Helper containers of an isolation check come and go within seconds; they are not part of
+		// the sandbox, and one vanishing between list and stats would fail the whole sample.
+		if name == "" || role == probeRole {
+			continue
+		}
 		for _, id := range ids {
 			if strings.HasPrefix(name, "aiofcage-"+id+"-") {
 				owner[name] = id

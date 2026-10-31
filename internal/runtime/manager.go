@@ -1115,6 +1115,9 @@ func (m *Manager) Stop(ctx context.Context, id string) error {
 	if err := m.stopContainers(ctx, names(sbx.ID)); err != nil {
 		errs = append(errs, err)
 	}
+	// Leftovers of an interrupted isolation check; they hold nothing secret, so failing to remove
+	// them does not fail the stop.
+	m.removeProbes(ctx, sbx.ID)
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
