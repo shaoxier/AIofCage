@@ -38,9 +38,11 @@ type App struct {
 	now           func() time.Time
 	emit          Emitter
 	terminal      TerminalOpener
-	monitor       *monitor
-	explain       explainCache
-	ops           operations
+	// nativeSessionExists checks an agent's own session record inside a running sandbox.
+	nativeSessionExists func(ctx context.Context, sandboxID string, agent session.Agent, nativeID string) (bool, error)
+	monitor             *monitor
+	explain             explainCache
+	ops                 operations
 	// root is the parent of every lifecycle operation's context; it ends when the app quits.
 	root          context.Context
 	rootCancel    context.CancelFunc
@@ -70,6 +72,12 @@ func NewApp(st *store.Store, secrets vault.Store, manager *runtime.Manager, mana
 		client: client, oauth: oauth.NewClient(client, openURL), isolationRuns: map[string]SecurityIsolationRun{},
 		explainClient: &http.Client{Transport: &http.Transport{Proxy: nil, TLSHandshakeTimeout: 10 * time.Second}, CheckRedirect: noRedirect}}
 	a.root, a.rootCancel = context.WithCancel(context.Background())
+	a.nativeSessionExists = func(ctx context.Context, sandboxID string, agent session.Agent, nativeID string) (bool, error) {
+		if a.manager == nil {
+			return false, errors.New("运行环境不可用")
+		}
+		return a.manager.NativeSessionExists(ctx, sandboxID, agent, nativeID)
+	}
 	// Progress is remembered as well as emitted, so a page opened later still shows it.
 	a.ops.send = func(id string, view OperationView) {
 		a.emit("sandbox:progress", map[string]any{"id": id, "activity": view})

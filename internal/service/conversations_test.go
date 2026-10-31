@@ -1,11 +1,13 @@
 package service
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/shaoxier/AIofCage/internal/provider"
+	"github.com/shaoxier/AIofCage/internal/runtime"
 	"github.com/shaoxier/AIofCage/internal/sandbox"
 	"github.com/shaoxier/AIofCage/internal/session"
 )
@@ -67,5 +69,77 @@ func TestConversationRecoveryMetadataRoundTrip(t *testing.T) {
 	}
 	if items, err := app.ListRecoverableConversations(); err != nil || len(items) != 0 {
 		t.Fatalf("remove: %+v %v", items, err)
+	}
+}
+
+// Claude Code repeats its session id on every event: only a new id is written, and each write
+// tells the interface to read the recoverable list again.
+func TestNativeSessionIsWrittenOnlyWhenItChanges(t *testing.T) {
+	app, _, st := newApp(t)
+	p := provider.Provider{ID: "p1", Name: "测试供应商", Agent: session.ClaudeCode}
+	st.SaveProvider(p)
+	sbx := sandbox.Sandbox{ID: "sbx-native", Name: "native", Bindings: []sandbox.Binding{{Agent: session.ClaudeCode, ProviderID: p.ID}}}
+	st.SaveSandbox(sbx)
+	notices := 0
+	app.emit = func(event string, _ any) {
+		if event == "conversation:recovery" {
+			notices++
+		}
+	}
+	c := &conversation{id: "t-native", sandbox: sbx, agent: session.ClaudeCode, provider: p}
+	for _, id := range []string{"session-a", "session-a", "session-a", "", "session-b"} {
+		app.noteNativeSession(c, id)
+	}
+	items, _ := app.recoveryRecords()
+	if notices != 2 || items["t-native"].NativeSessionID != "session-b" {
+		t.Fatalf("%d writes, record %+v", notices, items["t-native"])
+	}
+	c.closed = true
+	if app.noteNativeSession(c, "session-c") {
+		t.Fatal("a closed conversation must not write")
+	}
+}
+
+// Records of a deleted sandbox go when the list is read.
+func TestRecoveryRecordsOfDeletedSandboxesAreDropped(t *testing.T) {
+	app, _, st := newApp(t)
+	p := provider.Provider{ID: "p1", Name: "测试供应商", Agent: session.Codex}
+	st.SaveProvider(p)
+	sbx := sandbox.Sandbox{ID: "sbx-kept", Name: "kept", Bindings: []sandbox.Binding{{Agent: session.Codex, ProviderID: p.ID}}}
+	st.SaveSandbox(sbx)
+	for _, item := range []conversationRecovery{
+		{ID: "t-kept", SandboxID: "sbx-kept", Agent: session.Codex, ProviderID: p.ID, NativeSessionID: "native-1"},
+		{ID: "t-gone", SandboxID: "sbx-deleted", Agent: session.Codex, ProviderID: p.ID, NativeSessionID: "native-2"},
+	} {
+		if err := app.saveConversationRecovery(item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	listed, err := app.ListRecoverableConversations()
+	items, _ := app.recoveryRecords()
+	if err != nil || len(listed) != 1 || listed[0].ID != "t-kept" || len(items) != 1 {
+		t.Fatalf("listed %+v, stored %+v, %v", listed, items, err)
+	}
+}
+
+// A record whose native session is gone from the sandbox is removed before anything starts.
+func TestRecoveryWithoutTheNativeSessionIsRemoved(t *testing.T) {
+	app, _, st := newApp(t)
+	app.manager = &runtime.Manager{} // only so the runtime counts as ready; nothing reaches it
+	p := provider.Provider{ID: "p1", Name: "测试供应商", Agent: session.Codex}
+	st.SaveProvider(p)
+	st.SaveSandbox(sandbox.Sandbox{ID: "sbx-reset", Name: "reset", Bindings: []sandbox.Binding{{Agent: session.Codex, ProviderID: p.ID}}})
+	if err := app.saveConversationRecovery(conversationRecovery{ID: "t-old", SandboxID: "sbx-reset", Agent: session.Codex, ProviderID: p.ID, NativeSessionID: "native-old"}); err != nil {
+		t.Fatal(err)
+	}
+	checked := ""
+	app.nativeSessionExists = func(_ context.Context, sandboxID string, agent session.Agent, nativeID string) (bool, error) {
+		checked = sandboxID + "/" + string(agent) + "/" + nativeID
+		return false, nil
+	}
+	_, err := app.RecoverConversation("t-old")
+	items, _ := app.recoveryRecords()
+	if err == nil || !strings.Contains(err.Error(), "已移除这条恢复记录") || len(items) != 0 || checked != "sbx-reset/codex/native-old" {
+		t.Fatalf("got %v, records %+v, checked %q", err, items, checked)
 	}
 }

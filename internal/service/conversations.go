@@ -271,15 +271,7 @@ func (a *App) SendConversationMessage(id, text string, images []TerminalImage, o
 				continue
 			}
 			if event.Type == "session" {
-				c.mu.Lock()
-				if c.closed {
-					c.mu.Unlock()
-					continue
-				}
-				c.nativeID = event.Text
-				recovery := a.conversationRecoveryFrom(c)
-				c.mu.Unlock()
-				_ = a.saveConversationRecovery(recovery)
+				a.noteNativeSession(c, event.Text)
 				continue
 			}
 			switch event.Type {
@@ -474,6 +466,20 @@ type ConversationRecoveryView struct {
 	Reason          string        `json:"reason,omitempty"`
 }
 
+// noteNativeSession records the agent's own session id for recovery. Claude Code repeats the id on
+// every event; only a new one is written, and reported to the interface.
+func (a *App) noteNativeSession(c *conversation, nativeID string) bool {
+	c.mu.Lock()
+	if c.closed || nativeID == "" || c.nativeID == nativeID {
+		c.mu.Unlock()
+		return false
+	}
+	c.nativeID = nativeID
+	recovery := a.conversationRecoveryFrom(c)
+	c.mu.Unlock()
+	return a.saveConversationRecovery(recovery) == nil
+}
+
 func (a *App) conversationRecoveryFrom(c *conversation) conversationRecovery {
 	return conversationRecovery{ID: cID(c), SandboxID: c.sandbox.ID, Agent: c.agent, ProviderID: c.provider.ID, Model: c.model, Effort: c.effort, NativeSessionID: c.nativeID, UpdatedAt: a.now().UTC()}
 }
@@ -507,11 +513,21 @@ func (a *App) saveConversationRecovery(item conversationRecovery) error {
 		return err
 	}
 	items[item.ID] = item
+	return a.writeRecoveryRecords(items)
+}
+
+// writeRecoveryRecords saves the records and tells the interface to read the recoverable list
+// again. The caller holds persistMu.
+func (a *App) writeRecoveryRecords(items map[string]conversationRecovery) error {
 	data, err := json.Marshal(items)
 	if err != nil {
 		return err
 	}
-	return a.store.SetSetting(conversationRecoverySetting, string(data))
+	if err := a.store.SetSetting(conversationRecoverySetting, string(data)); err != nil {
+		return err
+	}
+	a.emit("conversation:recovery", nil)
+	return nil
 }
 
 func (a *App) removeConversationRecovery(id string) error {
@@ -525,11 +541,7 @@ func (a *App) removeConversationRecovery(id string) error {
 		return nil
 	}
 	delete(items, id)
-	data, err := json.Marshal(items)
-	if err != nil {
-		return err
-	}
-	return a.store.SetSetting(conversationRecoverySetting, string(data))
+	return a.writeRecoveryRecords(items)
 }
 
 func (a *App) removeSandboxConversationRecoveries(sandboxID string) error {
@@ -549,11 +561,7 @@ func (a *App) removeSandboxConversationRecoveries(sandboxID string) error {
 	if !changed {
 		return nil
 	}
-	data, err := json.Marshal(items)
-	if err != nil {
-		return err
-	}
-	return a.store.SetSetting(conversationRecoverySetting, string(data))
+	return a.writeRecoveryRecords(items)
 }
 
 func (a *App) ListRecoverableConversations() ([]ConversationRecoveryView, error) {
@@ -562,9 +570,11 @@ func (a *App) ListRecoverableConversations() ([]ConversationRecoveryView, error)
 		return nil, err
 	}
 	result := []ConversationRecoveryView{}
+	var gone []string
 	for _, item := range items {
 		sbx, err := a.store.Sandbox(item.SandboxID)
 		if err != nil {
+			gone = append(gone, item.ID) // the sandbox was deleted; so is its session history
 			continue
 		}
 		view := ConversationRecoveryView{ID: item.ID, SandboxID: item.SandboxID, SandboxName: sbx.Name, Agent: item.Agent, Model: item.Model, Effort: item.Effort, NativeSessionID: item.NativeSessionID, UpdatedAt: item.UpdatedAt, Ready: true}
@@ -590,6 +600,9 @@ func (a *App) ListRecoverableConversations() ([]ConversationRecoveryView, error)
 		result = append(result, view)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].UpdatedAt.After(result[j].UpdatedAt) })
+	for _, id := range gone {
+		_ = a.removeConversationRecovery(id)
+	}
 	return result, nil
 }
 
@@ -607,6 +620,15 @@ func (a *App) RecoverConversation(id string) (ConversationInfo, error) {
 	}
 	if !recovery.Agent.Valid() {
 		return ConversationInfo{}, errors.New("恢复会话的智能体无效")
+	}
+	// The record outlives the agent's own session files (a reset without keeping home, a manual
+	// cleanup): check them first rather than fail at the first message.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	exists, err := a.nativeSessionExists(ctx, recovery.SandboxID, recovery.Agent, recovery.NativeSessionID)
+	cancel()
+	if err == nil && !exists {
+		_ = a.removeConversationRecovery(id)
+		return ConversationInfo{}, errors.New("沙箱里已经没有这个会话的记录（可能重置时清掉了），已移除这条恢复记录，请新建会话")
 	}
 	return a.startConversation(recovery.ID, recovery.SandboxID, recovery.Agent, &recovery)
 }
