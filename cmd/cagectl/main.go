@@ -53,11 +53,12 @@ const usage = `用法：
   cagectl mcp rm ID
 
   cagectl sandbox create --name 名称 --project 路径 --bind codex=供应商ID [--bind ...] [--max-requests N] [--max-tokens N]
-                         [--mcp 服务ID ...] [--filesystem-mcp]
+                         [--mcp 服务ID ...] [--filesystem-mcp] [--dev npm|npm-mirror|github ...]
   cagectl sandbox ls
   cagectl sandbox start|stop 名称
   cagectl sandbox rm 名称 [--keep-home]
   cagectl sandbox bind 名称 agent=供应商ID
+  cagectl sandbox dev 名称 [npm|npm-mirror|github ...]   设置开发环境（只放行下载）；不写就是全部关闭
   cagectl sandbox mcp 名称 [--filesystem] [服务ID ...] [--grant 服务ID=工具,工具 ...]
                          未用 --grant 指定的服务保留原授权；新启用的远程服务默认只开放标注只读的工具
   cagectl sandbox exec 名称 [-t] -- 命令...
@@ -321,6 +322,8 @@ func run(args []string) error {
 			}
 		}
 		return manager.SetMCPPermissions(ctx, sbx.ID, ids, filesystem, grants)
+	case "dev":
+		return manager.SetDevSources(ctx, sbx.ID, args[3:])
 	case "usage":
 		usage, err := manager.Usage(ctx, sbx.ID)
 		if err != nil {
@@ -399,10 +402,13 @@ func sandboxCreate(ctx context.Context, manager *runtime.Manager, args []string)
 	var mcpIDs multiFlag
 	flags.Var(&mcpIDs, "mcp", "启用的远程 MCP 服务 ID，可重复")
 	flags.BoolVar(&request.FilesystemMCP, "filesystem-mcp", false, "启用内置的 filesystem MCP（只开放项目目录）")
+	var dev multiFlag
+	flags.Var(&dev, "dev", "开放的开发环境（npm、npm-mirror、github），可重复")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	request.MCP = mcpIDs
+	request.DevSources = dev
 	for _, value := range binds {
 		agent, providerID, _ := strings.Cut(value, "=")
 		request.Bindings = append(request.Bindings, sandbox.Binding{Agent: session.Agent(agent), ProviderID: providerID})

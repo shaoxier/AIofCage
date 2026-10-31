@@ -26,7 +26,6 @@ import (
 const (
 	maxRequestBody     = 32 << 20
 	maxErrorBody       = 64 << 10
-	generatedHeader    = "X-Aiofcage-Generated"
 	warnRatioNumerator = 4 // warn at 4/5 = 80% of a limit
 	warnRatioDivisor   = 5
 )
@@ -85,7 +84,9 @@ type requestState struct {
 	secret                     string
 	version                    uint64
 	generated                  bool
-	bodyIn                     *countingReader
+	// transportFailure is the reason when the gatekeeper answered for an unreachable upstream.
+	transportFailure string
+	bodyIn           *countingReader
 }
 
 func NewGate() (*Gate, error) {
@@ -126,8 +127,10 @@ func NewGate() (*Gate, error) {
 			if errors.Is(err, errDestinationDenied) {
 				reason = "destination_denied"
 			}
+			if state, ok := ctx.UserData.(*requestState); ok {
+				state.transportFailure = reason
+			}
 			resp = textResponse(req, http.StatusBadGateway, reason)
-			resp.Header.Set(generatedHeader, reason)
 		}
 		return resp, nil
 	})
@@ -203,8 +206,8 @@ func (g *Gate) connect(host string, ctx *goproxy.ProxyCtx, mitm *goproxy.Connect
 			event.Host = "" // never echo arbitrary attacker-chosen strings into the event log
 		}
 		event.ReasonCode, event.Status = reason, http.StatusForbidden
-		g.deny(event)
-		ctx.Resp = textResponse(ctx.Req, http.StatusForbidden, reason)
+		recorded := g.deny(event)
+		ctx.Resp = blocked(ctx.Req, http.StatusForbidden, reason, event.Host, recorded.Sequence)
 		return goproxy.RejectConnect, host
 	}
 	ctx.UserData = connectTarget{host: name}
@@ -229,8 +232,8 @@ func (g *Gate) request(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request,
 	deny := func(status int, reason string) (*http.Request, *http.Response) {
 		state.generated = true
 		event.ReasonCode, event.Status = reason, status
-		g.deny(event)
-		return req, textResponse(req, status, reason)
+		recorded := g.deny(event)
+		return req, blocked(req, status, reason, state.target.host, recorded.Sequence)
 	}
 	if state.target.host == "" {
 		event.Host = ""
@@ -238,12 +241,15 @@ func (g *Gate) request(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request,
 	}
 	u := req.URL
 	if u == nil || u.Scheme != "https" || strings.ToLower(u.Hostname()) != state.target.host ||
-		(u.Port() != "" && u.Port() != "443") || u.User != nil || u.Fragment != "" || u.RawPath != "" ||
-		!policy.ValidPath(u.Path) || !sameHost(req.Host, state.target.host) {
+		(u.Port() != "" && u.Port() != "443") || u.User != nil || u.Fragment != "" || !sameHost(req.Host, state.target.host) {
 		return deny(http.StatusForbidden, "target_mismatch")
 	}
-	state.path = u.Path
-	event.Path = truncate(u.Path, 256)
+	requestPath, ok := policyPath(u)
+	if !ok {
+		return deny(http.StatusForbidden, "target_mismatch")
+	}
+	state.path = requestPath
+	event.Path = truncate(requestPath, 256)
 	for _, value := range req.Header.Values("Connection") {
 		for _, token := range strings.Split(value, ",") {
 			token = strings.TrimSpace(token)
@@ -253,8 +259,13 @@ func (g *Gate) request(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request,
 			}
 		}
 	}
+	if len(req.Trailer) > 0 || len(req.Header.Values("Trailer")) > 0 {
+		// Trailers arrive after the body, past the credential checks, and are forwarded upstream.
+		return deny(http.StatusForbidden, "trailer_denied")
+	}
+	dropOwnHeaders(req.Header)
 	decision := active.config.Policy.Evaluate(policy.Request{Host: state.target.host, Port: policy.DefaultPort,
-		Method: req.Method, Path: u.Path})
+		Method: req.Method, Path: requestPath})
 	event.RuleID = decision.RuleID
 	if !decision.Allowed {
 		return deny(http.StatusForbidden, decision.ReasonCode)
@@ -263,6 +274,10 @@ func (g *Gate) request(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request,
 	event.RuleID, state.ruleID = decision.RuleID, decision.RuleID
 	if reason := checkCredentials(active, state.target.host, decision.SecretRef, req.Header); reason != "" {
 		return deny(http.StatusForbidden, reason)
+	}
+	if decision.Anonymous && carriesCredential(req.Header) {
+		// An open download source must not become a way to use some account inside the sandbox.
+		return deny(http.StatusForbidden, "credential_not_allowed")
 	}
 	if req.ContentLength > maxRequestBody {
 		return deny(http.StatusRequestEntityTooLarge, "body_too_large")
@@ -278,10 +293,10 @@ func (g *Gate) request(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request,
 		event.SecretRef = secret.ID
 		state.model, state.agent, state.providerName = secret.Model, secret.Agent, secret.Name
 		state.pricing = secret.Pricing
-		state.modelRequest = secret.Agent != "" && req.Method == http.MethodPost && !strings.HasSuffix(u.Path, "/count_tokens")
+		state.modelRequest = secret.Agent != "" && req.Method == http.MethodPost && !strings.HasSuffix(requestPath, "/count_tokens")
 		if status, reason := g.reserve(active, secret.ID, event); reason != "" {
 			state.generated = true
-			return req, textResponse(req, status, reason)
+			return req, blocked(req, status, reason, "", 0)
 		}
 		req.Header.Del("Cookie")
 		for _, header := range credentialHeaders {
@@ -315,13 +330,13 @@ func chooseMatch(active *compiled, decision policy.Decision, header http.Header)
 		}
 		secret := active.secrets[match.SecretRef]
 		if values := header.Values(secret.Header); len(values) == 1 && values[0] == secret.Prefix+secret.Placeholder {
-			decision.RuleID, decision.SecretRef = match.RuleID, match.SecretRef
+			decision.RuleID, decision.SecretRef, decision.Anonymous = match.RuleID, match.SecretRef, match.Anonymous
 			return decision
 		}
 	}
 	for _, match := range decision.Matches {
 		if match.SecretRef == "" {
-			decision.RuleID, decision.SecretRef = match.RuleID, ""
+			decision.RuleID, decision.SecretRef, decision.Anonymous = match.RuleID, "", match.Anonymous
 			return decision
 		}
 	}
@@ -439,28 +454,43 @@ func (g *Gate) response(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Respon
 		g.finish(state, event)
 		return textResponse(ctx.Req, http.StatusBadGateway, "upstream_failed")
 	}
-	if reason := resp.Header.Get(generatedHeader); reason != "" {
-		resp.Header.Del(generatedHeader)
-		event.Decision, event.ReasonCode, event.Status = audit.DecisionError, reason, resp.StatusCode
+	if state.transportFailure != "" {
+		event.Decision, event.ReasonCode, event.Status = audit.DecisionError, state.transportFailure, resp.StatusCode
 		g.finish(state, event)
 		return resp
 	}
+	// X-Aiofcage-* headers reaching the agent always come from the gatekeeper itself. Trailers are
+	// not passed on at all: they arrive after the body, past every check here. goproxy writes the
+	// trailers it finds when it starts writing, so a nil map stays nil.
+	dropOwnHeaders(resp.Header)
+	resp.Trailer = nil
 	event.Status = resp.StatusCode
 	event.Decision = audit.DecisionAllow
 	if state.secretID != "" {
 		event.Decision = audit.DecisionInject
 	}
-	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		// Redirects are not followed and their targets are not revealed to the agent.
-		resp.Body.Close()
-		event.Decision, event.ReasonCode, event.Status = audit.DecisionDeny, "redirect_denied", http.StatusForbidden
-		g.finish(state, event)
-		return textResponse(ctx.Req, http.StatusForbidden, "redirect_denied")
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 && resp.StatusCode != http.StatusNotModified {
+		// The gatekeeper never follows a redirect. It passes one on only when it cannot carry a
+		// credential and leads where the sandbox may go anyway. Otherwise the Location never
+		// reaches the agent. The log and the refusal name the target host only for requests without
+		// an injected credential, whose redirect cannot carry the credential or a derived token.
+		target, ok := redirectTarget(active, state, resp)
+		if state.secretID != "" {
+			target = "" // the upstream could spell the credential into a host name
+		}
+		event.RedirectHost = target
+		if !ok {
+			resp.Body.Close()
+			event.Decision, event.ReasonCode, event.Status = audit.DecisionDeny, "redirect_denied", http.StatusForbidden
+			recorded := g.finish(state, event)
+			return blocked(ctx.Req, http.StatusForbidden, "redirect_denied", target, recorded.Sequence)
+		}
 	}
 	if resp.StatusCode >= 400 {
 		// Error bodies are small and may echo the credential; decode and redact before returning them.
 		body, withheld := readErrorBody(resp, state.secret)
 		resp.Body.Close()
+		resp.Trailer = nil // reading the body to its end filled them in again
 		if withheld {
 			resp.Header.Set("Content-Type", "application/json")
 		}
@@ -483,8 +513,9 @@ func (g *Gate) response(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Respon
 	return resp
 }
 
-// finish records the completed request: usage for quota and the redacted event.
-func (g *Gate) finish(state *requestState, event audit.Event) {
+// finish records the completed request: usage for quota and the redacted event, which it returns
+// as recorded.
+func (g *Gate) finish(state *requestState, event audit.Event) audit.Event {
 	event.ConfiguredModel, event.Agent, event.ProviderName, event.ModelRequest = state.model, state.agent, state.providerName, state.modelRequest
 	if event.Model == "" {
 		event.Model = state.model
@@ -530,19 +561,21 @@ func (g *Gate) finish(state *requestState, event audit.Event) {
 		}
 	}
 	g.mu.Unlock()
-	g.events.append(event)
+	recorded := g.events.append(event)
 	for _, reason := range warnings {
 		g.events.append(audit.Event{Action: audit.ActionQuotaWarning, Decision: audit.DecisionNotApplicable,
 			ReasonCode: reason, SessionID: event.SessionID, PolicyVersion: event.PolicyVersion})
 	}
+	return recorded
 }
 
-func (g *Gate) deny(event audit.Event) {
+// deny records a refusal and returns the event as recorded, with its sequence number.
+func (g *Gate) deny(event audit.Event) audit.Event {
 	g.mu.Lock()
 	g.stats.Requests++
 	g.stats.Denied++
 	g.mu.Unlock()
-	g.events.append(event)
+	return g.events.append(event)
 }
 
 // observedBody forwards the upstream response unchanged while counting bytes and sniffing usage.

@@ -71,7 +71,9 @@ type Sandbox struct {
 	// never applies to another address, which may be another server with tools of the same name.
 	MCPGrantURLs  map[string]string `json:"mcp_grant_urls,omitempty"`
 	FilesystemMCP bool              `json:"filesystem_mcp,omitempty"`
-	Usage         Usage             `json:"usage"`
+	// DevSources are the development sources (package registries, GitHub) opened for downloads.
+	DevSources []string `json:"dev_sources,omitempty"`
+	Usage      Usage    `json:"usage"`
 	// ProviderUsage is cumulative per provider ID; UsageCursor tracks the live gatekeeper run.
 	ProviderUsage map[string]ProviderUsage `json:"provider_usage,omitempty"`
 	UsageCursor   *UsageCursor             `json:"usage_cursor,omitempty"`

@@ -185,6 +185,28 @@ func (m *Manager) listConnectors(ctx context.Context, sandboxID string) ([]strin
 	return names, nil
 }
 
+// connectorSecret reads a connector service and its password together, under the service's lock,
+// so an edited address is never launched with the old password or the reverse.
+func (m *Manager) connectorSecret(ctx context.Context, read mcp.Service) (mcp.Service, []byte, error) {
+	unlock, err := m.store.LockOperation(ctx, ServiceLock(read.ID), true)
+	if err != nil {
+		return read, nil, err
+	}
+	defer unlock()
+	service, err := m.store.MCPService(read.ID)
+	if err != nil || service.IsBuiltin() {
+		return service, nil, err
+	}
+	if !service.IsConnector() {
+		return service, nil, fmt.Errorf("MCP 服务「%s」已经不是连接器类服务", service.Name)
+	}
+	secret, err := m.vault.Read(ctx, service.KeyRef)
+	if err != nil {
+		return service, nil, fmt.Errorf("MCP 服务「%s」的密码不可用：%w", service.Name, err)
+	}
+	return service, secret, nil
+}
+
 // syncConnectors makes a sandbox's connector containers match its enabled connector services,
 // delivers each one its secret, and returns the gatekeeper routes to them. Connectors sit only on
 // the sandbox's egress network: the gatekeeper can reach them, the agent cannot.
@@ -226,12 +248,10 @@ func (m *Manager) syncConnectors(ctx context.Context, sbx sandbox.Sandbox, servi
 		if err := m.ensureConnector(ctx, sbx.ID, name, build.tag, n.egress); err != nil {
 			return nil, err
 		}
-		var secret []byte
-		if !service.IsBuiltin() {
-			secret, err = m.vault.Read(ctx, service.KeyRef)
-			if err != nil {
-				return nil, fmt.Errorf("MCP 服务「%s」的密码不可用：%w", service.Name, err)
-			}
+		// The image build above can take minutes: launch with the service as it is now.
+		service, secret, err := m.connectorSecret(ctx, service)
+		if err != nil {
+			return nil, err
 		}
 		command, redact, err := service.Launch(string(secret))
 		clear(secret)

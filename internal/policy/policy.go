@@ -12,7 +12,8 @@ import (
 )
 
 // Rule authorizes or denies HTTPS requests. Host is an exact lowercase name; deny rules may also use
-// a "*.example.com" suffix wildcard. Path is exact, a prefix ending in "/*", or empty for any path.
+// a "*.example.com" suffix wildcard. Path is exact, a prefix ending in "/*", or empty for any path;
+// a segment that is just "*" matches any one non-empty segment (e.g. "/*/*/info/refs").
 type Rule struct {
 	ID        string   `json:"id"`
 	Effect    string   `json:"effect"`
@@ -21,6 +22,9 @@ type Rule struct {
 	Methods   []string `json:"methods,omitempty"`
 	Path      string   `json:"path,omitempty"`
 	SecretRef string   `json:"secret_ref,omitempty"`
+	// Anonymous allow rules refuse requests that carry their own credentials (an Authorization,
+	// API key or Cookie header): the source is opened for anonymous downloads only.
+	Anonymous bool `json:"anonymous,omitempty"`
 }
 
 type Snapshot struct {
@@ -41,6 +45,7 @@ type Decision struct {
 	ReasonCode string
 	RuleID     string
 	SecretRef  string
+	Anonymous  bool
 	// Matches lists every allow rule matching the request, in order. Several providers may share
 	// a host and path (e.g. two agents on the same endpoint); the gatekeeper then picks the one
 	// whose placeholder the request carries.
@@ -50,6 +55,7 @@ type Decision struct {
 type Match struct {
 	RuleID    string
 	SecretRef string
+	Anonymous bool
 }
 
 const (
@@ -153,16 +159,36 @@ func (r Rule) validate() error {
 			return fmt.Errorf("不支持的 HTTP 方法：%s", method)
 		}
 	}
-	if r.Path != "" && r.Path != "/*" {
-		base := strings.TrimSuffix(r.Path, "/*")
-		if !ValidPath(base) || strings.Contains(base, "*") {
-			return errors.New("path 须为规范化的绝对路径，前缀匹配以 /* 结尾")
-		}
+	if r.Path != "" && r.Path != "/*" && !validPattern(strings.TrimSuffix(r.Path, "/*")) {
+		return errors.New("path 须为规范化的绝对路径，前缀匹配以 /* 结尾，单段通配只能写成 /*/")
 	}
 	if r.SecretRef != "" && (r.Effect != Allow || !ValidID(r.SecretRef)) {
 		return errors.New("secret_ref 只能用于 allow 规则且须为有效 ID")
 	}
+	if r.SecretRef != "" && strings.Contains(strings.TrimSuffix(r.Path, "/*"), "*") {
+		return errors.New("注入密钥的规则不能用单段通配")
+	}
+	if r.Anonymous && (r.Effect != Allow || r.SecretRef != "") {
+		return errors.New("anonymous 只能用于不注入密钥的 allow 规则")
+	}
 	return nil
+}
+
+// validPattern accepts a clean absolute path whose segments are literal or exactly "*".
+func validPattern(base string) bool {
+	if !strings.HasPrefix(base, "/") {
+		return false
+	}
+	segments := strings.Split(base[1:], "/")
+	for i, segment := range segments {
+		switch {
+		case segment == "*":
+			segments[i] = "x"
+		case strings.Contains(segment, "*"):
+			return false
+		}
+	}
+	return ValidPath("/" + strings.Join(segments, "/"))
 }
 
 // Evaluate applies deny rules first, then the first matching allow rule.
@@ -177,9 +203,9 @@ func (s *Snapshot) Evaluate(request Request) Decision {
 	for _, rule := range s.Rules {
 		if rule.Effect == Allow && rule.matches(request) {
 			if !decision.Allowed {
-				decision = Decision{Allowed: true, ReasonCode: "allowed", RuleID: rule.ID, SecretRef: rule.SecretRef}
+				decision = Decision{Allowed: true, ReasonCode: "allowed", RuleID: rule.ID, SecretRef: rule.SecretRef, Anonymous: rule.Anonymous}
 			}
-			decision.Matches = append(decision.Matches, Match{RuleID: rule.ID, SecretRef: rule.SecretRef})
+			decision.Matches = append(decision.Matches, Match{RuleID: rule.ID, SecretRef: rule.SecretRef, Anonymous: rule.Anonymous})
 		}
 	}
 	if decision.Allowed {
@@ -250,15 +276,26 @@ func (r Rule) matches(request Request) bool {
 }
 
 func pathMatches(pattern, value string) bool {
-	switch {
-	case pattern == "" || pattern == "/*":
+	if pattern == "" || pattern == "/*" {
 		return true
-	case strings.HasSuffix(pattern, "/*"):
-		prefix := strings.TrimSuffix(pattern, "*")
-		return value == strings.TrimSuffix(prefix, "/") || strings.HasPrefix(value, prefix)
-	default:
+	}
+	base, prefix := strings.CutSuffix(pattern, "/*")
+	if !strings.Contains(base, "*") {
+		if prefix {
+			return value == base || strings.HasPrefix(value, base+"/")
+		}
 		return value == pattern
 	}
+	want, got := strings.Split(base, "/"), strings.Split(value, "/")
+	if len(got) < len(want) || (!prefix && len(got) != len(want)) {
+		return false
+	}
+	for i, segment := range want {
+		if segment == "*" && got[i] == "" || segment != "*" && segment != got[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func contains(values []string, value string) bool {

@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/shaoxier/AIofCage/internal/devsource"
 	"github.com/shaoxier/AIofCage/internal/events"
 	"github.com/shaoxier/AIofCage/internal/gatekeeper"
 	"github.com/shaoxier/AIofCage/internal/mcp"
@@ -133,6 +134,7 @@ type CreateRequest struct {
 	MCP            []string            `json:"mcp"`
 	MCPPermissions map[string][]string `json:"mcp_permissions"`
 	FilesystemMCP  bool                `json:"filesystem_mcp"`
+	DevSources     []string            `json:"dev_sources"`
 }
 
 // Create records a sandbox. Docker objects are created on first start.
@@ -140,7 +142,10 @@ func (m *Manager) Create(_ context.Context, request CreateRequest) (sandbox.Sand
 	sbx := sandbox.Sandbox{ID: sandbox.NewID(), Name: strings.TrimSpace(request.Name),
 		ProjectPath: filepath.Clean(request.ProjectPath), Bindings: request.Bindings, Limits: request.Limits,
 		FilesystemMCP: request.FilesystemMCP, MCPPermissions: cloneMCPPermissions(request.MCPPermissions),
-		Placeholders: map[string]string{}, CreatedAt: time.Now().UTC()}
+		DevSources: slices.Clone(request.DevSources), Placeholders: map[string]string{}, CreatedAt: time.Now().UTC()}
+	if err := devsource.Validate(sbx.DevSources); err != nil {
+		return sbx, err
+	}
 	if err := sbx.Validate(); err != nil {
 		return sbx, err
 	}
@@ -301,7 +306,31 @@ func (m *Manager) SetMCPPermissions(ctx context.Context, id string, ids []string
 	if err != nil {
 		return err
 	}
-	return m.refresh(ctx, sbx)
+	return m.refresh(ctx, sbx, true)
+}
+
+// SetDevSources changes which development sources a sandbox may download from; a running
+// sandbox gets the new rules and client settings at once.
+func (m *Manager) SetDevSources(ctx context.Context, id string, sources []string) error {
+	if err := devsource.Validate(sources); err != nil {
+		return err
+	}
+	unlock, lockErr := m.lock(ctx, id)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer unlock()
+	if err := m.store.UpdateSandbox(id, func(s *sandbox.Sandbox) error {
+		s.DevSources = slices.Clone(sources)
+		return nil
+	}); err != nil {
+		return err
+	}
+	sbx, err := m.store.Sandbox(id)
+	if err != nil {
+		return err
+	}
+	return m.refresh(ctx, sbx, true)
 }
 
 func (m *Manager) servicesFor(sbx sandbox.Sandbox) (map[string]mcp.Service, error) {
@@ -335,9 +364,16 @@ type State struct {
 }
 
 func (m *Manager) Status(ctx context.Context, id string) State {
+	state, _ := m.state(ctx, id)
+	return state
+}
+
+// state is Status with an error when Docker could not say whether a container runs: such a
+// sandbox may be running and must not be treated as stopped.
+func (m *Manager) state(ctx context.Context, id string) (State, error) {
 	n := names(id)
-	gate := m.container(ctx, n.gate)
-	agent := m.container(ctx, n.agent)
+	gate, gateErr := m.inspect(ctx, n.gate)
+	agent, agentErr := m.inspect(ctx, n.agent)
 	state := State{GateRunning: gate.running, AgentRunning: agent.running}
 	switch {
 	case !gate.exists && !agent.exists:
@@ -349,7 +385,10 @@ func (m *Manager) Status(ctx context.Context, id string) State {
 	default:
 		state.State = statePartial
 	}
-	return state
+	if gateErr != nil {
+		return state, gateErr
+	}
+	return state, agentErr
 }
 
 type containerInfo struct {
@@ -358,20 +397,30 @@ type containerInfo struct {
 }
 
 func (m *Manager) container(ctx context.Context, name string) containerInfo {
+	info, _ := m.inspect(ctx, name)
+	return info
+}
+
+// inspect reads a container's state. A container that does not exist is not an error; Docker
+// failing to answer is.
+func (m *Manager) inspect(ctx context.Context, name string) (containerInfo, error) {
 	out, err := m.docker.run(ctx, 15*time.Second, nil, "container", "inspect", "--format",
 		`{{.State.Running}} {{.Config.Image}} {{index .Config.Labels "`+specLabel+`"}}`, name)
 	if err != nil {
-		return containerInfo{}
+		if strings.Contains(err.Error(), "No such container") || strings.Contains(err.Error(), "No such object") {
+			return containerInfo{}, nil
+		}
+		return containerInfo{}, err
 	}
 	fields := strings.Fields(string(out))
 	if len(fields) < 2 {
-		return containerInfo{}
+		return containerInfo{}, errors.New("docker container inspect 的输出无法识别")
 	}
 	info := containerInfo{exists: true, running: fields[0] == "true", image: fields[1]}
 	if len(fields) > 2 {
 		info.spec = fields[2]
 	}
-	return info
+	return info, nil
 }
 
 func (m *Manager) providersFor(sbx sandbox.Sandbox) (map[string]provider.Provider, error) {
@@ -672,6 +721,7 @@ func (m *Manager) gateConfig(ctx context.Context, sbx sandbox.Sandbox, providers
 		BaselineRequests: sbx.Usage.Requests, BaselineTokens: sbx.Usage.Tokens}}
 	config.Policy.Version = uint64(time.Now().UnixMilli())
 	config.Policy.SessionID = sbx.ID
+	config.Policy.Rules = append(config.Policy.Rules, devsource.Rules(sbx.DevSources)...)
 	for _, id := range sortedKeys(providers) {
 		p := providers[id]
 		if err := p.KeyRefAllowed(); err != nil {
@@ -848,18 +898,35 @@ func (m *Manager) Bind(ctx context.Context, id string, agent session.Agent, prov
 	return err
 }
 
-// Refresh 刷新策略与 Agent 设置，但继续使用已生效的供应商快照；新选择在启动时应用。
+// Refresh 刷新策略与 Agent 设置，但继续使用已生效的供应商快照；新选择在启动时应用。它用于
+// 可能收紧权限的修改（编辑或断开服务）：送不到门卫时，哪怕是因为别的操作占着沙箱太久，
+// 运行中的沙箱也会断网。
 func (m *Manager) Refresh(ctx context.Context, id string) error {
+	return m.refreshUnder(ctx, id, true)
+}
+
+// RefreshCredentials hands renewed or new credentials to a running sandbox. Nothing becomes
+// narrower, so a gatekeeper that misses them keeps its configuration and the caller retries.
+func (m *Manager) RefreshCredentials(ctx context.Context, id string) error {
+	return m.refreshUnder(ctx, id, false)
+}
+
+func (m *Manager) refreshUnder(ctx context.Context, id string, mayNarrow bool) error {
 	unlock, lockErr := m.lock(ctx, id)
 	if lockErr != nil {
-		return lockErr
+		sbx, err := m.store.Sandbox(id)
+		if !mayNarrow || err != nil {
+			return lockErr
+		}
+		// Waiting longer is not possible here; an empty policy is safe whoever holds the sandbox.
+		return m.offline(ctx, sbx, lockErr)
 	}
 	defer unlock()
 	sbx, err := m.store.Sandbox(id)
 	if err != nil {
 		return err
 	}
-	return m.refresh(ctx, sbx)
+	return m.refresh(ctx, sbx, mayNarrow)
 }
 
 // captureApplied 为升级前的运行容器补记配置，避免修改时误称已经生效。
@@ -892,39 +959,115 @@ func (m *Manager) CaptureApplied(ctx context.Context, id string) error {
 	return m.captureApplied(ctx, id)
 }
 
-func (m *Manager) refresh(ctx context.Context, sbx sandbox.Sandbox) error {
-	if m.Status(ctx, sbx.ID).State != stateRunning {
+// refresh delivers the stored settings to a running sandbox; one whose state Docker cannot tell is
+// treated as running. Callers save the settings first, so when the gatekeeper does not take them
+// it may hold a wider configuration than the stored one (a closed source, a revoked tool, a
+// disconnected login); if the change may narrow the settings, the sandbox is taken offline.
+func (m *Manager) refresh(ctx context.Context, sbx sandbox.Sandbox, mayNarrow bool) error {
+	if !m.mayRun(ctx, sbx.ID) {
 		return nil
 	}
+	applied, err := m.deliver(ctx, sbx)
+	if err == nil || applied || !mayNarrow {
+		return err
+	}
+	return m.closeGate(ctx, sbx, err)
+}
+
+// mayRun reports whether a sandbox could be running: it is, or Docker cannot say and the VM is
+// not known to be stopped.
+func (m *Manager) mayRun(ctx context.Context, id string) bool {
+	state, err := m.state(ctx, id)
+	if err == nil {
+		return state.State == stateRunning
+	}
+	if m.env == nil {
+		return true
+	}
+	vm, vmErr := m.env.vm(ctx)
+	return vmErr != nil || (vm != nil && vm.Status != "Stopped")
+}
+
+// offline takes a sandbox that may be running offline without delivering anything.
+func (m *Manager) offline(ctx context.Context, sbx sandbox.Sandbox, cause error) error {
+	check, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	defer cancel()
+	if !m.mayRun(check, sbx.ID) {
+		return cause
+	}
+	return m.closeGate(ctx, sbx, cause)
+}
+
+// deliver pushes the settings to the gatekeeper, then to the agent; applied reports whether the
+// gatekeeper took the new configuration.
+func (m *Manager) deliver(ctx context.Context, sbx sandbox.Sandbox) (bool, error) {
 	if sbx.AppliedProviders != nil {
 		sbx.Bindings = sbx.AppliedBindings
 	}
 	providers, err := m.providersFor(sbx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if sbx.AppliedProviders != nil {
 		providers = sbx.AppliedProviders
 	}
 	client, err := m.client(ctx, sbx.ID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	services, err := m.servicesFor(sbx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if sbx, err = m.prepareRemote(ctx, sbx, services); err != nil {
-		return err
+		return false, err
 	}
 	routes, err := m.syncConnectors(ctx, sbx, services)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := m.configure(ctx, client, sbx, providers, routes); err != nil {
-		return err
+		return false, err
 	}
-	return m.writeAgentFiles(ctx, client, sbx, providers)
+	return true, m.writeAgentFiles(ctx, client, sbx, providers)
+}
+
+// closeGate takes a sandbox offline after its gatekeeper missed new settings: it clears the
+// gatekeeper's policy, or stops the gatekeeper when that does not work in time. A later successful
+// refresh, or a restart, brings the sandbox back with the stored settings. Each step has its own
+// deadline, unrelated to the caller's, which may be what made the delivery fail.
+func (m *Manager) closeGate(ctx context.Context, sbx sandbox.Sandbox, cause error) error {
+	base := context.WithoutCancel(ctx)
+	failed := fmt.Sprintf("新设置没能下发给沙箱「%s」的门卫（%v）。", sbx.Name, cause)
+	clearing, cancel := context.WithTimeout(base, clearTimeout)
+	client, err := m.client(clearing, sbx.ID)
+	if err == nil {
+		err = clearPolicy(clearing, client, sbx)
+	}
+	cancel()
+	if err == nil {
+		return errors.New(failed + "为安全起见，已暂停这个沙箱的全部网络访问，重试成功或重启沙箱后恢复")
+	}
+	stop, cancel := context.WithTimeout(base, 30*time.Second)
+	defer cancel()
+	if _, err := m.docker.run(stop, 30*time.Second, nil, "stop", "--time", "5", names(sbx.ID).gate); err == nil {
+		return errors.New(failed + "为安全起见，已停止它的门卫，沙箱暂时不能联网，请重启沙箱")
+	}
+	return errors.New(failed + "也没能暂停它的网络；如果这个沙箱正在运行，请立即停止它")
+}
+
+// clearTimeout bounds reaching and clearing a gatekeeper before closeGate stops it instead.
+var clearTimeout = 20 * time.Second
+
+// clearPolicy replaces the gatekeeper's configuration with an empty policy: it refuses every
+// request and keeps no secret or connector in memory. The version follows the active one even if
+// the host clock went back.
+func clearPolicy(ctx context.Context, client *gateClient, sbx sandbox.Sandbox) error {
+	version := uint64(time.Now().UnixMilli())
+	if health, err := client.health(ctx); err == nil && health.PolicyVersion >= version {
+		version = health.PolicyVersion + 1
+	}
+	return client.putConfig(ctx, gatekeeper.Config{Policy: policy.Snapshot{Version: version, SessionID: sbx.ID}})
 }
 
 // Stop saves cumulative usage so quotas survive restarts, revokes the live gatekeeper policy,
@@ -960,8 +1103,7 @@ func (m *Manager) revokeRuntime(ctx context.Context, sbx sandbox.Sandbox) error 
 	var errs []error
 	client, err := m.client(ctx, sbx.ID)
 	if err == nil {
-		config := gatekeeper.Config{Policy: policy.Snapshot{Version: uint64(time.Now().UnixMilli()), SessionID: sbx.ID}}
-		if err := client.putConfig(ctx, config); err != nil {
+		if err := clearPolicy(ctx, client, sbx); err != nil {
 			errs = append(errs, fmt.Errorf("清空沙箱「%s」的门卫授权失败：%w", sbx.Name, err))
 		}
 	} else if m.Status(ctx, sbx.ID).State == stateRunning {

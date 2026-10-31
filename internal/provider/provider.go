@@ -168,6 +168,10 @@ func (p Provider) Endpoint() (string, string, error) {
 	if base != "/" && !policy.ValidPath(base) {
 		return "", "", errors.New("接口地址的路径无效")
 	}
+	if strings.Contains(base, "*") {
+		// A "*" segment would turn the provider's rules into wildcards.
+		return "", "", errors.New("接口地址的路径里不能有 *")
+	}
 	return host, strings.TrimSuffix(base, "/"), nil
 }
 

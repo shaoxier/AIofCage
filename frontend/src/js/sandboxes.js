@@ -2,6 +2,7 @@
 import { useEffect, useState } from "preact/hooks";
 import { html, call, AGENTS, agentName, STATES, formatTokens, formatBytes, Icon, agentIcon, PageTitle } from "./core.js";
 import { cleanGrants, MCPChoices } from "./mcp.js";
+import { DevSourceChoices, DevSourceDialog, useDevSources } from "./dev-sources.js";
 import { AttackDialog } from "./ai.js";
 import { useTerminals } from "./terminal.js";
 import { SandboxDetail } from "./sandbox-detail.js";
@@ -11,6 +12,8 @@ export function SandboxesPage({ sandboxes, providers, services, recoverable, ove
   const [filter, setFilter] = useState("all");
   const [addingAgents, setAddingAgents] = useState(null);
   const [editingMCP, setEditingMCP] = useState(null);
+  const [editingDev, setEditingDev] = useState(null);
+  const devSources = useDevSources();
   const [attacking, setAttacking] = useState(null);
   const [creating, setCreating] = useState(false);
   const [busy, setBusy] = useState({}); // id → 正在进行的操作
@@ -52,7 +55,13 @@ export function SandboxesPage({ sandboxes, providers, services, recoverable, ove
           setEditingMCP(null);
           if (await run(target, "更新 MCP", "SetSandboxMCPPermissions", target.id, ids, filesystem, permissions)) notify(`已更新「${target.name}」的 MCP 服务和工具权限`);
         }} />`}
-      ${creating && html`<${CreateSandboxDialog} providers=${providers} services=${services} overview=${overview} onAddProvider=${onAddProvider} tutorial=${tutorial}
+      ${editingDev && html`<${DevSourceDialog} sandbox=${editingDev} sources=${devSources} onClose=${() => setEditingDev(null)}
+        onSave=${async (sources) => {
+          const target = editingDev;
+          setEditingDev(null);
+          if (await run(target, "更新开发环境", "SetSandboxDevSources", target.id, sources)) notify(`已更新「${target.name}」的开发环境`);
+        }} />`}
+      ${creating && html`<${CreateSandboxDialog} providers=${providers} services=${services} devSources=${devSources} overview=${overview} onAddProvider=${onAddProvider} tutorial=${tutorial}
         onClose=${() => setCreating(false)} onCreated=${async (created, start) => {
           setCreating(false);
           notify(`已创建沙箱「${created.name}」`);
@@ -83,6 +92,7 @@ export function SandboxesPage({ sandboxes, providers, services, recoverable, ove
       services=${services} recoverable=${recoverable} events=${events} vm=${overview?.environment?.vm} usage=${summary?.sandboxes?.find((u) => u.id === current.id)}
       busy=${busy[current.id] ?? current.operation} progress=${progress[current.id] || current.progress} run=${run} notify=${notify}
       onAddAgents=${() => setAddingAgents(current)} onEditMCP=${() => setEditingMCP(current)} onAttack=${() => setAttacking(current)}
+      devSources=${devSources} onEditDev=${() => setEditingDev(current)}
       onReset=${() => setResetting(current)} onDelete=${() => setDeleting(current)} onLogs=${(filter) => onLogs(current.id, filter)} dialogs=${dialogs} />`;
   }
 
@@ -195,7 +205,7 @@ function SandboxRow({ sandbox, providers, usage, busy, progress, run, notify, on
     </div></article>`;
 }
 
-function CreateSandboxDialog({ providers, services, overview, onClose, onCreated, onAddProvider, tutorial }) {
+function CreateSandboxDialog({ providers, services, devSources, overview, onClose, onCreated, onAddProvider, tutorial }) {
   const workspace = overview?.workspace ?? "";
   const [name, setName] = useState("");
   const [path, setPath] = useState("");
@@ -208,6 +218,7 @@ function CreateSandboxDialog({ providers, services, overview, onClose, onCreated
   const [mcp, setMcp] = useState([]);
   const [mcpPermissions, setMcpPermissions] = useState({});
   const [filesystem, setFilesystem] = useState(false);
+  const [dev, setDev] = useState([]);
   const [maxRequests, setMaxRequests] = useState("");
   const [maxTokens, setMaxTokens] = useState("");
   const [error, setError] = useState("");
@@ -238,6 +249,7 @@ function CreateSandboxDialog({ providers, services, overview, onClose, onCreated
         name, project_path: mode === "new" ? "" : path, project_mode: mode,
         bindings: selected.map((a) => ({ agent: a.id, provider_id: bindings[a.id] })),
         max_requests: Number(maxRequests) || 0, max_tokens: Number(maxTokens) || 0, mcp, mcp_permissions: mcpPermissions, filesystem_mcp: filesystem,
+        dev_sources: dev,
       });
       onCreated(created, start);
     } catch (e) {
@@ -287,6 +299,9 @@ function CreateSandboxDialog({ providers, services, overview, onClose, onCreated
               </div>`;
             })}
           </div>
+
+          <label>开发环境（可选）</label>
+          <${DevSourceChoices} sources=${devSources} selected=${dev} onChange=${setDev} />
 
           <label>工具连接（可选）</label>
           <${MCPChoices} services=${services} selected=${mcp} permissions=${mcpPermissions} filesystem=${filesystem}

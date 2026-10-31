@@ -30,8 +30,11 @@ func TestValidateRejects(t *testing.T) {
 		"non-443 port":        {ID: "r", Effect: Allow, Host: "example.com", Port: 8443, Methods: []string{"GET"}},
 		"dirty path":          {ID: "r", Effect: Allow, Host: "example.com", Methods: []string{"GET"}, Path: "/a/../b"},
 		"encoded path":        {ID: "r", Effect: Allow, Host: "example.com", Methods: []string{"GET"}, Path: "/a%2fb"},
-		"inner wildcard":      {ID: "r", Effect: Allow, Host: "example.com", Methods: []string{"GET"}, Path: "/a/*/b"},
+		"partial wildcard":    {ID: "r", Effect: Allow, Host: "example.com", Methods: []string{"GET"}, Path: "/a/b*/c"},
+		"anonymous deny":      {ID: "r", Effect: Deny, Host: "example.com", Path: "/a", Anonymous: true},
+		"anonymous secret":    {ID: "r", Effect: Allow, Host: "example.com", Methods: []string{"GET"}, SecretRef: "s", Anonymous: true},
 		"secret on deny":      {ID: "r", Effect: Deny, Host: "example.com", SecretRef: "s"},
+		"wildcard secret":     {ID: "r", Effect: Allow, Host: "example.com", Methods: []string{"POST"}, Path: "/*/responses/*", SecretRef: "s"},
 		"bad effect":          {ID: "r", Effect: "maybe", Host: "example.com"},
 		"bad id":              {ID: "has space", Effect: Deny, Host: "example.com"},
 	}
@@ -122,5 +125,43 @@ func TestValidPath(t *testing.T) {
 		if got := ValidPath(value); got != want {
 			t.Errorf("%q: got %v want %v", value, got, want)
 		}
+	}
+}
+
+// Segment wildcards express git smart HTTP on GitHub: any owner and repository, one fixed tail.
+func TestSegmentWildcards(t *testing.T) {
+	snapshot := Snapshot{Version: 1, Rules: []Rule{
+		{ID: "refs", Effect: Allow, Host: "github.com", Methods: []string{"GET"}, Path: "/*/*/info/refs", Anonymous: true},
+		{ID: "fetch", Effect: Allow, Host: "github.com", Methods: []string{"POST"}, Path: "/*/*/git-upload-pack"},
+		{ID: "archive", Effect: Allow, Host: "github.com", Methods: []string{"GET"}, Path: "/*/*/archive/*"},
+		{ID: "push", Effect: Deny, Host: "github.com", Path: "/*/*/git-receive-pack"},
+	}}
+	if err := snapshot.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		method, path string
+		allowed      bool
+		rule         string
+	}{
+		{"GET", "/octo/demo.git/info/refs", true, "refs"},
+		{"GET", "/octo/demo/info/refs", true, "refs"},
+		{"POST", "/octo/demo.git/git-upload-pack", true, "fetch"},
+		{"GET", "/octo/demo/archive/refs/heads/main.zip", true, "archive"},
+		{"GET", "/octo/demo/archive", true, "archive"},
+		{"POST", "/octo/demo.git/git-receive-pack", false, "push"},
+		{"GET", "/octo/info/refs", false, ""},
+		{"GET", "/a/b/c/info/refs", false, ""},
+		{"GET", "/octo/demo/info/refs/x", false, ""},
+		{"GET", "/octo/demo.git/HEAD", false, ""},
+		{"POST", "/octo/demo.git/info/refs", false, ""},
+	} {
+		d := snapshot.Evaluate(Request{Host: "github.com", Method: c.method, Path: c.path})
+		if d.Allowed != c.allowed || d.RuleID != c.rule {
+			t.Errorf("%s %s: %+v", c.method, c.path, d)
+		}
+	}
+	if d := snapshot.Evaluate(Request{Host: "github.com", Method: "GET", Path: "/octo/demo/info/refs"}); !d.Anonymous {
+		t.Fatal("the anonymous flag of the matching rule must reach the gatekeeper")
 	}
 }

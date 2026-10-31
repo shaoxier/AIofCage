@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -35,6 +37,12 @@ func (a *App) AuthorizeMCPService(id string) (MCPServiceView, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
+	// Logging in again may switch accounts: the old account's token must not stay in use.
+	relogin := false
+	if previous, err := a.vault.Read(ctx, service.KeyRef); err == nil {
+		relogin = true
+		clear(previous)
+	}
 	creds, err := a.oauth.Login(ctx, service.URL)
 	if err != nil {
 		return MCPServiceView{}, err
@@ -59,7 +67,7 @@ func (a *App) AuthorizeMCPService(id string) (MCPServiceView, error) {
 	if err != nil {
 		return view, err
 	}
-	return view, a.refreshSandboxesUsing(ctx, service.ID)
+	return view, a.refreshSandboxesUsing(ctx, service.ID, relogin)
 }
 
 func (a *App) saveLogin(ctx context.Context, service mcp.Service, data []byte) error {
@@ -104,11 +112,18 @@ func (a *App) DisconnectMCPService(id string) (MCPServiceView, error) {
 	if err != nil {
 		return view, err
 	}
-	return view, a.refreshSandboxesUsing(ctx, service.ID)
+	return view, a.refreshSandboxesUsing(ctx, service.ID, true)
 }
 
+// refreshTimeout bounds the refresh of one sandbox, including waiting for its lock.
+const refreshTimeout = 2 * time.Minute
+
 // refreshSandboxesUsing re-delivers configuration to running sandboxes that use a service.
-func (a *App) refreshSandboxesUsing(ctx context.Context, serviceID string) error {
+// mayNarrow says the change may take something away (an edit, a disconnect, another login): such
+// sandboxes go offline when the refresh fails, and the monitor delivers again until it succeeds;
+// a missed new credential is retried with the OAuth checks. One failure does not stop the others,
+// and each sandbox gets its own time: a revoked login must reach every gatekeeper that holds it.
+func (a *App) refreshSandboxesUsing(ctx context.Context, serviceID string, mayNarrow bool) error {
 	if a.manager == nil {
 		return nil
 	}
@@ -116,16 +131,66 @@ func (a *App) refreshSandboxesUsing(ctx context.Context, serviceID string) error
 	if err != nil {
 		return err
 	}
+	refresh := a.manager.RefreshCredentials
+	if mayNarrow {
+		refresh = a.manager.Refresh
+	}
+	var errs []error
 	for _, sbx := range sandboxes {
-		for _, id := range sbx.MCP {
-			if id == serviceID {
-				if err := a.manager.Refresh(ctx, sbx.ID); err != nil {
-					return fmt.Errorf("已保存，但更新运行中的沙箱「%s」失败：%w", sbx.Name, err)
+		if slices.Contains(sbx.MCP, serviceID) {
+			one, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshTimeout)
+			err := refresh(one, sbx.ID)
+			cancel()
+			if err != nil {
+				errs = append(errs, fmt.Errorf("已保存，但更新运行中的沙箱「%s」失败：%w", sbx.Name, err))
+				if mayNarrow {
+					a.markStale(sbx.ID, err)
+				} else {
+					a.monitor.mu.Lock()
+					a.monitor.oauthPending[serviceID] = true
+					a.monitor.mu.Unlock()
 				}
 			}
 		}
 	}
-	return nil
+	return errors.Join(errs...)
+}
+
+// staleRetries is how many times, a minute apart, the monitor delivers the stored settings again
+// to a sandbox whose refresh failed. A cause that lasts longer (an older gatekeeper) needs a restart.
+const staleRetries = 10
+
+// markStale remembers a sandbox whose last refresh failed, so the monitor delivers its stored
+// settings again; it returns err unchanged.
+func (a *App) markStale(id string, err error) error {
+	if err != nil {
+		a.monitor.mu.Lock()
+		a.monitor.stale[id] = 0
+		a.monitor.mu.Unlock()
+	}
+	return err
+}
+
+// retryStale delivers the stored settings again, with refresh, to sandboxes whose last refresh
+// failed. A sandbox that went offline comes back once it succeeds, and a gatekeeper that another
+// operation reconfigured meanwhile gets the stored settings. Stopped sandboxes succeed at once.
+func (a *App) retryStale(ctx context.Context, refresh func(context.Context, string) error) {
+	a.monitor.mu.Lock()
+	ids := slices.Sorted(maps.Keys(a.monitor.stale))
+	a.monitor.mu.Unlock()
+	for _, id := range ids {
+		_, err := a.store.Sandbox(id)
+		if err == nil {
+			one, cancel := context.WithTimeout(ctx, refreshTimeout)
+			err = refresh(one, id)
+			cancel()
+		}
+		a.monitor.mu.Lock()
+		if a.monitor.stale[id]++; err == nil || a.monitor.stale[id] >= staleRetries {
+			delete(a.monitor.stale, id)
+		}
+		a.monitor.mu.Unlock()
+	}
 }
 
 // refreshOAuth renews access tokens that running sandboxes will need soon and hands the new ones
@@ -157,6 +222,7 @@ func (a *App) refreshOAuth(ctx context.Context) {
 			a.monitor.mu.Lock()
 			alerted := a.monitor.oauthAlerted[id]
 			a.monitor.oauthAlerted[id] = err != nil
+			pending := a.monitor.oauthPending[id]
 			a.monitor.mu.Unlock()
 			if err != nil {
 				if !alerted {
@@ -165,8 +231,14 @@ func (a *App) refreshOAuth(ctx context.Context) {
 				}
 				continue
 			}
-			if refreshed {
-				if err := a.refreshSandboxesUsing(ctx, id); err != nil {
+			if refreshed || pending {
+				// A renewal takes nothing away, so a missed push only leaves the old token in place;
+				// it is retried on the next check.
+				err := a.refreshSandboxesUsing(ctx, id, false)
+				a.monitor.mu.Lock()
+				a.monitor.oauthPending[id] = err != nil
+				a.monitor.mu.Unlock()
+				if err != nil && !pending {
 					a.emit("sandbox:alert", map[string]string{"id": sbx.ID, "message": err.Error()})
 				}
 			}
