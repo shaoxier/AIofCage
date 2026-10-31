@@ -124,17 +124,25 @@ function ProviderDialog({ agent, presets, initial, onClose, onSaved }) {
   const [saving, setSaving] = useState(false);
   const [models, setModels] = useState({ list: [], message: "", ok: false, loading: false });
   const fetches = useRef(0); // 连续获取时只采用最后一次的结果
+  // 地址、协议、请求头或密钥变了，旧列表不再对应；还没回来的请求也作废。
+  const dropModels = () => { fetches.current++; setModels({ list: [], message: "", ok: false, loading: false }); };
   const choose = (p) => {
+    dropModels();
     setPreset(p);
     setForm({
       id: "", name: p.name, agent: p.agent, protocol: p.protocol, base_url: p.base_url, model: p.model,
       auth: p.auth, preset: p.id, api_key: "", use_existing: Boolean(p.existing_key_ref),
     });
   };
-  const set = (key) => (event) => setForm({ ...form,
-    ...(key.startsWith("price_") ? { price_source: "", price_as_of: "" } : {}),
-    ...(key === "model" ? { price_enabled: false, price_source: "", price_as_of: "" } : {}),
-    [key]: event.target.type === "checkbox" ? event.target.checked : event.target.value });
+  const set = (key) => (event) => {
+    const value = event.target.type === "checkbox" ? event.target.checked : event.target.value;
+    if (["base_url", "protocol", "auth", "api_key", "use_existing"].includes(key) && value !== form[key]) dropModels();
+    setForm({ ...form,
+      ...(key.startsWith("price_") ? { price_source: "", price_as_of: "" } : {}),
+      // 单价按模型填写，换了模型才清空
+      ...(key === "model" && value !== form.model ? { price_enabled: false, price_source: "", price_as_of: "" } : {}),
+      [key]: value });
+  };
   const request = () => ({
     id: form.id ?? "", name: form.name, agent: form.agent, protocol: form.protocol, base_url: form.base_url,
     model: form.model, auth: form.agent === "dsh" ? (form.protocol === "anthropic" ? "x-api-key" : "bearer") : form.auth, preset: form.preset ?? "",
@@ -154,11 +162,12 @@ function ProviderDialog({ agent, presets, initial, onClose, onSaved }) {
       if (turn === fetches.current) setModels({ list: [], message: e.message, ok: false, loading: false });
     }
   };
-  // 编辑已有供应商时先显示缓存的列表。
+  // 编辑已有供应商时先显示缓存的列表；这期间点了获取或改了地址，就不再采用它。
   useEffect(() => {
     if (!editing) return;
+    const turn = fetches.current;
     call("ProviderModels", initial.id, false)
-      .then((result) => setModels({ list: result.models ?? [], message: result.ok ? "" : result.message, ok: result.ok, loading: false }))
+      .then((result) => { if (turn === fetches.current) setModels({ list: result.models ?? [], message: result.ok ? "" : result.message, ok: result.ok, loading: false }); })
       .catch(() => {});
   }, []);
   // 地址固定的预设，填好密钥后自动获取；自定义地址要用户自己点，免得把密钥发给还没填完的域名。
@@ -168,7 +177,7 @@ function ProviderDialog({ agent, presets, initial, onClose, onSaved }) {
     if (!fixedAddress || !keyReady || editing) return undefined;
     const timer = setTimeout(fetchModels, 700);
     return () => clearTimeout(timer);
-  }, [fixedAddress, keyReady, form?.api_key, form?.use_existing, form?.protocol]);
+  }, [fixedAddress, keyReady, form?.preset, form?.api_key, form?.use_existing, form?.protocol, form?.auth]);
   const submit = async (event) => {
     event.preventDefault();
     setSaving(true);

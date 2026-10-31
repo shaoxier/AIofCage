@@ -159,7 +159,10 @@ main:focus { outline: none; }
 .model-picker-field { display: flex; align-items: center; gap: 4px; }
 .model-picker-field input { flex: 1; min-width: 0; }
 .model-options { position: absolute; z-index: 20; left: 0; right: 0; top: calc(100% + 4px); max-height: 260px; overflow-y: auto;
-  margin: 0; padding: 4px; list-style: none; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.12); }
+  padding: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.12); }
+.model-options ul { margin: 0; padding: 0; list-style: none; }
+.model-options.has-more { scroll-padding-bottom: 36px; } /* 方向键选中的项不被底部提示挡住 */
+.model-options-more { position: sticky; bottom: -4px; margin: 0 -4px -4px; padding: 6px 14px; font-size: var(--text-sm); color: var(--muted); background: var(--panel); border-top: 1px solid var(--line-soft); }
 .model-options li { padding: 6px 10px; border-radius: 6px; font-family: var(--font-mono); font-size: var(--text-sm); cursor: pointer; overflow-wrap: anywhere; }
 .model-options li.active, .model-options li:hover { background: var(--brand-soft); }
 .conversation-model { display: inline-flex; align-items: center; gap: 6px; }

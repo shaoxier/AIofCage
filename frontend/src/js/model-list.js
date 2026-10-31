@@ -14,3 +14,15 @@ export function matchModels(models, query, limit = 50) {
   }
   return [...starts, ...contains].slice(0, limit);
 }
+
+// modelOptions 返回下拉里显示的模型，以及超出 limit 没有显示的个数。
+export function modelOptions(models, query, limit = 50) {
+  const all = matchModels(models, query, Infinity);
+  return { options: all.slice(0, limit), more: Math.max(all.length - limit, 0) };
+}
+
+// withModel 把某个模型放在列表最前面，例如供应商配置的模型不在它返回的列表里时，仍能换回来。
+export function withModel(models, model) {
+  const list = models ?? [];
+  return model && !list.includes(model) ? [model, ...list] : list;
+}

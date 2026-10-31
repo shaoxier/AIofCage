@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "preact/hooks";
 import { html, call, Icon, agentName } from "./core.js";
 import { ModelPicker } from "./model-picker.js";
+import { withModel } from "./model-list.js";
 
 // 使用 Preact 文本节点显示 Markdown，代码块单独排版，绝不注入模型返回的 HTML。
 function inlineText(text) {
@@ -24,13 +25,14 @@ export function ConversationView({ session, changed }) {
   const message = session.messages[session.messages.length - 1];
   useEffect(() => { if (follow.current && viewport.current) viewport.current.scrollTop = viewport.current.scrollHeight; }, [session.messages.length, message?.text, message?.thinking, message?.tools?.length, session.busy]);
   // 打开会话时用供应商页取过的列表；刷新会重新请求，供应商页的列表也随之更新。
+  // 自动读取失败时不提示，模型照样可以手动填写；点刷新才说明原因，取不到时保留原来的列表。
   const loadModels = async (refresh) => {
     session.loadingModels = true; session.modelsError = ""; changed();
     try {
       const result = await call("ConversationModels", session.id, refresh);
-      session.models = result.models ?? [];
-      session.modelsError = result.ok ? "" : result.message;
-    } catch (error) { session.modelsError = error.message; }
+      if (result.ok) session.models = result.models ?? [];
+      session.modelsError = result.ok || !refresh ? "" : result.message;
+    } catch (error) { if (refresh) session.modelsError = error.message; }
     finally { session.loadingModels = false; changed(); }
   };
   useEffect(() => {
@@ -43,7 +45,7 @@ export function ConversationView({ session, changed }) {
     <div class="conversation-controls">
       <span class="conversation-provider"><${Icon} name="layers" size=${17} />${session.info?.provider_name || "正在连接…"}</span>
       <span class="conversation-model"><label for=${`model-${session.id}`}>模型</label>
-        <${ModelPicker} id=${`model-${session.id}`} label="会话模型" value=${session.model || ""} models=${session.models} loading=${session.loadingModels}
+        <${ModelPicker} id=${`model-${session.id}`} label="会话模型" value=${session.model || ""} models=${withModel(session.models, session.info?.provider_model)} loading=${session.loadingModels}
           disabled=${session.started || !session.info} onChange=${(model) => { session.model = model; changed(); }} onRefresh=${() => loadModels(true)} /></span>
       <label>思考强度<select aria-label="会话思考强度" value=${session.effort || ""} disabled=${session.started || !session.info}
         onChange=${(event) => { session.effort = event.target.value; changed(); }}>

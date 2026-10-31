@@ -120,7 +120,8 @@ function App() {
     const observer = new MutationObserver(syncDialog);
     observer.observe(document.body, { childList: true, subtree: true });
     const onKey = (e) => {
-      if (e.key === "Escape" && topDialog) {
+      // 对话框里的控件（例如模型下拉）已经用 Esc 收起了自己，就不再关闭对话框。
+      if (e.key === "Escape" && topDialog && !e.defaultPrevented) {
         topDialog.querySelector("[data-dismiss], [aria-label='关闭']")?.click();
         e.preventDefault();
       }
