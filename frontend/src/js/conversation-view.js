@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "preact/hooks";
 import { html, call, Icon, agentName } from "./core.js";
+import { ModelPicker } from "./model-picker.js";
 
 // 使用 Preact 文本节点显示 Markdown，代码块单独排版，绝不注入模型返回的 HTML。
 function inlineText(text) {
@@ -22,19 +23,26 @@ export function ConversationView({ session, changed }) {
   const follow = useRef(true);
   const message = session.messages[session.messages.length - 1];
   useEffect(() => { if (follow.current && viewport.current) viewport.current.scrollTop = viewport.current.scrollHeight; }, [session.messages.length, message?.text, message?.thinking, message?.tools?.length, session.busy]);
-  const refreshModels = async () => {
+  // 打开会话时用供应商页取过的列表；刷新会重新请求，供应商页的列表也随之更新。
+  const loadModels = async (refresh) => {
     session.loadingModels = true; session.modelsError = ""; changed();
-    try { session.models = await call("ConversationModels", session.id); }
-    catch (error) { session.modelsError = error.message; }
+    try {
+      const result = await call("ConversationModels", session.id, refresh);
+      session.models = result.models ?? [];
+      session.modelsError = result.ok ? "" : result.message;
+    } catch (error) { session.modelsError = error.message; }
     finally { session.loadingModels = false; changed(); }
   };
+  useEffect(() => {
+    if (session.info && !session.started && session.models === undefined && !session.loadingModels) loadModels(false);
+  }, [session.info]);
+  const unpriced = session.info?.priced && session.model && session.model !== session.info.provider_model;
   return html`<div class="conversation-container">
     <div class="conversation-controls">
       <span class="conversation-provider"><${Icon} name="layers" size=${17} />${session.info?.provider_name || "正在连接…"}</span>
-      <label>模型<input aria-label="会话模型" list=${`models-${session.id}`} value=${session.model || ""} disabled=${session.started || !session.info}
-        onInput=${(event) => { session.model = event.target.value; changed(); }} /></label>
-      <datalist id=${`models-${session.id}`}>${(session.models || []).map((model) => html`<option value=${model} />`)}</datalist>
-      <button class="icon-button" title="读取供应商模型列表" aria-label="读取供应商模型列表" disabled=${session.started || session.loadingModels || !session.info} onClick=${refreshModels}><${Icon} name="refresh" size=${17} /></button>
+      <span class="conversation-model"><label for=${`model-${session.id}`}>模型</label>
+        <${ModelPicker} id=${`model-${session.id}`} label="会话模型" value=${session.model || ""} models=${session.models} loading=${session.loadingModels}
+          disabled=${session.started || !session.info} onChange=${(model) => { session.model = model; changed(); }} onRefresh=${() => loadModels(true)} /></span>
       <label>思考强度<select aria-label="会话思考强度" value=${session.effort || ""} disabled=${session.started || !session.info}
         onChange=${(event) => { session.effort = event.target.value; changed(); }}>
         <option value="">模型默认</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option>
@@ -42,6 +50,7 @@ export function ConversationView({ session, changed }) {
       <span class="conversation-status" role="status">${session.started ? `${session.status} · 新会话可更改模型设置` : "设置在首条消息发送时生效"}</span>
     </div>
     ${session.modelsError && html`<p class="conversation-notice" role="status">${session.modelsError}</p>`}
+    ${unpriced && !session.started && html`<p class="conversation-notice" role="status">换成「${session.model}」后用量照常统计，但不估算费用：单价只配置了「${session.info.provider_model}」。</p>`}
     <div class="conversation-messages" ref=${viewport} role="region" aria-label="会话消息" tabindex="0"
       onScroll=${() => { const element = viewport.current; follow.current = element.scrollHeight - element.scrollTop - element.clientHeight < 100; }}>
       ${session.error && html`<div class="conversation-notice error" role="alert">${session.error}</div>`}

@@ -2,6 +2,7 @@
 import { useEffect, useState } from "preact/hooks";
 import { html, call, AGENTS, agentName, PROTOCOLS, COMPATIBLE, AUTHS, formatTokens, ConfirmDialog, Icon, agentIcon, PageTitle } from "./core.js";
 import { PricingLookup } from "./pricing.js";
+import { ModelPicker } from "./model-picker.js";
 
 export function ProvidersPage({ providers, presets, summary, reload, notify, tutorial }) {
   const [agent, setAgent] = useState(tutorial?.state.agent ?? "codex");
@@ -121,6 +122,7 @@ function ProviderDialog({ agent, presets, initial, onClose, onSaved }) {
   );
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const [models, setModels] = useState({ list: [], message: "", ok: false, loading: false });
   const choose = (p) => {
     setPreset(p);
     setForm({
@@ -132,20 +134,45 @@ function ProviderDialog({ agent, presets, initial, onClose, onSaved }) {
     ...(key.startsWith("price_") ? { price_source: "", price_as_of: "" } : {}),
     ...(key === "model" ? { price_enabled: false, price_source: "", price_as_of: "" } : {}),
     [key]: event.target.type === "checkbox" ? event.target.checked : event.target.value });
+  const request = () => ({
+    id: form.id ?? "", name: form.name, agent: form.agent, protocol: form.protocol, base_url: form.base_url,
+    model: form.model, auth: form.agent === "dsh" ? (form.protocol === "anthropic" ? "x-api-key" : "bearer") : form.auth, preset: form.preset ?? "",
+    api_key: form.use_existing ? "" : form.api_key,
+    image_input: form.agent === "dsh" && Boolean(form.image_input),
+    pricing: form.price_enabled ? { currency: form.price_currency || "CNY", input: Number(form.price_input), output: Number(form.price_output), cache_read: Number(form.price_cache_read), cache_write: Number(form.price_cache_write), source: form.price_source || "", as_of: form.price_as_of || "" } : null,
+    existing_key_ref: form.use_existing && preset?.existing_key_ref ? preset.existing_key_ref : "",
+  });
+  // 用表单里的地址和密钥获取模型列表，不用先保存；编辑时密钥留空就用已保存的。
+  const fetchModels = async () => {
+    setModels((current) => ({ ...current, loading: true, message: "正在获取模型列表…" }));
+    try {
+      const result = await call("PreviewProviderModels", request());
+      setModels({ list: result.models ?? [], message: result.message, ok: result.ok, loading: false });
+    } catch (e) {
+      setModels({ list: [], message: e.message, ok: false, loading: false });
+    }
+  };
+  // 编辑已有供应商时先显示缓存的列表。
+  useEffect(() => {
+    if (!editing) return;
+    call("ProviderModels", initial.id, false)
+      .then((result) => setModels({ list: result.models ?? [], message: result.ok ? "" : result.message, ok: result.ok, loading: false }))
+      .catch(() => {});
+  }, []);
+  // 地址固定的预设，填好密钥后自动获取；自定义地址要用户自己点，免得把密钥发给还没填完的域名。
+  const fixedAddress = Boolean(preset?.base_url) && form?.base_url === preset.base_url;
+  const keyReady = form && (form.use_existing || (form.api_key ?? "").trim().length >= 8);
+  useEffect(() => {
+    if (!fixedAddress || !keyReady || editing) return undefined;
+    const timer = setTimeout(fetchModels, 700);
+    return () => clearTimeout(timer);
+  }, [fixedAddress, keyReady, form?.api_key, form?.use_existing, form?.protocol]);
   const submit = async (event) => {
     event.preventDefault();
     setSaving(true);
     setError("");
     try {
-      const request = {
-        id: form.id ?? "", name: form.name, agent: form.agent, protocol: form.protocol, base_url: form.base_url,
-        model: form.model, auth: form.agent === "dsh" ? (form.protocol === "anthropic" ? "x-api-key" : "bearer") : form.auth, preset: form.preset ?? "",
-        api_key: form.use_existing ? "" : form.api_key,
-        image_input: form.agent === "dsh" && Boolean(form.image_input),
-        pricing: form.price_enabled ? { currency: form.price_currency || "CNY", input: Number(form.price_input), output: Number(form.price_output), cache_read: Number(form.price_cache_read), cache_write: Number(form.price_cache_write), source: form.price_source || "", as_of: form.price_as_of || "" } : null,
-        existing_key_ref: form.use_existing && preset?.existing_key_ref ? preset.existing_key_ref : "",
-      };
-      const saved = await call("SaveProvider", request);
+      const saved = await call("SaveProvider", request());
       setForm({ ...form, api_key: "" });
       onSaved(saved);
     } catch (e) {
@@ -178,7 +205,10 @@ function ProviderDialog({ agent, presets, initial, onClose, onSaved }) {
               <label for="p-url">接口地址（Base URL）</label>
               <input id="p-url" required class="mono" placeholder="https://" value=${form.base_url} onInput=${set("base_url")} />
               <label for="p-model">模型</label>
-              <input id="p-model" required class="mono" value=${form.model} onInput=${set("model")} />
+              <${ModelPicker} id="p-model" required value=${form.model} models=${models.list} loading=${models.loading}
+                onChange=${(model) => set("model")({ target: { value: model } })} onRefresh=${fetchModels} />
+              <p class=${models.message && !models.ok && !models.loading ? "caption form-warning" : "caption"} role="status">${models.message ||
+                (fixedAddress ? "填好 API Key 后会自动获取模型列表，也可以直接填写模型名称。" : "填好地址和 API Key 后，点右侧按钮获取模型列表；也可以直接填写模型名称。")}</p>
               ${form.agent === "dsh" && html`<label class="check"><input type="checkbox" checked=${Boolean(form.image_input)} onChange=${set("image_input")} />模型支持图片输入</label>
                 <p class="caption">请按模型的实际能力选择。运行中的沙箱重启后生效。</p>`}
               <details class="advanced" open=${editing || !preset || preset.id?.startsWith("custom")}>
