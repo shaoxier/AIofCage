@@ -491,6 +491,15 @@ func (m *Manager) startSnapshot(ctx context.Context, id string, original *sandbo
 	if err != nil {
 		return err
 	}
+	// Sandboxes created before projects had to be apart may overlap: the outer sandbox's agent
+	// could swap the inner project for another folder of the workspace, which a start would mount.
+	others, err := m.store.Sandboxes()
+	if err != nil {
+		return err
+	}
+	if other, found := sandbox.OverlappingSandbox(sbx.ID, sbx.ProjectPath, others); found {
+		return fmt.Errorf("不能启动：项目文件夹与沙箱「%s」的项目重叠（同一个文件夹，或一个在另一个里面），一个沙箱的 Agent 能改动或替换另一个沙箱的项目。请删除其中一个沙箱（项目文件夹会保留），再选一个不重叠的文件夹重新创建", other.Name)
+	}
 	var providers map[string]provider.Provider
 	if original != nil && original.AppliedProviders != nil {
 		sbx.Bindings = append([]sandbox.Binding{}, original.AppliedBindings...)
