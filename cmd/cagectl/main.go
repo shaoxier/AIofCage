@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -42,10 +43,12 @@ const usage = `用法：
   cagectl provider rm ID
 
   cagectl mcp add --id ID --name 名称 --url URL --token-stdin   保存远程 MCP 服务（令牌进钥匙串）
+  cagectl mcp add --id ID --name 名称 --url URL --no-auth       保存不需要令牌的公开远程 MCP 服务
   cagectl mcp add --kind postgres --id ID --name 名称 --url postgresql://用户@主机:5432/库 --token-stdin
                                                      保存数据库 MCP（密码进钥匙串，由可信连接器代持）
   cagectl mcp add --kind oauth --id ID --name 名称 --url URL      保存 OAuth 类远程 MCP（例如 https://mcp.notion.com/mcp）
   cagectl mcp login ID                                  在浏览器里登录授权，令牌进钥匙串
+  cagectl mcp tools ID                                  获取远程 MCP 服务的工具列表（标出服务标注的只读工具）
   cagectl mcp ls
   cagectl mcp rm ID
 
@@ -55,7 +58,8 @@ const usage = `用法：
   cagectl sandbox start|stop 名称
   cagectl sandbox rm 名称 [--keep-home]
   cagectl sandbox bind 名称 agent=供应商ID
-  cagectl sandbox mcp 名称 [--filesystem] [服务ID ...]
+  cagectl sandbox mcp 名称 [--filesystem] [服务ID ...] [--grant 服务ID=工具,工具 ...]
+                         未用 --grant 指定的服务保留原授权；新启用的远程服务默认只开放标注只读的工具
   cagectl sandbox exec 名称 [-t] -- 命令...
   cagectl sandbox usage 名称
   cagectl sandbox events 名称
@@ -143,13 +147,53 @@ func run(args []string) error {
 			return err
 		}
 		w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-		fmt.Fprintln(w, "ID\t名称\t类型\t地址\t钥匙串条目")
+		fmt.Fprintln(w, "ID\t名称\t类型\t地址\t钥匙串条目\t工具")
 		for _, s := range items {
 			kind := string(s.Kind)
 			if kind == "" {
 				kind = "http"
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", s.ID, s.Name, kind, s.URL, s.KeyRef)
+			keyRef, tools := s.KeyRef, fmt.Sprintf("%d 个，%d 个标注只读", len(s.Tools()), len(s.DefaultTools()))
+			if s.Auth == mcp.AuthNone {
+				keyRef = "（无需令牌）"
+			}
+			if s.IsConnector() {
+				tools = fmt.Sprintf("%d 个（AIofCage 固定）", len(s.Tools()))
+			} else if s.CatalogAt == nil {
+				tools = "未获取（cagectl mcp tools " + s.ID + "）"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", s.ID, s.Name, kind, s.URL, keyRef, tools)
+		}
+		return w.Flush()
+	case "mcp tools":
+		if len(args) != 3 {
+			return errors.New("用法：cagectl mcp tools ID")
+		}
+		service, err := st.MCPService(args[2])
+		if err != nil {
+			return err
+		}
+		if service.IsConnector() {
+			return errors.New("这个服务的工具由 AIofCage 固定：" + strings.Join(service.Tools(), "、"))
+		}
+		manager, err := runtime.NewManager(st, keychain)
+		if err != nil {
+			return err
+		}
+		listed, err := manager.ListTools(ctx, service)
+		if err != nil {
+			return err
+		}
+		w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+		fmt.Fprintln(w, "工具\t服务的标注\t说明")
+		for _, tool := range listed.Catalog {
+			mark := "未标注只读"
+			if tool.ReadOnly {
+				mark = "只读"
+			} else if tool.Destructive {
+				mark = "可能删改"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\n", tool.Name, mark, firstOf(tool.Title, tool.Description))
 		}
 		return w.Flush()
 	case "mcp login":
@@ -164,6 +208,20 @@ func run(args []string) error {
 		service, err := st.MCPService(args[2])
 		if err != nil {
 			return err
+		}
+		// Like the desktop app: a service still enabled in a sandbox is not deleted.
+		sandboxes, err := st.Sandboxes()
+		if err != nil {
+			return err
+		}
+		var users []string
+		for _, sbx := range sandboxes {
+			if slices.Contains(sbx.MCP, service.ID) {
+				users = append(users, sbx.Name)
+			}
+		}
+		if len(users) > 0 {
+			return fmt.Errorf("还有沙箱在用这个 MCP 服务（%s），请先用 cagectl sandbox mcp 停用它", strings.Join(users, "、"))
 		}
 		if err := st.DeleteMCPService(service.ID); err != nil {
 			return err
@@ -240,14 +298,29 @@ func run(args []string) error {
 	case "mcp":
 		filesystem := false
 		var ids []string
-		for _, arg := range args[3:] {
-			if arg == "--filesystem" {
+		grants := map[string][]string{}
+		rest := args[3:]
+		for i := 0; i < len(rest); i++ {
+			switch {
+			case rest[i] == "--filesystem":
 				filesystem = true
-			} else {
-				ids = append(ids, arg)
+			case rest[i] == "--grant" && i+1 < len(rest):
+				i++
+				id, tools, ok := strings.Cut(rest[i], "=")
+				if !ok || id == "" {
+					return errors.New("--grant 的格式是 服务ID=工具,工具（不开放任何工具时写 服务ID=）")
+				}
+				grants[id] = []string{}
+				for _, tool := range strings.Split(tools, ",") {
+					if tool = strings.TrimSpace(tool); tool != "" {
+						grants[id] = append(grants[id], tool)
+					}
+				}
+			default:
+				ids = append(ids, rest[i])
 			}
 		}
-		return manager.SetMCP(ctx, sbx.ID, ids, filesystem)
+		return manager.SetMCPPermissions(ctx, sbx.ID, ids, filesystem, grants)
 	case "usage":
 		usage, err := manager.Usage(ctx, sbx.ID)
 		if err != nil {
@@ -258,8 +331,15 @@ func run(args []string) error {
 		return nil
 	case "events":
 		return manager.Events(ctx, sbx.ID, "", func(event audit.Event) error {
+			target := event.Path
+			if event.ServiceID != "" {
+				target = "mcp:" + event.ServiceID
+				if event.ToolID != "" {
+					target += "/" + event.ToolID
+				}
+			}
 			_, err := fmt.Printf("%s #%d %-14s %-8s %-22s %s %s %s %s\n", event.Time.Local().Format("15:04:05"), event.Sequence,
-				event.Action, event.Decision, event.ReasonCode, event.Method, event.Host, event.Path, tokens(event))
+				event.Action, event.Decision, event.ReasonCode, event.Method, event.Host, target, tokens(event))
 			return err
 		})
 	}
@@ -390,14 +470,33 @@ func mcpAdd(ctx context.Context, st *store.Store, keychain *vault.Keychain, args
 	flags.StringVar(&service.URL, "url", "", "streamable HTTP 地址；数据库为不含密码的连接串")
 	kind := flags.String("kind", "http", "http、oauth 或 postgres")
 	tokenStdin := flags.Bool("token-stdin", false, "从标准输入读取令牌或数据库密码并保存到钥匙串")
+	noAuth := flags.Bool("no-auth", false, "公开服务，不需要令牌")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	service.Kind = mcp.Kind(*kind)
 	service.KeyRef, service.CreatedAt = mcp.KeyRefFor(service.ID), time.Now().UTC()
+	// Replacing a service in place would hand sandboxes' grants and the saved credential to
+	// another address or kind; remove it first instead.
+	if _, err := st.MCPService(service.ID); err == nil {
+		return fmt.Errorf("MCP 服务 %s 已存在；要改地址或类型，请先 cagectl mcp rm %s 再添加", service.ID, service.ID)
+	}
+	if *noAuth {
+		service.Auth = mcp.AuthNone
+	}
 	service.Normalize()
 	if err := service.Validate(); err != nil {
 		return err
+	}
+	if service.Auth == mcp.AuthNone {
+		if *tokenStdin {
+			return errors.New("--no-auth 和 --token-stdin 不能同时使用")
+		}
+		if err := st.SaveMCPService(service); err != nil {
+			return err
+		}
+		fmt.Printf("已保存。用 cagectl mcp tools %s 获取它的工具列表\n", service.ID)
+		return nil
 	}
 	if service.IsOAuth() {
 		if err := st.SaveMCPService(service); err != nil {
@@ -422,8 +521,20 @@ func mcpAdd(ctx context.Context, st *store.Store, keychain *vault.Keychain, args
 	if strings.TrimSpace(secret) == "" {
 		return errors.New("令牌或密码不能为空")
 	}
+	if !service.IsConnector() && len(secret) < mcp.MinTokenLength {
+		return fmt.Errorf("访问令牌太短（至少 %d 个字符）", mcp.MinTokenLength)
+	}
 	if err := keychain.Put(ctx, service.KeyRef, []byte(secret)); err != nil {
 		return err
 	}
 	return st.SaveMCPService(service)
+}
+
+func firstOf(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }

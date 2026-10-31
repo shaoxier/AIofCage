@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/shaoxier/AIofCage/internal/buildinfo"
+	"github.com/shaoxier/AIofCage/internal/mcp"
 	"github.com/shaoxier/AIofCage/internal/oauth"
 	"github.com/shaoxier/AIofCage/internal/provider"
 	"github.com/shaoxier/AIofCage/internal/runtime"
@@ -436,6 +437,20 @@ type BindingView struct {
 	ActiveProviderName string        `json:"active_provider_name"`
 }
 
+// effectiveGrants returns the grants that apply: a remote service's grant made for another
+// address is left out, so the settings show that service's defaults instead.
+func effectiveGrants(sbx sandbox.Sandbox, services []mcp.Service) map[string][]string {
+	result := cloneMCPPermissions(sbx.MCPPermissions)
+	for _, service := range services {
+		if _, ok := result[service.ID]; ok {
+			if _, explicit := runtime.Grant(sbx, service); !explicit {
+				delete(result, service.ID)
+			}
+		}
+	}
+	return result
+}
+
 func cloneMCPPermissions(input map[string][]string) map[string][]string {
 	if len(input) == 0 {
 		return nil
@@ -464,13 +479,17 @@ func (a *App) ListSandboxes() ([]SandboxView, error) {
 	for _, p := range providers {
 		names[p.ID] = p.Name
 	}
+	services, err := a.store.MCPServices()
+	if err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	views := make([]SandboxView, 0, len(sandboxes))
 	for _, s := range sandboxes {
 		view := SandboxView{ID: s.ID, Name: s.Name, ProjectPath: s.ProjectPath, DemoCase: s.DemoCase, State: "unknown",
 			Limits: s.Limits, Usage: s.Usage, CreatedAt: s.CreatedAt, Bindings: []BindingView{},
-			MCP: append([]string{}, s.MCP...), MCPPermissions: cloneMCPPermissions(s.MCPPermissions), Filesystem: s.FilesystemMCP}
+			MCP: append([]string{}, s.MCP...), MCPPermissions: effectiveGrants(s, services), Filesystem: s.FilesystemMCP}
 		if a.manager != nil {
 			view.State = a.manager.Status(ctx, s.ID).State
 		}

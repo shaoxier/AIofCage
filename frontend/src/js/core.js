@@ -65,8 +65,10 @@ export const REASONS = {
   upstream_failed: "连不上上游服务", destination_denied: "目标不是公网地址", upstream_status: "上游返回了错误",
   closed_early: "连接提前结束", stream_interrupted: "数据流中断", not_configured: "门卫尚未配置",
   cursor_from_other_run: "日志有缺口（门卫已重启）", buffer_overflow: "日志有缺口（应用离线太久）",
-  mcp_forwarded: "经门卫转给可信连接器", mcp_tool_denied: "工具不在允许列表，已拦截", mcp_method_denied: "不允许的 MCP 方法，已拦截",
-  mcp_unknown_service: "未启用的 MCP 服务", mcp_invalid_message: "MCP 消息格式错误",
+  mcp_forwarded: "经门卫转给 MCP 服务", mcp_tool_denied: "工具不在允许列表，已拦截", mcp_method_denied: "不允许的 MCP 方法，已拦截",
+  mcp_unknown_service: "未启用的 MCP 服务", mcp_invalid_message: "MCP 消息格式错误或有歧义，已拦截",
+  mcp_invalid_reply: "MCP 服务的回复无法检查，没有转交", upstream_unauthorized: "MCP 服务不接受保存的凭据，需要重新登录或更新令牌",
+  mcp_token_in_reply: "MCP 服务的回复里带有服务令牌，已拦下",
   client_closed: "Agent 没等回答就断开了（通常是正在退出）",
 };
 

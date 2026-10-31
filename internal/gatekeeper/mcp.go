@@ -1,24 +1,30 @@
 package gatekeeper
 
 import (
+	"bufio"
 	"bytes"
+	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"crypto/subtle"
-	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"regexp"
-	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/shaoxier/AIofCage/internal/audit"
 )
 
-// The MCP gateway is the only way from the sandbox to connector-backed MCP services. Every
-// message is checked against the service placeholder and the allowed tools; tool calls are
-// recorded by name only, never with arguments or results.
+// The MCP gateway is the only way from the sandbox to MCP services that need a secret: trusted
+// connector containers (e.g. a database) and remote streamable-HTTP services, whose token the
+// gatekeeper adds itself. Every message is checked against the service placeholder and the
+// granted tools; tool calls are recorded by name only, never with arguments or results.
 
 const (
 	maxMCPBody     = 4 << 20
@@ -29,6 +35,13 @@ var mcpMethods = map[string]bool{"initialize": true, "ping": true, "tools/list":
 	"resources/list": true, "resources/read": true, "resources/templates/list": true, "prompts/list": true,
 	"prompts/get": true, "completion/complete": true, "logging/setLevel": true}
 
+// A remote service is granted tools only. Its resource and prompt listings are answered here as
+// empty and reading a resource or prompt is refused, because no tool grant covers them.
+var (
+	remoteMethods    = map[string]bool{"initialize": true, "ping": true, "tools/list": true, "tools/call": true, "logging/setLevel": true}
+	remoteEmptyLists = map[string]string{"resources/list": "resources", "resources/templates/list": "resourceTemplates", "prompts/list": "prompts"}
+)
+
 // Newer protocol probes that clients fall back from (Claude Code tries server/discover before
 // initialize). They are answered like a server without them and not logged as denials.
 var mcpProbes = map[string]bool{"server/discover": true}
@@ -38,10 +51,10 @@ var mcpRecorded = map[string]bool{"initialize": true, "tools/call": true, "resou
 
 var (
 	mcpMethodPattern = regexp.MustCompile(`^[a-z][a-zA-Z/_]{0,63}$`)
-	toolPattern      = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
+	toolPattern      = regexp.MustCompile(`^[A-Za-z0-9_./-]{1,128}$`)
 )
 
-var mcpForwardHeaders = []string{"Content-Type", "Accept", "Mcp-Session-Id", "Mcp-Protocol-Version", "Last-Event-Id"}
+var mcpForwardHeaders = []string{"Accept", "Mcp-Session-Id", "Mcp-Protocol-Version", "Last-Event-Id"}
 
 func newMCPClient() *http.Client {
 	return &http.Client{
@@ -49,14 +62,6 @@ func newMCPClient() *http.Client {
 			ResponseHeaderTimeout: mcpCallTimeout, IdleConnTimeout: 90 * time.Second, MaxIdleConnsPerHost: 4},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
-}
-
-type mcpMessage struct {
-	ID     json.RawMessage `json:"id"`
-	Method string          `json:"method"`
-	Params struct {
-		Name string `json:"name"`
-	} `json:"params"`
 }
 
 func (g *Gate) serveMCP(w http.ResponseWriter, r *http.Request) {
@@ -82,6 +87,9 @@ func (g *Gate) serveMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	event.ServiceID = id
+	if connector.Remote {
+		event.Host = remoteHost(connector.Upstream)
+	}
 	values := r.Header.Values("Authorization")
 	if len(values) == 0 {
 		deny(http.StatusForbidden, "credential_missing")
@@ -100,7 +108,7 @@ func (g *Gate) serveMCP(w http.ResponseWriter, r *http.Request) {
 			deny(http.StatusRequestEntityTooLarge, "body_too_large")
 			return
 		}
-		if json.Unmarshal(data, &msg) != nil {
+		if msg, err = parseMCPMessage(data); err != nil {
 			deny(http.StatusBadRequest, "mcp_invalid_message")
 			return
 		}
@@ -110,21 +118,28 @@ func (g *Gate) serveMCP(w http.ResponseWriter, r *http.Request) {
 		if mcpMethodPattern.MatchString(msg.Method) {
 			event.Method = msg.Method
 		}
-		if msg.Method == "tools/call" && toolPattern.MatchString(msg.Params.Name) {
-			event.ToolID = msg.Params.Name
+		if msg.Method == "tools/call" && toolPattern.MatchString(msg.Tool) {
+			event.ToolID = msg.Tool
 		}
 		if mcpProbes[msg.Method] && len(msg.ID) > 0 {
 			writeJSON(w, http.StatusOK, map[string]any{"jsonrpc": "2.0", "id": msg.ID,
 				"error": map[string]any{"code": -32601, "message": "Method not found"}})
 			return
 		}
-		if msg.Method != "" && !strings.HasPrefix(msg.Method, "notifications/") && !mcpMethods[msg.Method] {
+		if field := remoteEmptyLists[msg.Method]; connector.Remote && field != "" && len(msg.ID) > 0 {
+			writeJSON(w, http.StatusOK, map[string]any{"jsonrpc": "2.0", "id": msg.ID, "result": map[string]any{field: []any{}}})
+			return
+		}
+		allowed := mcpMethods
+		if connector.Remote {
+			allowed = remoteMethods
+		}
+		if msg.Method != "" && !strings.HasPrefix(msg.Method, "notifications/") && !allowed[msg.Method] {
 			g.denyRPC(w, msg, event, started, "mcp_method_denied", "AIofCage 门卫不允许这个 MCP 方法")
 			return
 		}
-		if msg.Method == "tools/call" && (connector.ToolsRestricted || len(connector.Tools) > 0) && !slices.Contains(connector.Tools, msg.Params.Name) {
-			g.denyRPC(w, msg, event, started, "mcp_tool_denied",
-				"AIofCage 门卫拒绝了这个工具调用：该服务只开放 "+strings.Join(connector.Tools, "、"))
+		if msg.Method == "tools/call" && !connector.allows(msg.Tool) {
+			g.denyRPC(w, msg, event, started, "mcp_tool_denied", toolDeniedText(connector))
 			return
 		}
 	case http.MethodDelete:
@@ -134,32 +149,89 @@ func (g *Gate) serveMCP(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
 	}
-	g.forwardMCP(w, r, connector, body, event, started)
+	g.forwardMCP(w, r, connector, msg, body, event, started)
+}
+
+// toolDeniedText tells the agent what it may use, so it can explain the refusal to the user.
+func toolDeniedText(connector Connector) string {
+	const hint = "；需要其他工具时，请在 AIofCage 的沙箱 MCP 设置里勾选"
+	if len(connector.Tools) == 0 {
+		return "AIofCage 门卫拒绝了这个工具调用：该服务目前没有开放任何工具" + hint
+	}
+	names, more := connector.Tools, ""
+	if len(names) > 12 {
+		names, more = names[:12], fmt.Sprintf(" 等 %d 个", len(connector.Tools))
+	}
+	return "AIofCage 门卫拒绝了这个工具调用：该服务只开放 " + strings.Join(names, "、") + more + hint
 }
 
 // denyRPC answers a refused message with a JSON-RPC error so the agent can tell the user why.
 func (g *Gate) denyRPC(w http.ResponseWriter, msg mcpMessage, event audit.Event, started time.Time, reason, text string) {
-	event.ReasonCode, event.Status = reason, http.StatusForbidden
+	event.Decision, event.ReasonCode, event.Status = audit.DecisionDeny, reason, http.StatusForbidden
 	event.DurationMS = g.now().Sub(started).Milliseconds()
 	g.deny(event)
+	writeRPCError(w, msg, http.StatusForbidden, reason, text)
+}
+
+// failRPC answers a message the service could not handle safely, e.g. a rejected credential.
+func (g *Gate) failRPC(w http.ResponseWriter, msg mcpMessage, event audit.Event, started time.Time, reason, text string) {
+	event.Decision, event.ReasonCode, event.Status = audit.DecisionError, reason, http.StatusBadGateway
+	g.recordMCP(event, started, true)
+	writeRPCError(w, msg, http.StatusBadGateway, reason, text)
+}
+
+// writeRPCError answers a request with a JSON-RPC error; notifications and session closes have
+// no ID to answer, so they get a plain problem response.
+func writeRPCError(w http.ResponseWriter, msg mcpMessage, status int, reason, text string) {
 	if len(msg.ID) == 0 || string(msg.ID) == "null" {
-		writeProblem(w, http.StatusForbidden, reason)
+		writeProblem(w, status, reason)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"jsonrpc": "2.0", "id": msg.ID,
 		"error": map[string]any{"code": -32001, "message": text}})
 }
 
-func (g *Gate) forwardMCP(w http.ResponseWriter, r *http.Request, connector Connector, body []byte, event audit.Event, started time.Time) {
+// decodedBody undoes an answer's content encoding; an encoding the standard library cannot
+// decode is refused rather than passed on unchecked.
+func decodedBody(resp *http.Response) (io.Reader, error) {
+	body := bufio.NewReader(resp.Body)
+	if _, err := body.Peek(1); err == io.EOF {
+		return body, nil // an empty answer (e.g. 202) has nothing to decode, whatever it declares
+	}
+	switch strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))) {
+	case "", "identity":
+		return body, nil
+	case "gzip", "x-gzip":
+		return gzip.NewReader(body)
+	case "deflate":
+		return zlib.NewReader(body)
+	}
+	return nil, errMCPReply
+}
+
+func remoteHost(upstream string) string {
+	u, err := url.Parse(upstream)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
+}
+
+func (g *Gate) forwardMCP(w http.ResponseWriter, r *http.Request, connector Connector, msg mcpMessage, body []byte, event audit.Event, started time.Time) {
 	parent := r.Context()
 	if r.Method == http.MethodDelete {
-		// Clients often send the session close while exiting and hang up at once; the connector
-		// must still end the session and its server process.
+		// Clients often send the session close while exiting and hang up at once; the service
+		// must still end the session (for a connector, its server process).
 		parent = context.WithoutCancel(parent)
 	}
 	ctx, cancel := context.WithTimeout(parent, mcpCallTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, r.Method, strings.TrimSuffix(connector.Upstream, "/")+"/mcp", bytes.NewReader(body))
+	target, client := strings.TrimSuffix(connector.Upstream, "/")+"/mcp", g.mcpClient
+	if connector.Remote {
+		// The exact endpoint the user configured, through the proxy's public-only dialer.
+		target, client = connector.Upstream, g.remoteMCP
+	}
+	req, err := http.NewRequestWithContext(ctx, r.Method, target, bytes.NewReader(body))
 	if err != nil {
 		writeProblem(w, http.StatusInternalServerError, "internal_error")
 		return
@@ -169,26 +241,92 @@ func (g *Gate) forwardMCP(w http.ResponseWriter, r *http.Request, connector Conn
 			req.Header.Set(name, value)
 		}
 	}
-	req.Header.Set("Authorization", "Bearer "+connector.Token)
+	if r.Method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if connector.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+connector.Token)
+	}
 	event.BytesIn = int64(len(body))
-	resp, err := g.mcpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil && r.Context().Err() != nil {
-		// The agent hung up before the answer: not a connector failure.
+		// The agent hung up before the answer: not a service failure.
 		event.Decision, event.ReasonCode = audit.DecisionAllow, "client_closed"
 		g.recordMCP(event, started, mcpRecorded[event.Method])
 		return
 	}
 	if err != nil {
-		event.Decision, event.ReasonCode, event.Status = audit.DecisionError, "upstream_failed", http.StatusBadGateway
+		reason := "upstream_failed"
+		if errors.Is(err, errDestinationDenied) {
+			reason = "destination_denied"
+		}
+		event.Decision, event.ReasonCode, event.Status = audit.DecisionError, reason, http.StatusBadGateway
 		g.recordMCP(event, started, true)
-		writeProblem(w, http.StatusBadGateway, "upstream_failed")
+		writeProblem(w, http.StatusBadGateway, reason)
 		return
 	}
 	defer resp.Body.Close()
 	status := resp.StatusCode
-	if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		// The connector token is ours; never let the agent see an auth challenge.
-		status = http.StatusBadGateway
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		// The credential is ours, never the agent's: an auth challenge would make the agent start
+		// an OAuth login against the gateway. The user renews it in the app instead.
+		g.failRPC(w, msg, event, started, "upstream_unauthorized",
+			"MCP 服务不接受 AIofCage 保存的凭据，请在 AIofCage 的「工具连接」里重新登录或更新令牌")
+		return
+	case status >= 300 && status < 400:
+		// Redirects are not followed and their targets are not revealed to the agent.
+		g.failRPC(w, msg, event, started, "redirect_denied", "MCP 服务返回了跳转，AIofCage 门卫不跟随跳转")
+		return
+	}
+	reply := mcpReply{method: msg.Method, connector: connector}
+	var out []byte
+	var answer io.Reader = resp.Body
+	streamed := false
+	if r.Method != http.MethodDelete && status < 400 {
+		// Undo the content encoding, so filtering and masking see what the agent's client would
+		// decode. The agent gets the decoded answer; Content-Encoding is never passed on.
+		decoded, err := decodedBody(resp)
+		if err != nil {
+			g.failRPC(w, msg, event, started, "mcp_invalid_reply", "MCP 服务的回复用了无法检查的压缩格式，AIofCage 门卫没有转交")
+			return
+		}
+		answer = decoded
+	}
+	switch {
+	case r.Method == http.MethodDelete:
+		// A session close carries no data the agent needs.
+	case status >= 400:
+		// Error bodies may echo the request; decode and mask the token before returning them.
+		var withheld bool
+		out, withheld = readErrorBody(resp, connector.Token)
+		if reply.checkDecoded(out) != nil {
+			out, withheld = []byte(withheldBody), true
+		}
+		if withheld {
+			resp.Header.Set("Content-Type", "application/json")
+		}
+	case !reply.rewrites():
+		streamed = true
+	case strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream"):
+		streamed = true
+	default:
+		data, err := io.ReadAll(io.LimitReader(answer, maxMCPReply+1))
+		if err == nil && len(data) > maxMCPReply {
+			err = errMCPReply
+		}
+		if err == nil && len(bytes.TrimSpace(data)) > 0 {
+			data, err = reply.body(data)
+		}
+		if errors.Is(err, errTokenInReply) {
+			g.failRPC(w, msg, event, started, "mcp_token_in_reply", "MCP 服务的回复里带有服务令牌，AIofCage 门卫没有转交")
+			return
+		}
+		if err != nil {
+			g.failRPC(w, msg, event, started, "mcp_invalid_reply", "MCP 服务的回复无法检查，AIofCage 门卫没有转交")
+			return
+		}
+		out = data
 	}
 	for _, name := range []string{"Content-Type", "Mcp-Session-Id"} {
 		if value := resp.Header.Get(name); value != "" {
@@ -196,14 +334,35 @@ func (g *Gate) forwardMCP(w http.ResponseWriter, r *http.Request, connector Conn
 		}
 	}
 	w.Header().Set("Cache-Control", "no-store")
+	if !streamed {
+		w.Header().Set("Content-Length", strconv.Itoa(len(out)))
+	}
 	w.WriteHeader(status)
-	written, _ := copyFlushing(w, resp.Body)
+	var written int64
+	var copyErr error
+	switch {
+	case !streamed:
+		n, err := w.Write(out)
+		written, copyErr = int64(n), err
+	case reply.rewrites():
+		written, copyErr = copyEvents(w, answer, reply.message, reply.mask)
+	default:
+		written, copyErr = copyFlushing(w, answer)
+	}
 	event.Status, event.BytesOut = status, written
 	event.Decision, event.ReasonCode = audit.DecisionAllow, "mcp_forwarded"
 	// Closing a session that already ended (404) is routine, e.g. a second close on exit.
 	failed := status >= 400 && !(r.Method == http.MethodDelete && status == http.StatusNotFound)
 	if failed {
 		event.Decision, event.ReasonCode = audit.DecisionError, "upstream_status"
+	} else if errors.Is(copyErr, errTokenInReply) {
+		// The stream was cut before an event that carried the service token.
+		event.Decision, event.ReasonCode = audit.DecisionError, "mcp_token_in_reply"
+		failed = true
+	} else if errors.Is(copyErr, errMCPReply) {
+		// The stream was cut where an event could not be checked.
+		event.Decision, event.ReasonCode = audit.DecisionError, "mcp_invalid_reply"
+		failed = true
 	}
 	g.recordMCP(event, started, mcpRecorded[event.Method] || failed)
 }

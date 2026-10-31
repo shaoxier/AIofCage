@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/shaoxier/AIofCage/internal/audit"
+	"github.com/shaoxier/AIofCage/internal/mcp"
+	"github.com/shaoxier/AIofCage/internal/runtime"
 )
 
 type SecurityControlView struct {
@@ -84,21 +86,14 @@ func (a *App) SecurityDiagnostics(id string) (SecurityDiagnosticsView, error) {
 		}
 		item := SecurityMCPView{ID: service.ID, Name: service.Name, Kind: string(service.Kind), Connector: service.IsConnector(),
 			CatalogTools: append([]string{}, service.Tools()...), GrantedTools: []string{}}
-		if service.IsBuiltin() {
+		if service.IsBuiltin() || service.Auth == mcp.AuthNone {
 			item.KeySaved = true
 		} else {
 			secret, readErr := a.vault.Read(ctx, service.KeyRef)
 			item.KeySaved = readErr == nil
 			clear(secret)
 		}
-		if service.IsConnector() {
-			if tools, ok := sbx.MCPPermissions[service.ID]; ok {
-				item.ExplicitGrant = true
-				item.GrantedTools = append([]string{}, tools...)
-			} else {
-				item.GrantedTools = service.Tools()
-			}
-		}
+		item.GrantedTools, item.ExplicitGrant = runtime.Grant(sbx, service)
 		view.MCP = append(view.MCP, item)
 	}
 	a.securityMu.Lock()

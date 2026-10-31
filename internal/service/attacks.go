@@ -118,7 +118,13 @@ func (a *App) realSecrets(ctx context.Context, sbx sandbox.Sandbox) ([]string, e
 		}
 	}
 	for _, id := range sbx.MCP {
-		raw, err := a.vault.Read(ctx, mcp.KeyRefFor(id))
+		// A service may keep its secret under its own Keychain item (e.g. a dedicated read-only
+		// database account), so read the item the service records, not the default name.
+		ref := mcp.KeyRefFor(id)
+		if service, err := a.store.MCPService(id); err == nil && service.KeyRef != "" {
+			ref = service.KeyRef
+		}
+		raw, err := a.vault.Read(ctx, ref)
 		if err != nil {
 			continue
 		}

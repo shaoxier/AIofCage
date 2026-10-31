@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/shaoxier/AIofCage/internal/policy"
 	"github.com/shaoxier/AIofCage/internal/provider"
@@ -22,9 +24,12 @@ type Config struct {
 	Connectors []Connector     `json:"connectors,omitempty"`
 }
 
-// Connector routes the MCP entrypoint to a trusted connector container that holds a secret the
-// sandbox never sees (e.g. a database password). The sandbox authenticates with Placeholder; the
-// gatekeeper forwards to Upstream with Token, a credential only it and the connector know.
+// Connector routes the MCP entrypoint to a service holding a secret the sandbox never sees. The
+// sandbox authenticates with Placeholder. For a trusted connector container (e.g. one holding a
+// database password) the gatekeeper forwards to Upstream with Token, a credential only it and the
+// connector know. For a Remote service, Upstream is the service's exact https:// endpoint, reached
+// through the proxy's public-only dialer with verified TLS, and Token is the service's own bearer
+// token (empty for a service that needs none).
 type Connector struct {
 	ID          string `json:"id"`
 	Placeholder string `json:"placeholder"`
@@ -32,9 +37,10 @@ type Connector struct {
 	Token       string `json:"token"`
 	// Tools lists the tools the agent may call. When ToolsRestricted is true, an empty
 	// list denies every tool; this keeps an explicit empty grant distinct from legacy
-	// connectors that did not carry a tool policy.
+	// connectors that did not carry a tool policy. Remote services are always restricted.
 	Tools           []string `json:"tools,omitempty"`
 	ToolsRestricted bool     `json:"tools_restricted,omitempty"`
+	Remote          bool     `json:"remote,omitempty"`
 }
 
 // Secret maps a placeholder visible inside the sandbox to the real credential for one provider.
@@ -63,6 +69,8 @@ const (
 	maxSecrets     = 32
 	maxSecretBytes = 4096
 	maxConnectors  = 16
+	maxGrantTools  = 512
+	minRemoteToken = 8
 )
 
 var (
@@ -138,11 +146,31 @@ func compile(config Config) (*compiled, error) {
 		if !placeholderPattern.MatchString(connector.Placeholder) || placeholders[connector.Placeholder] {
 			return nil, fmt.Errorf("连接器 %s 的占位符无效或重复", connector.ID)
 		}
-		if err := validUpstream(connector.Upstream); err != nil {
-			return nil, fmt.Errorf("连接器 %s：%w", connector.ID, err)
+		if connector.Remote {
+			if err := validRemote(connector.Upstream); err != nil {
+				return nil, fmt.Errorf("连接器 %s：%w", connector.ID, err)
+			}
+			// A short token would be masked inside ordinary words and JSON keys of every reply.
+			if connector.Token != "" && len(connector.Token) < minRemoteToken || len(connector.Token) > maxSecretBytes ||
+				strings.ContainsAny(connector.Token, " \t\r\n") || strings.HasPrefix(connector.Token, "cage-") {
+				return nil, fmt.Errorf("连接器 %s 的令牌无效", connector.ID)
+			}
+			connector.ToolsRestricted = true
+		} else {
+			if err := validUpstream(connector.Upstream); err != nil {
+				return nil, fmt.Errorf("连接器 %s：%w", connector.ID, err)
+			}
+			if len(connector.Token) < 32 || len(connector.Token) > maxSecretBytes || strings.ContainsAny(connector.Token, " \t\r\n") {
+				return nil, fmt.Errorf("连接器 %s 的令牌无效", connector.ID)
+			}
 		}
-		if len(connector.Token) < 32 || len(connector.Token) > maxSecretBytes || strings.ContainsAny(connector.Token, " \t\r\n") {
-			return nil, fmt.Errorf("连接器 %s 的令牌无效", connector.ID)
+		if len(connector.Tools) > maxGrantTools {
+			return nil, fmt.Errorf("连接器 %s 的工具不能超过 %d 个", connector.ID, maxGrantTools)
+		}
+		for _, tool := range connector.Tools {
+			if tool == "" || len(tool) > 128 || !utf8.ValidString(tool) || strings.ContainsFunc(tool, unicode.IsControl) {
+				return nil, fmt.Errorf("连接器 %s 的工具名无效", connector.ID)
+			}
 		}
 		placeholders[connector.Placeholder] = true
 		result.connectors[connector.ID] = connector
@@ -164,6 +192,20 @@ func validUpstream(raw string) error {
 	address, err := netip.ParseAddrPort(u.Host)
 	if err != nil || !address.Addr().Is4() || !address.Addr().IsPrivate() || address.Port() == 0 {
 		return errors.New("上游地址须为 http://内网IP:端口")
+	}
+	return nil
+}
+
+// validRemote accepts https://<domain>[:443]/<clean path>: a name the gatekeeper resolves and
+// checks itself, never an IP address, a query string or embedded credentials.
+func validRemote(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Opaque != "" || u.User != nil || u.RawQuery != "" || u.ForceQuery ||
+		u.Fragment != "" || (u.Port() != "" && u.Port() != "443") || !policy.ValidHost(u.Hostname(), false) {
+		return errors.New("远程地址须为 https://域名/路径")
+	}
+	if p := u.EscapedPath(); p == "" || !policy.ValidPath(p) {
+		return errors.New("远程地址的路径无效")
 	}
 	return nil
 }

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/shaoxier/AIofCage/internal/oauth"
 	"github.com/shaoxier/AIofCage/internal/provider"
 	"github.com/shaoxier/AIofCage/internal/sandbox"
 	"github.com/shaoxier/AIofCage/internal/session"
@@ -22,9 +23,11 @@ func (m memoryVault) Put(_ context.Context, ref string, value []byte) error {
 	m[ref] = append([]byte(nil), value...)
 	return nil
 }
+
+// Read returns a copy, as the Keychain does: callers clear what they read.
 func (m memoryVault) Read(_ context.Context, ref string) ([]byte, error) {
 	if value, ok := m[ref]; ok {
-		return value, nil
+		return append([]byte(nil), value...), nil
 	}
 	return nil, vault.ErrNotFound
 }
@@ -37,7 +40,20 @@ func newApp(t *testing.T) (*App, memoryVault, *store.Store) {
 		t.Fatal(err)
 	}
 	secrets := memoryVault{}
-	return NewApp(st, secrets, nil, errors.New("测试环境没有 Docker"), nil), secrets, st
+	app := NewApp(st, secrets, nil, errors.New("测试环境没有 Docker"), nil)
+	// Tests never reach real services; a test that needs a server sets its own transport. The
+	// redirect policy NewApp sets is kept.
+	client := *app.client
+	client.Transport = offline{}
+	app.client = &client
+	app.oauth = oauth.NewClient(app.client, func(string) error { return errors.New("测试不打开浏览器") })
+	return app, secrets, st
+}
+
+type offline struct{}
+
+func (offline) RoundTrip(r *http.Request) (*http.Response, error) {
+	return nil, errors.New("测试不联网：" + r.URL.Host)
 }
 
 func codexRequest() SaveProviderRequest {

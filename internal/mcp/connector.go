@@ -63,7 +63,7 @@ func ConnectorFor(kind Kind) (ConnectorSpec, bool) {
 // GatewayPort is the gatekeeper's MCP entrypoint on the sandbox network.
 const GatewayPort = 8890
 
-// GatewayURL is where agents reach a connector service.
+// GatewayURL is where agents reach a service.
 func GatewayURL(id string) string { return fmt.Sprintf("http://gatekeeper:%d/mcp/%s", GatewayPort, id) }
 
 // LocalHost is how a connector inside the VM reaches services listening on the Mac's loopback.
@@ -76,36 +76,47 @@ func (s Service) IsConnector() bool {
 
 func (s Service) IsOAuth() bool { return s.Kind == KindOAuth }
 
-// AgentURL is the address written into agent configurations.
-func (s Service) AgentURL() string {
-	if s.IsConnector() {
-		return GatewayURL(s.ID)
-	}
-	return s.URL
-}
+// AgentURL is the address written into agent configurations: always the gatekeeper's MCP
+// entrypoint, never the service itself.
+func (s Service) AgentURL() string { return GatewayURL(s.ID) }
 
-// Tools returns the tools agents may call on a connector service (nil means all, for HTTP).
+// Tools returns the tools a service offers: a connector's fixed catalog, or the tools a remote
+// service last listed.
 func (s Service) Tools() []string {
 	if spec, ok := ConnectorFor(s.Kind); ok && s.IsConnector() {
 		return append([]string(nil), spec.Tools...)
 	}
-	return nil
+	tools := make([]string, 0, len(s.Catalog))
+	for _, tool := range s.Catalog {
+		tools = append(tools, tool.Name)
+	}
+	return tools
 }
 
-// ValidateTools ensures a connector grant only names tools from its fixed catalog. An empty
-// grant is valid and means that the service is enabled but no tool may be called.
+// DefaultTools are granted when a sandbox enables a service without choosing tools: every tool
+// of a connector, whose catalog AIofCage fixes, but only the tools a remote service marks as
+// read-only. Tools a remote service adds later are never granted by default.
+func (s Service) DefaultTools() []string {
+	if s.IsConnector() {
+		return s.Tools()
+	}
+	tools := []string{}
+	for _, tool := range s.Catalog {
+		if tool.ReadOnly {
+			tools = append(tools, tool.Name)
+		}
+	}
+	return tools
+}
+
+// ValidateTools ensures a grant only names tools the service offers. An empty grant is valid and
+// means that the service is enabled but no tool may be called.
 func ValidateTools(s Service, tools []string) error {
 	allowed := s.Tools()
-	if !s.IsConnector() {
-		if len(tools) > 0 {
-			return fmt.Errorf("远程 MCP 服务「%s」不支持本地工具权限列表", s.Name)
-		}
-		return nil
-	}
 	seen := make(map[string]bool, len(tools))
 	for _, tool := range tools {
 		if seen[tool] || !slices.Contains(allowed, tool) {
-			return fmt.Errorf("MCP 服务「%s」不支持工具「%s」", s.Name, tool)
+			return fmt.Errorf("MCP 服务「%s」没有工具「%s」，请先刷新它的工具列表", s.Name, tool)
 		}
 		seen[tool] = true
 	}

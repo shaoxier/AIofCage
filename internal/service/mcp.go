@@ -1,13 +1,10 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -20,12 +17,16 @@ import (
 )
 
 // MCPServiceView never contains the token, only whether one is saved. For OAuth services
-// KeySaved means the login is still usable (a valid access token or a refresh token).
+// KeySaved means the login is still usable (a valid access token or a refresh token). Tools are
+// what the service offers and DefaultTools what a sandbox is granted unless the user chooses;
+// ToolsError explains why the tool list could not be fetched just now.
 type MCPServiceView struct {
 	mcp.Service
-	Tools    []string `json:"tools"`
-	KeySaved bool     `json:"key_saved"`
-	UsedBy   []string `json:"used_by"`
+	Tools        []string `json:"tools"`
+	DefaultTools []string `json:"default_tools"`
+	ToolsError   string   `json:"tools_error,omitempty"`
+	KeySaved     bool     `json:"key_saved"`
+	UsedBy       []string `json:"used_by"`
 }
 
 func (a *App) ListMCPPresets() []mcp.Preset { return mcp.Presets() }
@@ -47,12 +48,14 @@ func (a *App) ListMCPServices() ([]MCPServiceView, error) {
 }
 
 func (a *App) mcpView(s mcp.Service) (MCPServiceView, error) {
-	view := MCPServiceView{Service: s, Tools: s.Tools(), UsedBy: []string{}}
+	view := MCPServiceView{Service: s, Tools: s.Tools(), DefaultTools: s.DefaultTools(), UsedBy: []string{}}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var data []byte
 	var err error
-	if !s.IsBuiltin() {
+	if s.Auth == mcp.AuthNone {
+		view.KeySaved = true // nothing to save
+	} else if !s.IsBuiltin() {
 		data, err = a.vault.Read(ctx, s.KeyRef)
 		view.KeySaved = err == nil
 	}
@@ -83,24 +86,41 @@ type SaveMCPServiceRequest struct {
 	// Token is write-only: it goes straight to the Keychain. For database services it is the
 	// password; a password pasted inside the connection URL is moved there as well.
 	Token string `json:"token"`
+	// NoAuth marks a custom HTTP service that needs no token; a token saved earlier is removed.
+	NoAuth bool `json:"no_auth"`
 }
 
 func (a *App) SaveMCPService(request SaveMCPServiceRequest) (MCPServiceView, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	existing := request.ID != ""
+	id := request.ID
+	if !existing {
+		var err error
+		if id, err = a.newMCPID(request.Preset); err != nil {
+			return MCPServiceView{}, err
+		}
+	}
+	// The address and the credential change together under the service's lock, which readers of
+	// the pair also take (runtime.ServiceLock). It is released before tools are listed.
+	unlock, err := a.store.LockOperation(ctx, runtime.ServiceLock(id), true)
+	if err != nil {
+		return MCPServiceView{}, err
+	}
+	locked := true
+	defer func() {
+		if locked {
+			unlock()
+		}
+	}()
 	var service mcp.Service
 	if existing {
-		current, err := a.store.MCPService(request.ID)
+		current, err := a.store.MCPService(id)
 		if err != nil {
 			return MCPServiceView{}, err
 		}
 		service = current
 	} else {
-		id, err := a.newMCPID(request.Preset)
-		if err != nil {
-			return MCPServiceView{}, err
-		}
 		// The kind is fixed at creation: switching between HTTP and connector services would leave
 		// sandboxes configured for the other one.
 		service = mcp.Service{ID: id, Kind: mcp.Kind(request.Kind), KeyRef: mcp.KeyRefFor(id), CreatedAt: a.now().UTC()}
@@ -108,8 +128,21 @@ func (a *App) SaveMCPService(request SaveMCPServiceRequest) (MCPServiceView, err
 			service.KeyRef = ""
 		}
 	}
+	previousURL := service.URL
 	service.Name, service.URL, service.Preset = request.Name, request.URL, request.Preset
 	service.Normalize()
+	service.Auth = ""
+	if request.NoAuth {
+		service.Auth = mcp.AuthNone
+	}
+	previousHost := hostOf(mcp.Service{URL: previousURL})
+	if existing && service.URL != previousURL && !service.IsConnector() {
+		// Another address may be another server: its tools must be listed again, and grants made
+		// for the old address no longer apply (they are bound to it, see runtime.Grant).
+		service.Catalog, service.CatalogAt = nil, nil
+	}
+	// A credential belongs to the host it was given for and never follows the service elsewhere.
+	newHost := existing && !service.IsConnector() && hostOf(service) != previousHost
 	token := strings.TrimSpace(request.Token)
 	missing := "请填写访问令牌"
 	if service.IsConnector() && !service.IsBuiltin() {
@@ -132,18 +165,53 @@ func (a *App) SaveMCPService(request SaveMCPServiceRequest) (MCPServiceView, err
 			return MCPServiceView{}, errors.New("内置案例无需凭据")
 		}
 	case service.IsOAuth():
-		// Credentials come only from AuthorizeMCPService; a pasted token is ignored.
+		// Credentials come only from AuthorizeMCPService; a pasted token is ignored. A login made
+		// for another host is removed, so the next step is a new login.
+		if newHost {
+			if err := a.vault.Delete(ctx, service.KeyRef); err != nil {
+				return MCPServiceView{}, err
+			}
+		}
+	case service.Auth == mcp.AuthNone:
+		if existing {
+			if err := a.vault.Delete(ctx, service.KeyRef); err != nil {
+				return MCPServiceView{}, err
+			}
+		}
 	case token != "":
+		if len(token) < mcp.MinTokenLength {
+			return MCPServiceView{}, fmt.Errorf("访问令牌太短（至少 %d 个字符），请检查是否粘贴完整", mcp.MinTokenLength)
+		}
 		if err := a.vault.Put(ctx, service.KeyRef, []byte(token)); err != nil {
 			return MCPServiceView{}, err
 		}
 	case !existing:
 		return MCPServiceView{}, errors.New(missing)
+	case newHost:
+		return MCPServiceView{}, errors.New("MCP 地址换了域名，请重新填写访问令牌；原来的令牌不会发给新地址")
+	default:
+		if saved, err := a.vault.Read(ctx, service.KeyRef); err != nil {
+			return MCPServiceView{}, errors.New(missing)
+		} else {
+			clear(saved)
+		}
 	}
 	if err := a.store.SaveMCPService(service); err != nil {
 		return MCPServiceView{}, err
 	}
+	unlock()
+	locked = false
+	toolsErr := ""
+	if !service.IsConnector() && !service.IsOAuth() {
+		// The user chooses tools per sandbox, so list them now; OAuth services list after login.
+		if listed, err := a.listServiceTools(ctx, service); err != nil {
+			toolsErr = err.Error()
+		} else {
+			service = listed
+		}
+	}
 	view, err := a.mcpView(service)
+	view.ToolsError = toolsErr
 	if err != nil {
 		return view, err
 	}
@@ -151,6 +219,97 @@ func (a *App) SaveMCPService(request SaveMCPServiceRequest) (MCPServiceView, err
 		return view, a.refreshSandboxesUsing(ctx, service.ID)
 	}
 	return view, nil
+}
+
+// listServiceTools fetches a remote service's tools from the Mac with the credential the app
+// holds and saves them as the service's tool list. Grants in sandboxes are not changed.
+func (a *App) listServiceTools(ctx context.Context, service mcp.Service) (mcp.Service, error) {
+	current, token, err := a.serviceCredential(ctx, service.ID)
+	if err != nil {
+		return service, err
+	}
+	upstream, err := current.Upstream()
+	if err != nil {
+		return service, err
+	}
+	tools, err := mcp.ListTools(ctx, a.client, upstream, token)
+	if err != nil {
+		return service, toolListError(current, err)
+	}
+	return runtime.SaveCatalog(a.store, current, tools, a.now())
+}
+
+// serviceCredential reads a remote service and its token together, under the service's lock, so
+// the token goes only to the address it was saved for.
+func (a *App) serviceCredential(ctx context.Context, id string) (mcp.Service, string, error) {
+	unlock, err := a.store.LockOperation(ctx, runtime.ServiceLock(id), true)
+	if err != nil {
+		return mcp.Service{}, "", err
+	}
+	defer unlock()
+	service, err := a.store.MCPService(id)
+	if err != nil {
+		return service, "", err
+	}
+	switch {
+	case service.Auth == mcp.AuthNone:
+		return service, "", nil
+	case service.IsOAuth():
+		creds, _, err := a.oauth.AccessToken(ctx, a.vault, service.KeyRef, time.Minute)
+		if err != nil {
+			return service, "", err
+		}
+		return service, creds.AccessToken, nil
+	}
+	data, err := a.vault.Read(ctx, service.KeyRef)
+	if err != nil {
+		return service, "", errors.New("钥匙串中没有这个服务的令牌")
+	}
+	defer clear(data)
+	return service, string(data), nil
+}
+
+func hostOf(service mcp.Service) string {
+	host, _, _ := service.Endpoint()
+	return host
+}
+
+// toolListError says in plain words why a remote service's tools could not be listed.
+func toolListError(service mcp.Service, err error) error {
+	var status *mcp.StatusError
+	var rpc *mcp.RPCError
+	switch {
+	case errors.As(err, &status) && (status.Status == http.StatusUnauthorized || status.Status == http.StatusForbidden):
+		if service.Auth == mcp.AuthNone {
+			return errors.New("服务要求令牌或登录，不能按“无需令牌”使用")
+		}
+		return errors.New("服务可达，但令牌无效或没有权限")
+	case errors.As(err, &status):
+		return fmt.Errorf("服务返回了 HTTP %d，没有拿到工具列表", status.Status)
+	case errors.As(err, &rpc), errors.Is(err, mcp.ErrInvalidAnswer):
+		return err
+	}
+	host, _, _ := service.Endpoint()
+	return fmt.Errorf("无法连接到 %s（%s）", host, networkReason(err))
+}
+
+// RefreshMCPTools lists a remote service's tools again, e.g. after the service added tools. New
+// tools stay closed in every sandbox until the user grants them.
+func (a *App) RefreshMCPTools(id string) (MCPServiceView, error) {
+	service, err := a.store.MCPService(id)
+	if err != nil {
+		return MCPServiceView{}, err
+	}
+	if service.IsConnector() {
+		return MCPServiceView{}, errors.New("这个服务的工具由 AIofCage 固定，无需刷新")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	listed, err := a.listServiceTools(ctx, service)
+	if err != nil {
+		return MCPServiceView{}, err
+	}
+	return a.mcpView(listed)
 }
 
 // newMCPID reuses the preset ID (e.g. "github") when free, so agents see a readable server name.
@@ -222,51 +381,27 @@ func (a *App) TestMCPService(id string) (TestResult, error) {
 		}
 		return TestResult{OK: ok, Message: message}, nil
 	}
-	var token []byte
-	if service.IsOAuth() {
-		creds, _, err := a.oauth.AccessToken(ctx, a.vault, service.KeyRef, time.Minute)
+	if !service.IsConnector() {
+		// A remote service is tested the way an agent uses it, and its tool list is updated.
+		listCtx, stop := context.WithTimeout(context.Background(), 30*time.Second)
+		defer stop()
+		started := a.now()
+		listed, err := a.listServiceTools(listCtx, service)
+		result := TestResult{LatencyMS: a.now().Sub(started).Milliseconds()}
 		if err != nil {
-			return TestResult{Message: err.Error()}, nil
+			result.Message = err.Error()
+			return result, nil
 		}
-		token = []byte(creds.AccessToken)
-	} else if token, err = a.vault.Read(ctx, service.KeyRef); err != nil {
-		return TestResult{Message: "钥匙串中没有这个服务的令牌"}, nil
-	}
-	if service.IsConnector() {
-		return a.testDatabase(service, string(token)), nil
-	}
-	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{
-		"protocolVersion": "2025-06-18", "capabilities": map[string]any{},
-		"clientInfo": map[string]string{"name": "AIofCage", "version": "0.1"}}})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, service.URL, bytes.NewReader(body))
-	if err != nil {
-		return TestResult{}, err
-	}
-	req.Header.Set("Authorization", "Bearer "+string(token))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
-	started := a.now()
-	resp, err := a.client.Do(req)
-	result := TestResult{LatencyMS: a.now().Sub(started).Milliseconds()}
-	if err != nil {
-		host, _, _ := service.Endpoint()
-		result.Message = "无法连接到 " + host + "（" + networkReason(err) + "）"
+		result.OK = true
+		result.Message = fmt.Sprintf("连接正常：服务提供 %d 个工具，其中 %d 个标注为只读", len(listed.Catalog), len(listed.DefaultTools()))
 		return result, nil
 	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	result.Status = resp.StatusCode
-	switch {
-	case resp.StatusCode == 200 && bytes.Contains(data, []byte(`"serverInfo"`)):
-		result.OK, result.Message = true, "连接正常，MCP 服务已响应"
-	case resp.StatusCode == 200:
-		result.OK, result.Message = true, "服务可达"
-	case resp.StatusCode == 401 || resp.StatusCode == 403:
-		result.Message = "服务可达，但令牌无效或没有权限"
-	default:
-		result.Message = fmt.Sprintf("服务返回了 %d", resp.StatusCode)
+	token, err := a.vault.Read(ctx, service.KeyRef)
+	if err != nil {
+		return TestResult{Message: "钥匙串中没有这个服务的令牌"}, nil
 	}
-	return result, nil
+	defer clear(token)
+	return a.testDatabase(service, string(token)), nil
 }
 
 // SetSandboxMCP chooses the MCP services a sandbox may use; running sandboxes update at once.

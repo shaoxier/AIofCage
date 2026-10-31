@@ -253,7 +253,12 @@ input[type="radio"], input[type="checkbox"] { width: 16px; height: 16px; min-hei
 .agent-pick { display: grid; gap: 10px; }
 .mcp-choice { display: grid; gap: 5px; }
 .mcp-tool-list { display: grid; gap: 4px; margin: 0 0 4px 28px; padding: 8px 10px; border-left: 2px solid var(--line); color: var(--faint); }
-.mcp-tool-list label.check { min-height: 24px; font-size: var(--text-sm); color: var(--ink); }
+.mcp-tool-list label.check { min-height: 24px; font-size: var(--text-sm); color: var(--ink); flex-wrap: wrap; }
+.mcp-tool-list label.check .muted { font-size: var(--text-xs); }
+.mcp-tool-list label.check .pill { padding: 1px 8px; }
+.mcp-tool-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 12px; }
+.mcp-tool-actions { display: inline-flex; gap: 12px; }
+.mcp-tool-scroll { display: grid; gap: 4px; max-height: 240px; overflow-y: auto; }
 .security-diagnostics { display: grid; gap: 12px; margin-bottom: 18px; }
 .security-grid, .security-mcp { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .security-item { display: grid; gap: 4px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
