@@ -13,8 +13,17 @@ import { OperationProgress } from "./progress.js";
 import { recoveryPanel } from "./conversation-state.js";
 import { DemoTask } from "./demo-cases.js";
 import { placeTerminalMenu, terminalMenuKey } from "./terminal-menu.js";
+import { ProjectFiles } from "./project-files.js";
+import { insertAt, insertable, shellQuote } from "./project-paths.js";
 
 const activeTerminals = new Map();
+
+// 文件栏按沙箱记住展开状态；没有记录时，窗口够宽才默认展开。
+const filesKey = (id) => `aiofcage.files.${id}`;
+function filesPreference(id) {
+  try { const value = localStorage.getItem(filesKey(id)); if (value) return value === "open"; } catch { /* 无痕或禁用存储 */ }
+  return window.innerWidth >= 1180;
+}
 
 const TABS = [
   { id: "overview", label: "概览", icon: "box" },
@@ -92,6 +101,11 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
   const [active, updateActive] = useState(() => activeTerminals.get(sandbox.id));
   const [dragging, setDragging] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [filesOpen, setFilesOpen] = useState(() => filesPreference(sandbox.id));
+  const showFiles = (value) => {
+    setFilesOpen(value);
+    try { localStorage.setItem(filesKey(sandbox.id), value ? "open" : "closed"); } catch { /* 只影响下次是否默认展开 */ }
+  };
   const menu = useRef(null);
   useEffect(() => {
     const dismiss = (event) => { if (menu.current && !menu.current.contains(event.target)) menu.current.open = false; };
@@ -156,6 +170,24 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
     if (id === current?.id) setActive(null);
   };
   const choices = [...sandbox.bindings.map((b) => ({ agent: b.agent, label: agentName(b.agent) })), { agent: "", label: "Shell" }];
+  // 路径插入当前会话：对话插到输入框光标处，Shell 当作键入（不带回车）。
+  const conversation = current?.kind === "conversation";
+  const canInsert = Boolean(current && !current.exited && (!conversation || (current.info && running && !current.draft.busy)));
+  const insertPath = (path) => {
+    if (!canInsert || !insertable(path)) return;
+    if (!conversation) {
+      call("WriteTerminal", current.id, shellQuote(path) + " ").catch((error) => notify(error.message, true));
+      current.term?.focus();
+      return;
+    }
+    const inputID = `terminal-message-${current.id}`;
+    const input = document.getElementById(inputID);
+    const next = insertAt(current.draft.text, path, input?.selectionStart ?? current.draft.text.length, input?.selectionEnd ?? current.draft.text.length);
+    current.draft.text = next.text;
+    current.draft.error = "";
+    updateTerminalDraft();
+    requestAnimationFrame(() => { const field = document.getElementById(inputID); field?.focus(); field?.setSelectionRange(next.cursor, next.cursor); });
+  };
 
   if (!running && sessions.length === 0) {
     return html`<div>${recoveries}<div class="panel empty">
@@ -164,12 +196,7 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
       <button class="primary" onClick=${() => run(sandbox, "启动", "StartSandbox", sandbox.id)} disabled=${Boolean(busy)}>启动沙箱</button>
     </div></div>`;
   }
-  return html`<div class=${`terminal-panel ${dragging ? "dragging-image" : ""}`}
-    onPasteCapture=${(e) => handleTerminalPaste(current, e)}
-    onKeyDownCapture=${(e) => handleTerminalImageKey(current, e)}
-    onDragOver=${(e) => { if (e.dataTransfer.types.includes("Files")) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; setDragging(true); } }}
-    onDragLeave=${(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setDragging(false); }}
-    onDrop=${(e) => { e.preventDefault(); setDragging(false); if (current?.agent && !current.exited) addTerminalImages(current, e.dataTransfer.files); }}>
+  return html`<div class="terminal-panel">
     ${recoveries}
     <div class="terminal-tabs">
       ${sessions.length > 0 && html`<div class="terminal-session-tabs" role="tablist" aria-label="终端会话">${sessions.map((s) => html`<div class=${`terminal-tab ${s.id === current?.id ? "active" : ""} ${s.exited ? "exited" : ""}`} key=${s.id}>
@@ -186,7 +213,16 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
       <button class="link system-terminal" disabled=${!running} title="用 macOS 自带的“终端”打开"
         onClick=${() => call("OpenTerminal", sandbox.id, current?.agent ?? sandbox.bindings[0]?.agent ?? "").catch((e) => notify(e.message, true))}>
         在系统终端中打开</button>
+      <button class=${`files-toggle ${filesOpen ? "active" : ""}`} aria-pressed=${filesOpen} onClick=${() => showFiles(!filesOpen)}
+        title=${filesOpen ? "收起项目文件" : "展开项目文件"}><${Icon} name="folder" size=${17} />项目文件</button>
     </div>
+    <div class="terminal-body">
+    <div class=${`terminal-main ${dragging ? "dragging-image" : ""}`}
+      onPasteCapture=${(e) => handleTerminalPaste(current, e)}
+      onKeyDownCapture=${(e) => handleTerminalImageKey(current, e)}
+      onDragOver=${(e) => { if (e.dataTransfer.types.includes("Files")) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; setDragging(true); } }}
+      onDragLeave=${(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setDragging(false); }}
+      onDrop=${(e) => { e.preventDefault(); setDragging(false); if (current?.agent && !current.exited) addTerminalImages(current, e.dataTransfer.files); }}>
     ${current
       ? html`<${TerminalView} key=${current.id} id=${current.id} />
           ${current.exited && running && html`<div class="terminal-exited">
@@ -197,6 +233,10 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
         </div>`}
     ${current?.agent && current.info && !current.exited && running && html`<${TerminalComposer} key=${current.id} session=${current} />`}
     ${dragging && html`<div class="terminal-drop-hint" aria-hidden="true">松开以添加图片</div>`}
+    </div>
+    ${filesOpen && html`<${ProjectFiles} sandboxId=${sandbox.id} busy=${sessions.filter((s) => s.busy).length} canInsert=${canInsert}
+      onInsert=${insertPath} onClose=${() => showFiles(false)} notify=${notify} />`}
+    </div>
   </div>`;
 }
 
