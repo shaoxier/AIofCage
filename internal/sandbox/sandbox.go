@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -217,4 +218,60 @@ func ValidateProject(project string) error {
 		return errors.New("项目路径不是目录")
 	}
 	return nil
+}
+
+// CheckProjectOverlap refuses a project that is the project of another sandbox in others (the
+// sandbox id aside), lies inside one or contains one. A folder belongs to one sandbox: the agent of
+// an outer sandbox can rename the inner project or swap it for a link, a FIFO or an app, which the
+// Mac and the inner sandbox then take for the project; a shared folder also passes data between
+// sandboxes that have different networks, tools and keys.
+func CheckProjectOverlap(id, project string, others []Sandbox) error {
+	other, found := OverlappingSandbox(id, project, others)
+	switch {
+	case !found:
+		return nil
+	case within(project, other.ProjectPath) && within(other.ProjectPath, project):
+		return fmt.Errorf("这个文件夹已是沙箱「%s」的项目，一个文件夹只能给一个沙箱用，请换一个文件夹", other.Name)
+	case within(other.ProjectPath, project):
+		return fmt.Errorf("这个文件夹在沙箱「%s」的项目里面，请换一个与它并列的文件夹", other.Name)
+	}
+	return fmt.Errorf("这个文件夹里面有沙箱「%s」的项目，请换一个不包含它的文件夹", other.Name)
+}
+
+// OverlappingSandbox returns the first sandbox in others, the sandbox id aside, whose project is
+// the same folder as project, lies inside it or contains it.
+func OverlappingSandbox(id, project string, others []Sandbox) (Sandbox, bool) {
+	for _, other := range others {
+		if other.ID != id && (within(other.ProjectPath, project) || within(project, other.ProjectPath)) {
+			return other, true
+		}
+	}
+	return Sandbox{}, false
+}
+
+// within reports whether inner is the folder outer or lies inside it. Paths compare by component
+// and ignore case, as the Mac's file system does by default, so "proj-2" is not inside "proj" and a
+// trailing slash changes nothing. Folders that exist also compare by identity, which catches other
+// spellings of the same folder, such as another Unicode form of its name.
+func within(outer, inner string) bool {
+	if !filepath.IsAbs(outer) || !filepath.IsAbs(inner) {
+		return false
+	}
+	outerParts := strings.Split(filepath.Clean(outer), string(filepath.Separator))
+	innerParts := strings.Split(filepath.Clean(inner), string(filepath.Separator))
+	if len(innerParts) >= len(outerParts) && slices.EqualFunc(outerParts, innerParts[:len(outerParts)], strings.EqualFold) {
+		return true
+	}
+	target, err := os.Stat(outer)
+	if err != nil {
+		return false
+	}
+	for dir := filepath.Clean(inner); ; dir = filepath.Dir(dir) {
+		if info, err := os.Stat(dir); err == nil && os.SameFile(info, target) {
+			return true
+		}
+		if dir == filepath.Dir(dir) {
+			return false
+		}
+	}
 }

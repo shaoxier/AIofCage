@@ -300,7 +300,11 @@ func (c *agentController) create(raw json.RawMessage) (any, error) {
 		id, path = result.ID, result.ProjectPath
 	} else {
 		name := "ai-" + strings.TrimSpace(args.Name) + "-" + rand.Text()[:6]
-		path, err = prepareProject(ProjectNew, "", name)
+		existing, err := c.app.store.Sandboxes()
+		if err != nil {
+			return nil, err
+		}
+		path, err = prepareProject(ProjectNew, "", name, existing)
 		if err != nil {
 			return nil, err
 		}
