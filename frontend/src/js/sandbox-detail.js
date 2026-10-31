@@ -6,7 +6,7 @@ import { BindingSelects, MCPLine, UsageStats } from "./sandboxes.js";
 import { HealthPanel } from "./health.js";
 import { UsagePage } from "./usage.js";
 import { LogsPage } from "./logs.js";
-import { TerminalView, openTerminal, closeTerminal, useTerminals, updateTerminalDraft, addTerminalImages, handleTerminalPaste, handleTerminalImageKey } from "./terminal.js";
+import { TerminalView, openTerminal, closeTerminal, useTerminals, recoveryHidden, updateTerminalDraft, addTerminalImages, handleTerminalPaste, handleTerminalImageKey } from "./terminal.js";
 import { IMAGE_ACCEPT, removeImage, sendDraft } from "./terminal-draft.js";
 import { SandboxAgentUpdates } from "./agent-versions.js";
 import { OperationProgress } from "./progress.js";
@@ -114,21 +114,24 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
     try { setActive(await openTerminal(sandbox, agent)); }
     finally { setCreating(false); }
   };
+  const recovering = useRef(false); // 同步加锁：第一次调用返回之前，重复点击不会再恢复一次
   const recover = async (item) => {
-    if (creating || !item.ready) return;
-    // 先确认记录还在、还能恢复，再决定要不要启动沙箱。
-    const current = (await call("ListRecoverableConversations").catch(() => [])).find((record) => record.id === item.id);
-    if (!current?.ready) {
-      notify(current ? `这条会话不能恢复：${current.reason}` : "这条会话记录已经不在了", true);
-      return;
-    }
-    if (!running && !await run(sandbox, "启动", "StartSandbox", sandbox.id)) return;
+    if (creating || recovering.current || !item.ready) return;
+    recovering.current = true;
     setCreating(true);
-    try { setActive(await openTerminal(sandbox, item.agent, item)); }
-    finally { setCreating(false); }
+    try {
+      // 先确认记录还在、还能恢复，再决定要不要启动沙箱。
+      const current = (await call("ListRecoverableConversations").catch(() => [])).find((record) => record.id === item.id);
+      if (!current?.ready) {
+        notify(current ? `这条会话不能恢复：${current.reason}` : "这条会话记录已经不在了", true);
+        return;
+      }
+      if (!running && !await run(sandbox, "启动", "StartSandbox", sandbox.id)) return;
+      setActive(await openTerminal(sandbox, item.agent, item));
+    } finally { recovering.current = false; setCreating(false); }
   };
   // 面板只列出真能恢复的会话；不能恢复的旧记录只作为诊断信息，不出现“恢复”字样。
-  const { ready, stale } = recoveryPanel(recoverable, sandbox.id, sessions.filter((session) => !session.exited).map((session) => session.id));
+  const { ready, stale } = recoveryPanel(recoverable, sandbox.id, recoveryHidden(sandbox.id));
   const recoveries = html`${ready.length > 0 && html`<div class="conversation-recovery panel" role="status">
       <div><strong>可恢复会话</strong><p class="caption">这些记录只保存原生会话元数据，不保存消息正文。${running ? "" : "恢复时会先启动沙箱。"}</p></div>
       ${ready.map((item) => html`<div class="conversation-recovery-row" key=${item.id}>

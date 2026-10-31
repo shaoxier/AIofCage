@@ -29,6 +29,7 @@ function App() {
   const [toast, setToast] = useState(null);
   const [quitting, setQuitting] = useState(false);
   const reloads = useRef(0); // 只采用最近一次刷新的结果，旧的响应晚到时不覆盖新状态
+  const recoveryReads = useRef(0); // 可恢复列表单独读的时候也一样
   const [events, setEvents] = useState([]);
   const [summary, setSummary] = useState({ sandboxes: [], providers: {} });
   const [logSandbox, setLogSandbox] = useState("");
@@ -49,13 +50,14 @@ function App() {
 
   const reload = useCallback(async () => {
     const turn = ++reloads.current;
+    const recoveryTurn = ++recoveryReads.current;
     try {
       const [p, s, m, r] = await Promise.all([call("ListProviders"), call("ListSandboxes"), call("ListMCPServices"), call("ListRecoverableConversations")]);
       if (turn !== reloads.current) return;
       setProviders(p);
       setSandboxes(s);
       setServices(m);
-      setRecoverable(r ?? []);
+      if (recoveryTurn === recoveryReads.current) setRecoverable(r ?? []);
       setDataReady(true);
     } catch (error) {
       if (turn !== reloads.current) return;
@@ -92,8 +94,10 @@ function App() {
     const offAlert = window.runtime?.EventsOn?.("sandbox:alert", (alert) => notify(alert.message, alert.level !== "info"));
     const offQuitting = window.runtime?.EventsOn?.("app:quitting", () => setQuitting(true));
     // 恢复记录变了（首轮拿到会话 ID、关闭标签、记录失效），只重读可恢复列表。
-    const offRecovery = window.runtime?.EventsOn?.("conversation:recovery", () =>
-      call("ListRecoverableConversations").then((list) => setRecoverable(list ?? [])).catch(() => {}));
+    const offRecovery = window.runtime?.EventsOn?.("conversation:recovery", () => {
+      const turn = ++recoveryReads.current;
+      call("ListRecoverableConversations").then((list) => { if (turn === recoveryReads.current) setRecoverable(list ?? []); }).catch(() => {});
+    });
     // 进度只更新对应沙箱的操作，不重读全部数据；操作结束时沙箱状态会变，再刷新一次列表。
     // 后端也记着进度，切换页面回来照样能看到正在进行的操作。
     const offProgress = window.runtime?.EventsOn?.("sandbox:progress", ({ id, activity }) => {
