@@ -1,6 +1,7 @@
 // AI 安全解说与隔离检查。AI 只负责解释，不参与放行决定。
 import { useEffect, useState } from "preact/hooks";
 import { html, call, Icon } from "./core.js";
+import { CHECK_STATUSES, checkCounts, checkStatus } from "./isolation-summary.js";
 
 const RISK_TONE = { 高: "bad", 中: "warn", 低: "ok" };
 
@@ -42,23 +43,24 @@ export function AttackDialog({ sandbox, onClose, onLogs }) {
     try { setResults(await call("RunIsolationChecks", sandbox.id)); } catch (e) { setError(e.message); } finally { setRunning(false); }
   };
   const list = results ?? attacks;
-  const statuses = { passed: { label: "通过", tone: "ok" }, problem: { label: "发现问题", tone: "bad" }, inconclusive: { label: "无法验证", tone: "warn" }, skipped: { label: "跳过", tone: "idle" } };
   return html`
     <div class="overlay" onClick=${(e) => e.target === e.currentTarget && !running && onClose()}>
       <div class="dialog wide" role="dialog" aria-modal="true" aria-label="隔离检查">
         <div class="dialog-heading"><h2>隔离检查 · 「${sandbox.name}」</h2>
           <button type="button" class="icon-button" aria-label="关闭" onClick=${onClose} disabled=${running}><${Icon} name="x" size=${20} /></button></div>
-        <p class="caption">使用固定测试数据，读取凭据与网络配置；宿主会创建临时测试文件并在检查后清理。结果只覆盖本次检查，不代表完整安全审计。</p>
-        ${results && html`<div class="diagnostic-summary" role="status">${Object.entries(statuses).map(([key,value]) => html`<span class=${`pill ${value.tone}`}>${value.label} ${results.filter((r) => r.status === key).length}</span>`)}</div>`}
+        <p class="caption">使用固定测试数据。检查时会在专用虚拟机里临时启动几个对照容器，并在 ~/CageWorkspace 下临时建一个测试目录，结束后都会删除。对照不成立的项判“无法验证”。结果只覆盖本次检查，不代表完整安全审计。</p>
+        ${results && html`<div class="diagnostic-summary" role="status">${checkCounts(results).map((item) => html`<span class=${`pill ${item.tone}`}>${item.label} ${item.count}</span>`)}</div>`}
         <div class="attack-list">
-          ${list.map((a) => html`<article class=${`attack ${results ? (statuses[a.status]?.tone || "warn") : ""}`} key=${a.id}>
+          ${list.map((a) => { const status = CHECK_STATUSES[checkStatus(a)]; return html`<article class=${`attack ${results ? status.tone : ""}`} key=${a.id}>
             <div class="card-top">
               <h3>${a.title}</h3>
-              ${results ? html`<span class=${`pill ${statuses[a.status]?.tone || "warn"}`}>${statuses[a.status]?.label || "无法验证"}</span>` : html`<span class="pill idle">${a.layer}</span>`}
+              ${results ? html`<span class=${`pill ${status.tone}`}>${status.label}</span>` : html`<span class="pill idle">${a.layer}</span>`}
             </div>
             ${a.evidence && html`<pre class="evidence">${a.evidence}</pre>`}
+            ${a.controls?.length > 0 && html`<ul class="check-controls" aria-label="对照">${a.controls.map((c) => html`<li class=${c.ok ? "ok" : "bad"}>
+              <${Icon} name=${c.ok ? "check" : "x"} size=${14} /><span>对照${c.ok ? "成立" : "不成立"}：${c.name}${c.detail && html`<small>${c.detail}</small>`}</span></li>`)}</ul>`}
             ${a.note && html`<p class="note">${a.note}</p>`}
-          </article>`)}
+          </article>`; })}
         </div>
         ${error && html`<p class="form-error" role="alert">${error}</p>`}
         <div class="dialog-actions">

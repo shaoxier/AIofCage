@@ -1,5 +1,6 @@
 import { useEffect, useState } from "preact/hooks";
 import { html, call, formatBytes, REASONS, STATES, Icon } from "./core.js";
+import { checkCountsText } from "./isolation-summary.js";
 
 const KINDS = { agent: "智能体环境", gate: "出网代理", mcp: "MCP 连接器" };
 const COMPONENT_STATES = { running: "运行中", exited: "已停止", created: "待启动", restarting: "重启中", paused: "已暂停", dead: "异常退出", missing: "未创建", unknown: "未采集" };
@@ -48,7 +49,7 @@ export function HealthPanel({ sandbox, vm, events = [] }) {
         <div class="security-grid">${security.controls.map((item) => html`<div class="security-item"><strong>${item.name}</strong><span class="pill idle">边界说明</span><small>${item.detail}</small></div>`)}</div>
         <div class="section-heading compact"><h4>MCP 权限</h4><span class="caption">最近拒绝 ${security.recent_denied} 次</span></div>
         ${security.mcp.length ? html`<div class="security-mcp">${security.mcp.map((item) => html`<div class="security-item"><strong>${item.name}</strong><small>${item.connector ? "连接器" : "远程服务"}工具 ${item.granted_tools.length}/${item.catalog_tools.length}${item.explicit_grant ? "（沙箱专属）" : item.connector ? "（默认目录）" : "（默认只读）"} · ${item.key_saved ? "凭据可用" : "需要登录或配置"}</small></div>`)}</div>` : html`<p class="caption">当前沙箱未启用 MCP 服务。</p>`}
-        ${security.last_isolation && html`<p class="caption">最近一次隔离检查：${new Date(security.last_isolation.finished_at).toLocaleString()}，${security.last_isolation.results.filter((item) => item.status === "passed").length}/${security.last_isolation.results.length} 项通过。</p>`}
+        ${security.last_isolation && html`<p class="caption">最近一次隔离检查：${new Date(security.last_isolation.finished_at).toLocaleString()}，${checkCountsText(security.last_isolation.results)}。</p>`}
       </div>`}
       <div class="metric-grid">
         <div class="panel metric"><span><${Icon} name="cpu" />CPU</span><strong>${valid ? `${s.cpu_percent.toFixed(1)}%` : "—"}</strong><small>100% = 1 个核心</small></div>
