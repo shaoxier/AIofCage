@@ -7,14 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/shaoxier/AIofCage/internal/mcp"
 	"github.com/shaoxier/AIofCage/internal/oauth"
+	"github.com/shaoxier/AIofCage/internal/runtime"
 	"github.com/shaoxier/AIofCage/internal/sandbox"
 )
 
@@ -31,7 +30,16 @@ type AttackResult struct {
 	Blocked  bool   `json:"blocked"`
 	Skipped  bool   `json:"skipped"`
 	Evidence string `json:"evidence"`
-	Note     string `json:"note"`
+	// Controls are the positive samples a check needs before its negative result means anything.
+	Controls []CheckControl `json:"controls,omitempty"`
+	Note     string         `json:"note"`
+}
+
+// CheckControl is one positive sample: a setup where the probe must see what it looks for.
+type CheckControl struct {
+	Name   string `json:"name"`
+	OK     bool   `json:"ok"`
+	Detail string `json:"detail,omitempty"`
 }
 
 const (
@@ -46,8 +54,10 @@ var attacks = []Attack{
 	{ID: "exfil-domain", Title: "未授权域名请求", Layer: "出网规则"},
 	{ID: "bypass-proxy", Title: "绕开代理直连公网", Layer: "网络路由"},
 	{ID: "foreign-key", Title: "外来凭据请求", Layer: "凭据校验"},
-	{ID: "host-files", Title: "宿主测试文件与 Docker 接口", Layer: "文件隔离"},
-	{ID: "dns-exfil", Title: "公网 DNS 连通性", Layer: "DNS 与路由"},
+	{ID: "dns-exfil", Title: "DNS 查询外传", Layer: "DNS 与路由"},
+	{ID: "docker-socket", Title: "Docker 接口", Layer: "容器边界"},
+	{ID: "project-boundary", Title: "项目以外的文件", Layer: "文件隔离"},
+	{ID: "remote-mcp-direct", Title: "绕过网关直连远程 MCP", Layer: "MCP 网关"},
 	{ID: "db-direct", Title: "直连数据库与密码配置", Layer: "可信连接器"},
 }
 
@@ -64,21 +74,39 @@ func (a *App) RunIsolationChecks(id string) ([]AttackResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	a.securityMu.Lock()
+	if a.isolationBusy[id] {
+		a.securityMu.Unlock()
+		return nil, errors.New("这个沙箱正在进行隔离检查，请等它完成")
+	}
+	if a.isolationBusy == nil {
+		a.isolationBusy = map[string]bool{}
+	}
+	a.isolationBusy[id] = true
+	a.securityMu.Unlock()
+	defer func() { a.securityMu.Lock(); delete(a.isolationBusy, id); a.securityMu.Unlock() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	if a.manager.Status(ctx, id).State != "running" {
 		return nil, errors.New("请先启动沙箱")
 	}
+	// Helpers an interrupted check left behind would only get in the way.
+	a.manager.RemoveProbes(ctx, id)
 	secrets, _ := a.realSecrets(ctx, sbx)
 	started := a.now()
 	defer func() { a.demos.add(id, demoRun{Start: started, End: a.now()}) }()
 	results := make([]AttackResult, 0, len(attacks))
 	for _, check := range attacks {
-		r := a.runAttack(ctx, sbx, check)
+		r := settle(a.runAttack(ctx, sbx, check))
 		for _, secret := range secrets {
-			if strings.Contains(r.Evidence, secret) || strings.Contains(r.Note, secret) {
+			leaked := strings.Contains(r.Evidence, secret) || strings.Contains(r.Note, secret)
+			for _, control := range r.Controls {
+				leaked = leaked || strings.Contains(control.Detail, secret)
+			}
+			if leaked {
 				r.Status = checkProblem
 				r.Evidence = "检查输出包含真实凭据（已隐去）"
+				r.Controls = nil
 				r.Note = "请停止该沙箱并检查凭据隔离。"
 			}
 		}
@@ -148,6 +176,22 @@ func (a *App) realSecrets(ctx context.Context, sbx sandbox.Sandbox) ([]string, e
 	return values, nil
 }
 
+// settle keeps a negative result from passing when one of its positive samples failed: the probe
+// may simply be unable to see what it looks for. A problem stays a problem.
+func settle(r AttackResult) AttackResult {
+	if r.Status != checkPassed {
+		return r
+	}
+	for _, control := range r.Controls {
+		if !control.OK {
+			r.Status = checkInconclusive
+			r.Note = "对照不成立：「" + control.Name + "」没有得到预期结果，所以不能下结论。" + r.Note
+			return r
+		}
+	}
+	return r
+}
+
 // 脚本输出严格 JSON；命令错误优先于脚本声称的结论。
 func classifyCheck(check Attack, out []byte, execErr error) AttackResult {
 	r := AttackResult{Attack: check, Status: checkInconclusive}
@@ -191,14 +235,33 @@ def connect(host,port):
     finally:
         s.close()
 
-def curl_check(url,headers,expected):
+def curl(url,headers=()):
     args=["curl","--silent","--show-error","--max-time","12","--dump-header","-","--output","/dev/null","--request","POST","--data","aiofcage-isolation-probe"]
     for h in headers: args.extend(["--header",h])
     p=subprocess.run(args+[url],capture_output=True,text=True,timeout=15)
     codes=re.findall(r"(?im)^HTTP/[^ ]+ ([0-9]{3})(?![^\r\n]*Connection established)",p.stdout)
     reasons=re.findall(r"(?im)^x-aiofcage-reason: *([^\r\n]+)",p.stdout)
+    return codes,reasons,p.returncode
+
+def curl_check(url,headers,expected):
+    codes,reasons,code=curl(url,headers)
     status="passed" if "403" in codes and expected in reasons else "problem" if codes and 200<=int(codes[-1])<400 else "inconclusive"
-    result(status,"HTTP "+(" / ".join(codes) or "无响应")+"；代理原因："+(" / ".join(reasons) or "未取得")+"；curl 退出码 "+str(p.returncode),"仅验证本次请求和返回原因。网络错误、超时或其他拒绝原因不判通过。")
+    result(status,"HTTP "+(" / ".join(codes) or "无响应")+"；代理原因："+(" / ".join(reasons) or "未取得")+"；curl 退出码 "+str(code),"仅验证本次请求和返回原因。网络错误、超时或其他拒绝原因不判通过。")
+
+# Denials the gatekeeper gives before anything is sent to the service.
+BEFORE_UPSTREAM={"default_deny","rule_denied","port_denied","plain_http_denied","target_mismatch"}
+
+def direct_check(urls):
+    rows=[];statuses=[]
+    for url in urls:
+        codes,reasons,code=curl(url)
+        if "403" in codes and reasons and set(reasons)<=BEFORE_UPSTREAM: status="passed"
+        elif codes and (not reasons or set(reasons)&{"redirect_denied","upstream_failed","upstream_status"} or 200<=int(codes[-1])<400): status="problem"
+        else: status="inconclusive"
+        statuses.append(status)
+        rows.append(re.sub(r"^https?://([^/:]+).*$",r"\1",url)+"：HTTP "+(" / ".join(codes) or "无响应")+"，代理原因 "+(" / ".join(reasons) or "未取得"))
+    status="problem" if "problem" in statuses else "passed" if statuses and all(s=="passed" for s in statuses) else "inconclusive"
+    result(status,"；".join(rows),"不带任何凭据，经代理直接请求每个远程 MCP 服务。只有门卫在请求发出前就拒绝才算通过；请求到过服务（包括服务返回 401 或跳转）就是发现问题。")
 `
 
 func (a *App) runAttack(ctx context.Context, sbx sandbox.Sandbox, check Attack) AttackResult {
@@ -233,38 +296,19 @@ result("problem" if suspects or found else "passed" if names else "inconclusive"
 observations=[(host,connect(host,443)) for host in ("223.5.5.5","1.1.1.1")]
 status="problem" if any(v=="connected" for _,v in observations) else "passed" if all(v=="blocked" for _,v in observations) else "inconclusive"
 result(status,"；".join(host+":443 "+value for host,value in observations),"socket 直接测试两个 IPv4 地址，不发送应用数据；超时和连接拒绝不足以证明无出网能力。")`
-	case "host-files":
-		dir, err := os.MkdirTemp("", "aiofcage-isolation-")
-		if err != nil {
-			return classifyCheck(check, nil, err)
-		}
-		defer os.RemoveAll(dir)
-		marker := filepath.Join(dir, "host-probe.txt")
-		if err := os.WriteFile(marker, []byte("aiofcage own test fixture"), 0644); err != nil {
-			return classifyCheck(check, nil, err)
-		}
-		value, _ := json.Marshal(marker)
-		script = "marker=" + string(value) + `
-visible=os.path.exists(marker)
-sock=os.path.exists("/var/run/docker.sock")
-result("problem" if visible or sock else "passed","宿主自建测试文件可见："+str(visible)+"；Docker socket 可见："+str(sock),"宿主临时测试文件在检查后删除。此结果只覆盖该路径和 Docker socket，不代表已检查所有挂载或容器逃逸。")`
 	case "dns-exfil":
-		script = `
-resolvers=re.findall(r"(?m)^nameserver\s+(\S+)",pathlib.Path("/etc/resolv.conf").read_text())
-route=pathlib.Path("/proc/net/route").read_text().splitlines()[1:]
-default4=any(len(row.split())>1 and row.split()[1]=="00000000" for row in route)
-route6=pathlib.Path("/proc/net/ipv6_route")
-default6=any(row.split()[0]=="0"*32 and row.split()[1]=="00" and row.split()[-1]!="lo" for row in route6.read_text().splitlines()) if route6.exists() else False
-query=b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x08aiofcage\x07invalid\x00\x00\x01\x00\x01"
-s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(3)
-try:
-    s.sendto(query,("223.5.5.5",53));s.recvfrom(512);observed="received"
-except OSError as e:
-    observed="blocked" if e.errno in blocked_errors else type(e).__name__
-finally: s.close()
-local=bool(resolvers) and all(v in ("127.0.0.1","::1") for v in resolvers)
-status="problem" if observed=="received" else "passed" if observed=="blocked" and local and not default4 and not default6 else "inconclusive"
-result(status,"DNS 配置："+", ".join(resolvers)+"；IPv4/IPv6 默认路由："+str(default4)+"/"+str(default6)+"；公网 UDP 53："+observed,"只发送固定测试域名 aiofcage.invalid。超时不证明 DNS 隔离；未覆盖所有隧道或 IPv6 端点。")`
+		return a.checkDNS(ctx, sbx, check, a.inAgent(sbx))
+	case "docker-socket":
+		return a.checkDockerSocket(ctx, sbx, check, a.inAgent(sbx))
+	case "project-boundary":
+		return a.checkProjectBoundary(ctx, sbx, check, a.inAgent(sbx))
+	case "remote-mcp-direct":
+		urls := a.remoteMCPAddresses(sbx)
+		if len(urls) == 0 {
+			return AttackResult{Attack: check, Status: checkSkipped, Note: "没有启用远程 MCP 服务。"}
+		}
+		targets, _ := json.Marshal(urls)
+		script = "direct_check(" + string(targets) + ")"
 	case "db-direct":
 		address := a.databaseAddress(sbx)
 		if address == "" {
@@ -274,20 +318,61 @@ result(status,"DNS 配置："+", ".join(resolvers)+"；IPv4/IPv6 默认路由：
 		if err != nil {
 			return classifyCheck(check, nil, err)
 		}
+		// The agent has no DNS at all, so it tries the address the egress side resolves the name to;
+		// a connection from there also shows the database is up.
+		reach := "没有取得"
+		if out, err := a.manager.RunProbe(ctx, sbx.ID, runtime.Probe{Network: runtime.ProbeEgress,
+			Command: pythonCommand(dbControlPython, host, port)}); err == nil {
+			var control struct{ IP, Reach string }
+			if json.Unmarshal(bytes.TrimSpace(out), &control) == nil {
+				reach = control.Reach
+				if control.IP != "" {
+					host = control.IP
+				}
+			}
+		}
 		target, _ := json.Marshal(host)
+		evidence, _ := json.Marshal("；出网侧对照连接数据库：" + reach)
 		script = fmt.Sprintf(`
 found=[]
 for f in (".claude.json",".codex/config.toml",".aiofcage/env"):
     p=pathlib.Path.home()/f
     if p.is_file() and re.search(r"(?:postgres|postgresql)://[^\s\"]*:[^\s\"]*@",p.read_text(errors="replace")): found.append(f)
 observed=connect(%s,int(%q))
-result("problem" if found or observed=="connected" else "passed" if observed=="blocked" else "inconclusive","疑似密码连接串文件："+(", ".join(found) or "无")+"；数据库直连："+observed,"只尝试建立 TCP 连接，不登录、不执行数据库操作；超时不能证明隔离。")`, string(target), port)
+result("problem" if found or observed=="connected" else "passed" if observed=="blocked" else "inconclusive","疑似密码连接串文件："+(", ".join(found) or "无")+"；数据库直连："+observed+%s,"只尝试建立 TCP 连接，不登录、不执行数据库操作；超时不能证明隔离。")`, string(target), port, evidence)
 	default:
 		return AttackResult{Attack: check, Status: checkSkipped, Note: "未支持的检查项。"}
 	}
 	var out bytes.Buffer
-	err := a.manager.Exec(ctx, sbx.ID, false, nil, &out, &out, "python3", "-c", checkPython+"\n"+script)
+	err := a.manager.Exec(ctx, sbx.ID, false, nil, &out, &out, pythonCommand(checkPython+"\n"+script)...)
 	return classifyCheck(check, out.Bytes(), err)
+}
+
+// dbControlPython resolves the database host from the egress network and connects to it.
+const dbControlPython = `import socket,sys,json
+host,port=sys.argv[1],int(sys.argv[2])
+try: ip=socket.gethostbyname(host)
+except OSError: print(json.dumps(dict(ip="",reach="解析失败")));sys.exit()
+try:
+    with socket.create_connection((ip,port),timeout=3): reach="已连接"
+except OSError as e: reach=type(e).__name__
+print(json.dumps(dict(ip=ip,reach=reach),ensure_ascii=False))
+`
+
+// remoteMCPAddresses returns the upstream addresses of the sandbox's remote MCP services: the agent
+// reaches them only through the gatekeeper's MCP gateway, never through the proxy.
+func (a *App) remoteMCPAddresses(sbx sandbox.Sandbox) []string {
+	var urls []string
+	for _, id := range sbx.MCP {
+		service, err := a.store.MCPService(id)
+		if err != nil || service.IsConnector() || service.IsBuiltin() {
+			continue
+		}
+		if url, err := service.Upstream(); err == nil {
+			urls = append(urls, url)
+		}
+	}
+	return urls
 }
 
 // databaseAddress returns where the sandbox's first database service is reached from the VM.

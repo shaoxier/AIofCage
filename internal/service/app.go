@@ -51,6 +51,7 @@ type App struct {
 	demos         demoLog
 	securityMu    sync.Mutex
 	isolationRuns map[string]SecurityIsolationRun
+	isolationBusy map[string]bool // sandboxes being checked; two checks would see each other's probes
 	prices        pricingCatalog
 	updatesMu     sync.Mutex
 	onboardingMu  sync.Mutex

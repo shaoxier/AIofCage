@@ -356,6 +356,12 @@ details.advanced label:first-of-type { margin-top: 12px; }
 .attack .caption { margin-top: 4px; }
 .evidence { margin: 10px 0 0; padding: 12px; background: #1f2a27; color: #d8e6df; border-radius: 8px; font-size: var(--text-xs); white-space: pre-wrap; word-break: break-all; }
 .note { font-size: var(--text-sm); color: var(--ok); margin-top: 8px; }
+.check-controls { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 4px; font-size: var(--text-sm); }
+.check-controls li { display: flex; gap: 6px; align-items: flex-start; }
+.check-controls li svg { flex: none; margin-top: 3px; }
+.check-controls li.ok svg { color: var(--ok); }
+.check-controls li.bad { color: var(--bad); }
+.check-controls small { display: block; color: var(--muted); word-break: break-all; }
 .diagnostic-summary { display: flex; gap: 8px; flex-wrap: wrap; margin: 16px 0; }
 
 /* 终端采用独立深色表面，附件、输入与标签保持清晰的操作边界。 */

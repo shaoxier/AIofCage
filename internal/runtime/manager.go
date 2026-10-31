@@ -1115,6 +1115,9 @@ func (m *Manager) Stop(ctx context.Context, id string) error {
 	if err := m.stopContainers(ctx, names(sbx.ID)); err != nil {
 		errs = append(errs, err)
 	}
+	// Leftovers of an interrupted isolation check; they hold nothing secret, so failing to remove
+	// them does not fail the stop.
+	m.removeProbes(ctx, sbx.ID)
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
@@ -1270,6 +1273,9 @@ func (m *Manager) removeRuntimeObjects(ctx context.Context, id string, keepHome 
 	n := names(id)
 	var errs []error
 	if err := m.removeConnectors(ctx, id); err != nil {
+		errs = append(errs, err)
+	}
+	if err := m.removeProbes(ctx, id); err != nil {
 		errs = append(errs, err)
 	}
 	for _, args := range [][]string{{"rm", "--force", n.agent}, {"rm", "--force", n.gate},
