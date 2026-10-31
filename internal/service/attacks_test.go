@@ -99,7 +99,9 @@ func TestIsolationCurlIgnoresTunnelSuccessAndRequiresReason(t *testing.T) {
 
 func jsonNumber(value int) string { data, _ := json.Marshal(value); return string(data) }
 
-func TestDedicatedIsolationChecks(t *testing.T) {
+// dedicatedApp opens the real store for a running uat- sandbox named by AIOFCAGE_ISOLATION_ID.
+func dedicatedApp(t *testing.T) (*App, sandbox.Sandbox) {
+	t.Helper()
 	id := os.Getenv("AIOFCAGE_ISOLATION_ID")
 	if id == "" {
 		t.Skip("设置 AIOFCAGE_ISOLATION_ID 对已有 uat- 沙箱执行诊断")
@@ -121,13 +123,27 @@ func TestDedicatedIsolationChecks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	app := NewApp(st, keychain, manager, nil, nil)
-	results, err := app.RunIsolationChecks(id)
+	return NewApp(st, keychain, manager, nil, nil), sbx
+}
+
+func TestDedicatedIsolationChecks(t *testing.T) {
+	app, sbx := dedicatedApp(t)
+	results, err := app.RunIsolationChecks(sbx.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Keep the results, e.g. for a validation record (they never contain secrets: see realSecrets).
+	if path := os.Getenv("AIOFCAGE_ISOLATION_OUT"); path != "" {
+		data, _ := json.MarshalIndent(results, "", "  ")
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for _, r := range results {
 		t.Logf("%s %s %s", r.ID, r.Status, r.Evidence)
+		for _, control := range r.Controls {
+			t.Logf("  对照 %v %s %s", control.OK, control.Name, control.Detail)
+		}
 		if r.Status == checkProblem {
 			t.Errorf("发现隔离问题 %s", r.ID)
 		}
