@@ -1,14 +1,18 @@
 GO ?= go
 WAILS_VERSION := v2.17.0
+# 发布版本号以 Info.plist 为准：安装包文件名和应用里显示的版本都取它（只在打包时读取）。
+PLIST_VERSION = $(shell /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' packaging/macos/Info.plist)
+DESKTOP_ENV ?=
+DESKTOP_LDFLAGS ?=
 
-.PHONY: desktop app icons gatekeeper gatekeeper-linux connector-linux cagectl dev check test clean
+.PHONY: desktop app dmg icons gatekeeper gatekeeper-linux connector-linux cagectl dev check test clean
 
 GATEKEEPER_LINUX := internal/runtime/assets/gatekeeper/gatekeeper-linux-arm64
 CONNECTOR_LINUX := internal/runtime/assets/connector/connector-linux-arm64
 APP := bin/Ai of Cage.app
 
 desktop: gatekeeper-linux connector-linux
-	$(GO) build -tags production -trimpath -o bin/AIofCage .
+	$(DESKTOP_ENV) $(GO) build -tags production -trimpath -ldflags "$(DESKTOP_LDFLAGS)" -o bin/AIofCage .
 
 # macOS 应用包：可以在访达里双击打开，程序坞和自动化工具都按应用标识 io.aiofcage.desktop 识别它。
 app: desktop
@@ -18,6 +22,13 @@ app: desktop
 	cp packaging/macos/Info.plist "$(APP)/Contents/Info.plist"
 	cp packaging/macos/AppIcon.icns "$(APP)/Contents/Resources/AppIcon.icns"
 	codesign --force --sign - "$(APP)"
+
+# 安装包：用发布版本号重新构建应用，打成拖拽安装的 DMG，并写出 SHA256 校验文件。只有本机临时签名，
+# 没有公证，首次打开的放行步骤见 README。
+dmg:
+	@test -n "$(PLIST_VERSION)" || { echo "packaging/macos/Info.plist 里没有 CFBundleShortVersionString" >&2; exit 1; }
+	$(MAKE) app DESKTOP_ENV="GOOS=darwin GOARCH=arm64" DESKTOP_LDFLAGS="-X github.com/shaoxier/AIofCage/internal/buildinfo.Version=$(PLIST_VERSION)"
+	scripts/package-dmg.sh "$(APP)" "$(PLIST_VERSION)" "bin/AiofCage-$(PLIST_VERSION)-arm64.dmg"
 
 # 修改 Logo SVG 后重新生成 PNG 和包含 16—1024 像素图像的 ICNS；日常打包直接使用已生成的图标。
 icons:
@@ -49,5 +60,5 @@ test:
 	$(GO) test -race ./internal/...
 
 clean:
-	rm -f bin/AIofCage bin/gatekeeper bin/cagectl $(GATEKEEPER_LINUX) $(CONNECTOR_LINUX)
+	rm -f bin/AIofCage bin/gatekeeper bin/cagectl bin/AiofCage-*.dmg bin/AiofCage-*.dmg.sha256 $(GATEKEEPER_LINUX) $(CONNECTOR_LINUX)
 	rm -rf "$(APP)"
