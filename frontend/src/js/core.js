@@ -60,7 +60,7 @@ export const REASONS = {
   credential_missing: "缺少占位符密钥", credential_mismatch: "密钥请求头格式不符", connection_header_denied: "可疑的 Connection 请求头",
   target_mismatch: "请求目标与隧道不一致", plain_http_denied: "禁止明文 HTTP", port_denied: "只允许 443 端口",
   ip_literal_denied: "禁止直接访问 IP 地址", body_too_large: "请求体过大", redirect_denied: "跳转目标不在允许范围内，已拦截",
-  credential_not_allowed: "开发环境只允许匿名下载，请求自带了凭据",
+  credential_not_allowed: "开发环境只允许匿名下载，请求自带了凭据", trailer_denied: "请求带了 trailer（正文后附加的请求头）",
   request_quota_exceeded: "已达到请求次数上限", token_quota_exceeded: "已达到 token 上限",
   request_quota_80: "请求次数已用到 80%", token_quota_80: "token 已用到 80%",
   upstream_failed: "连不上上游服务", destination_denied: "目标不是公网地址", upstream_status: "上游返回了错误",

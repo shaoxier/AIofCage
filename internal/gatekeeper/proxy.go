@@ -26,7 +26,6 @@ import (
 const (
 	maxRequestBody     = 32 << 20
 	maxErrorBody       = 64 << 10
-	generatedHeader    = "X-Aiofcage-Generated"
 	warnRatioNumerator = 4 // warn at 4/5 = 80% of a limit
 	warnRatioDivisor   = 5
 )
@@ -85,7 +84,9 @@ type requestState struct {
 	secret                     string
 	version                    uint64
 	generated                  bool
-	bodyIn                     *countingReader
+	// transportFailure is the reason when the gatekeeper answered for an unreachable upstream.
+	transportFailure string
+	bodyIn           *countingReader
 }
 
 func NewGate() (*Gate, error) {
@@ -126,8 +127,10 @@ func NewGate() (*Gate, error) {
 			if errors.Is(err, errDestinationDenied) {
 				reason = "destination_denied"
 			}
+			if state, ok := ctx.UserData.(*requestState); ok {
+				state.transportFailure = reason
+			}
 			resp = textResponse(req, http.StatusBadGateway, reason)
-			resp.Header.Set(generatedHeader, reason)
 		}
 		return resp, nil
 	})
@@ -256,6 +259,11 @@ func (g *Gate) request(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request,
 			}
 		}
 	}
+	if len(req.Trailer) > 0 || len(req.Header.Values("Trailer")) > 0 {
+		// Trailers arrive after the body, past the credential checks, and are forwarded upstream.
+		return deny(http.StatusForbidden, "trailer_denied")
+	}
+	dropOwnHeaders(req.Header)
 	decision := active.config.Policy.Evaluate(policy.Request{Host: state.target.host, Port: policy.DefaultPort,
 		Method: req.Method, Path: requestPath})
 	event.RuleID = decision.RuleID
@@ -446,12 +454,13 @@ func (g *Gate) response(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Respon
 		g.finish(state, event)
 		return textResponse(ctx.Req, http.StatusBadGateway, "upstream_failed")
 	}
-	if reason := resp.Header.Get(generatedHeader); reason != "" {
-		resp.Header.Del(generatedHeader)
-		event.Decision, event.ReasonCode, event.Status = audit.DecisionError, reason, resp.StatusCode
+	if state.transportFailure != "" {
+		event.Decision, event.ReasonCode, event.Status = audit.DecisionError, state.transportFailure, resp.StatusCode
 		g.finish(state, event)
 		return resp
 	}
+	// X-Aiofcage-* headers reaching the agent always come from the gatekeeper itself.
+	dropOwnHeaders(resp.Header)
 	event.Status = resp.StatusCode
 	event.Decision = audit.DecisionAllow
 	if state.secretID != "" {
@@ -460,17 +469,17 @@ func (g *Gate) response(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Respon
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 && resp.StatusCode != http.StatusNotModified {
 		// The gatekeeper never follows a redirect. It passes one on only when it cannot carry a
 		// credential and leads where the sandbox may go anyway. Otherwise the Location never
-		// reaches the agent; the log records the target host, and the refusal names it only for
-		// requests without an injected credential, whose redirect cannot carry a derived token.
+		// reaches the agent. The log and the refusal name the target host only for requests without
+		// an injected credential, whose redirect cannot carry the credential or a derived token.
 		target, ok := redirectTarget(active, state, resp)
+		if state.secretID != "" {
+			target = "" // the upstream could spell the credential into a host name
+		}
 		event.RedirectHost = target
 		if !ok {
 			resp.Body.Close()
 			event.Decision, event.ReasonCode, event.Status = audit.DecisionDeny, "redirect_denied", http.StatusForbidden
 			recorded := g.finish(state, event)
-			if state.secretID != "" {
-				target = ""
-			}
 			return blocked(ctx.Req, http.StatusForbidden, "redirect_denied", target, recorded.Sequence)
 		}
 	}

@@ -33,6 +33,7 @@ var blockedText = map[string][2]string{
 	"credential_missing":       {"请求缺少这个沙箱的占位凭据", "the request lacks this sandbox's placeholder credential"},
 	"credential_mismatch":      {"请求的凭据请求头格式不对", "the credential header is malformed"},
 	"connection_header_denied": {"请求带了不允许的 Connection 请求头", "the Connection header is not allowed"},
+	"trailer_denied":           {"请求带了 trailer（正文之后再附加的请求头），沙箱不接受", "requests with trailers are not accepted"},
 	"body_too_large":           {"请求体太大", "the request body is too large"},
 	"request_quota_exceeded":   {"这个沙箱已经用完了请求次数上限", "this sandbox has used up its request limit"},
 	"token_quota_exceeded":     {"这个沙箱已经用完了 token 上限", "this sandbox has used up its token limit"},
@@ -92,7 +93,7 @@ func blocked(req *http.Request, status int, reason, host string, event uint64) *
 var scopedPackage = regexp.MustCompile(`^/@[a-z0-9~][a-z0-9._~-]*%2[fF][a-z0-9~][a-z0-9._~-]*(/[^%]*)?$`)
 
 // policyPath returns the path the policy evaluates, or false when the request path could be read
-// in more than one way. The literal characters ! ( ) * ' are accepted (Go module paths use "!"
+// in more than one way. The literal characters ! ( ) * ' [ ] are accepted (Go module paths use "!"
 // for capitals; Go marks such paths as raw, but the bytes sent upstream stay as written). Two
 // percent-encodings are accepted, evaluated decoded: an encoded "@" anywhere (npm mirrors write
 // scopes as %40types), which cannot change how the path splits, and the slash of a scoped npm
@@ -131,6 +132,16 @@ func redirectTarget(active *compiled, state *requestState, resp *http.Response) 
 	}
 	decision := active.config.Policy.Evaluate(policy.Request{Host: host, Port: policy.DefaultPort, Method: http.MethodGet, Path: path})
 	return host, decision.Allowed && decision.SecretRef == ""
+}
+
+// dropOwnHeaders removes X-Aiofcage-* headers, which only the gatekeeper may set: an agent or an
+// upstream could otherwise make an answer look like the gatekeeper's own.
+func dropOwnHeaders(header http.Header) {
+	for name := range header {
+		if strings.HasPrefix(strings.ToLower(name), "x-aiofcage-") {
+			delete(header, name)
+		}
+	}
 }
 
 // carriesCredential reports whether a request brings its own credential.

