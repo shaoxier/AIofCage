@@ -143,13 +143,24 @@ func TestMCPConfigUsesPlaceholdersOnly(t *testing.T) {
 	}
 }
 
+// noContainers is a docker command that answers like Docker for a sandbox that was never created.
+func noContainers(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "docker")
+	script := "#!/bin/sh\necho \"Error response from daemon: No such container: x\" >&2\nexit 1\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 // SetMCP once deadlocked: it read the store inside the store's own update callback.
 func TestSetMCPUpdatesStoppedSandbox(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := &Manager{store: st, docker: runner{path: "/usr/bin/false"}, gates: map[string]*gateClient{}, locks: map[string]*sync.Mutex{}}
+	m := &Manager{store: st, docker: runner{path: noContainers(t)}, gates: map[string]*gateClient{}, locks: map[string]*sync.Mutex{}}
 	github := mcp.Service{ID: "github", Name: "GitHub", URL: "https://api.githubcopilot.com/mcp/", KeyRef: mcp.KeyRefFor("github")}
 	if err := st.SaveMCPService(github); err != nil {
 		t.Fatal(err)

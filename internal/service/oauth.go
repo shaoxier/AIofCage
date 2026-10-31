@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -107,7 +108,8 @@ func (a *App) DisconnectMCPService(id string) (MCPServiceView, error) {
 	return view, a.refreshSandboxesUsing(ctx, service.ID)
 }
 
-// refreshSandboxesUsing re-delivers configuration to running sandboxes that use a service.
+// refreshSandboxesUsing re-delivers configuration to running sandboxes that use a service. One
+// failure does not stop the others: a revoked login must reach every gatekeeper that holds it.
 func (a *App) refreshSandboxesUsing(ctx context.Context, serviceID string) error {
 	if a.manager == nil {
 		return nil
@@ -116,16 +118,15 @@ func (a *App) refreshSandboxesUsing(ctx context.Context, serviceID string) error
 	if err != nil {
 		return err
 	}
+	var errs []error
 	for _, sbx := range sandboxes {
-		for _, id := range sbx.MCP {
-			if id == serviceID {
-				if err := a.manager.Refresh(ctx, sbx.ID); err != nil {
-					return fmt.Errorf("已保存，但更新运行中的沙箱「%s」失败：%w", sbx.Name, err)
-				}
+		if slices.Contains(sbx.MCP, serviceID) {
+			if err := a.manager.Refresh(ctx, sbx.ID); err != nil {
+				errs = append(errs, fmt.Errorf("已保存，但更新运行中的沙箱「%s」失败：%w", sbx.Name, err))
 			}
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // refreshOAuth renews access tokens that running sandboxes will need soon and hands the new ones

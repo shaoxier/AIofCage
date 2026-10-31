@@ -364,9 +364,16 @@ type State struct {
 }
 
 func (m *Manager) Status(ctx context.Context, id string) State {
+	state, _ := m.state(ctx, id)
+	return state
+}
+
+// state is Status with an error when Docker could not say whether a container runs: such a
+// sandbox may be running and must not be treated as stopped.
+func (m *Manager) state(ctx context.Context, id string) (State, error) {
 	n := names(id)
-	gate := m.container(ctx, n.gate)
-	agent := m.container(ctx, n.agent)
+	gate, gateErr := m.inspect(ctx, n.gate)
+	agent, agentErr := m.inspect(ctx, n.agent)
 	state := State{GateRunning: gate.running, AgentRunning: agent.running}
 	switch {
 	case !gate.exists && !agent.exists:
@@ -378,7 +385,10 @@ func (m *Manager) Status(ctx context.Context, id string) State {
 	default:
 		state.State = statePartial
 	}
-	return state
+	if gateErr != nil {
+		return state, gateErr
+	}
+	return state, agentErr
 }
 
 type containerInfo struct {
@@ -387,20 +397,30 @@ type containerInfo struct {
 }
 
 func (m *Manager) container(ctx context.Context, name string) containerInfo {
+	info, _ := m.inspect(ctx, name)
+	return info
+}
+
+// inspect reads a container's state. A container that does not exist is not an error; Docker
+// failing to answer is.
+func (m *Manager) inspect(ctx context.Context, name string) (containerInfo, error) {
 	out, err := m.docker.run(ctx, 15*time.Second, nil, "container", "inspect", "--format",
 		`{{.State.Running}} {{.Config.Image}} {{index .Config.Labels "`+specLabel+`"}}`, name)
 	if err != nil {
-		return containerInfo{}
+		if strings.Contains(err.Error(), "No such container") || strings.Contains(err.Error(), "No such object") {
+			return containerInfo{}, nil
+		}
+		return containerInfo{}, err
 	}
 	fields := strings.Fields(string(out))
 	if len(fields) < 2 {
-		return containerInfo{}
+		return containerInfo{}, errors.New("docker container inspect 的输出无法识别")
 	}
 	info := containerInfo{exists: true, running: fields[0] == "true", image: fields[1]}
 	if len(fields) > 2 {
 		info.spec = fields[2]
 	}
-	return info
+	return info, nil
 }
 
 func (m *Manager) providersFor(sbx sandbox.Sandbox) (map[string]provider.Provider, error) {
@@ -922,39 +942,91 @@ func (m *Manager) CaptureApplied(ctx context.Context, id string) error {
 	return m.captureApplied(ctx, id)
 }
 
+// refresh delivers the stored settings to a running sandbox. Callers save the settings first, so
+// when the gatekeeper does not take them it may hold a wider configuration than the stored one (a
+// closed source, a revoked tool, a disconnected login); the sandbox is then taken offline.
 func (m *Manager) refresh(ctx context.Context, sbx sandbox.Sandbox) error {
-	if m.Status(ctx, sbx.ID).State != stateRunning {
+	state, err := m.state(ctx, sbx.ID)
+	if (err == nil && state.State != stateRunning) || (err != nil && m.vmStopped(ctx)) {
 		return nil
 	}
+	if err == nil {
+		var applied bool
+		if applied, err = m.deliver(ctx, sbx); err == nil || applied {
+			return err
+		}
+	}
+	return m.closeGate(ctx, sbx, err)
+}
+
+// vmStopped reports whether the dedicated VM is known not to run, so no container of it can.
+func (m *Manager) vmStopped(ctx context.Context) bool {
+	if m.env == nil {
+		return false
+	}
+	vm, err := m.env.vm(ctx)
+	return err == nil && (vm == nil || vm.Status != "Running")
+}
+
+// deliver pushes the settings to the gatekeeper, then to the agent; applied reports whether the
+// gatekeeper took the new configuration.
+func (m *Manager) deliver(ctx context.Context, sbx sandbox.Sandbox) (bool, error) {
 	if sbx.AppliedProviders != nil {
 		sbx.Bindings = sbx.AppliedBindings
 	}
 	providers, err := m.providersFor(sbx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if sbx.AppliedProviders != nil {
 		providers = sbx.AppliedProviders
 	}
 	client, err := m.client(ctx, sbx.ID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	services, err := m.servicesFor(sbx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if sbx, err = m.prepareRemote(ctx, sbx, services); err != nil {
-		return err
+		return false, err
 	}
 	routes, err := m.syncConnectors(ctx, sbx, services)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := m.configure(ctx, client, sbx, providers, routes); err != nil {
-		return err
+		return false, err
 	}
-	return m.writeAgentFiles(ctx, client, sbx, providers)
+	return true, m.writeAgentFiles(ctx, client, sbx, providers)
+}
+
+// closeGate takes a sandbox offline after its gatekeeper missed new settings: it clears the
+// gatekeeper's policy, or stops the gatekeeper when it cannot be reached. A later successful
+// refresh, or a restart, brings the sandbox back with the stored settings. It does not share the
+// caller's deadline, which may be what made the delivery fail.
+func (m *Manager) closeGate(ctx context.Context, sbx sandbox.Sandbox, cause error) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	defer cancel()
+	failed := fmt.Sprintf("新设置没能下发给沙箱「%s」的门卫（%v）。", sbx.Name, cause)
+	client, err := m.client(ctx, sbx.ID)
+	if err == nil {
+		err = client.putConfig(ctx, emptyConfig(sbx))
+	}
+	if err == nil {
+		return errors.New(failed + "为安全起见，已暂停这个沙箱的全部网络访问，重试成功或重启沙箱后恢复")
+	}
+	if _, err := m.docker.run(ctx, 30*time.Second, nil, "stop", "--time", "5", names(sbx.ID).gate); err == nil {
+		return errors.New(failed + "为安全起见，已停止它的门卫，沙箱暂时不能联网，请重启沙箱")
+	}
+	return errors.New(failed + "也没能暂停它的网络；如果这个沙箱正在运行，请立即停止它")
+}
+
+// emptyConfig is an empty policy: the gatekeeper refuses every request and keeps no secret or
+// connector in memory.
+func emptyConfig(sbx sandbox.Sandbox) gatekeeper.Config {
+	return gatekeeper.Config{Policy: policy.Snapshot{Version: uint64(time.Now().UnixMilli()), SessionID: sbx.ID}}
 }
 
 // Stop saves cumulative usage so quotas survive restarts, revokes the live gatekeeper policy,
@@ -990,8 +1062,7 @@ func (m *Manager) revokeRuntime(ctx context.Context, sbx sandbox.Sandbox) error 
 	var errs []error
 	client, err := m.client(ctx, sbx.ID)
 	if err == nil {
-		config := gatekeeper.Config{Policy: policy.Snapshot{Version: uint64(time.Now().UnixMilli()), SessionID: sbx.ID}}
-		if err := client.putConfig(ctx, config); err != nil {
+		if err := client.putConfig(ctx, emptyConfig(sbx)); err != nil {
 			errs = append(errs, fmt.Errorf("清空沙箱「%s」的门卫授权失败：%w", sbx.Name, err))
 		}
 	} else if m.Status(ctx, sbx.ID).State == stateRunning {
