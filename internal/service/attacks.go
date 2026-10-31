@@ -74,11 +74,24 @@ func (a *App) RunIsolationChecks(id string) ([]AttackResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	a.securityMu.Lock()
+	if a.isolationBusy[id] {
+		a.securityMu.Unlock()
+		return nil, errors.New("这个沙箱正在进行隔离检查，请等它完成")
+	}
+	if a.isolationBusy == nil {
+		a.isolationBusy = map[string]bool{}
+	}
+	a.isolationBusy[id] = true
+	a.securityMu.Unlock()
+	defer func() { a.securityMu.Lock(); delete(a.isolationBusy, id); a.securityMu.Unlock() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	if a.manager.Status(ctx, id).State != "running" {
 		return nil, errors.New("请先启动沙箱")
 	}
+	// Helpers an interrupted check left behind would only get in the way.
+	a.manager.RemoveProbes(ctx, id)
 	secrets, _ := a.realSecrets(ctx, sbx)
 	started := a.now()
 	defer func() { a.demos.add(id, demoRun{Start: started, End: a.now()}) }()
@@ -222,17 +235,33 @@ def connect(host,port):
     finally:
         s.close()
 
-# strict: any answer the gatekeeper did not give means the request got past it.
-def curl_check(url,headers,expected,strict=False):
+def curl(url,headers=()):
     args=["curl","--silent","--show-error","--max-time","12","--dump-header","-","--output","/dev/null","--request","POST","--data","aiofcage-isolation-probe"]
     for h in headers: args.extend(["--header",h])
     p=subprocess.run(args+[url],capture_output=True,text=True,timeout=15)
     codes=re.findall(r"(?im)^HTTP/[^ ]+ ([0-9]{3})(?![^\r\n]*Connection established)",p.stdout)
     reasons=re.findall(r"(?im)^x-aiofcage-reason: *([^\r\n]+)",p.stdout)
-    denied="403" in codes and (expected in reasons if expected else bool(reasons))
-    reached=codes and (200<=int(codes[-1])<400 or strict and not reasons)
-    status="passed" if denied else "problem" if reached else "inconclusive"
-    result(status,"HTTP "+(" / ".join(codes) or "无响应")+"；代理原因："+(" / ".join(reasons) or "未取得")+"；curl 退出码 "+str(p.returncode),"仅验证本次请求和返回原因。网络错误、超时或其他拒绝原因不判通过。")
+    return codes,reasons,p.returncode
+
+def curl_check(url,headers,expected):
+    codes,reasons,code=curl(url,headers)
+    status="passed" if "403" in codes and expected in reasons else "problem" if codes and 200<=int(codes[-1])<400 else "inconclusive"
+    result(status,"HTTP "+(" / ".join(codes) or "无响应")+"；代理原因："+(" / ".join(reasons) or "未取得")+"；curl 退出码 "+str(code),"仅验证本次请求和返回原因。网络错误、超时或其他拒绝原因不判通过。")
+
+# Denials the gatekeeper gives before anything is sent to the service.
+BEFORE_UPSTREAM={"default_deny","rule_denied","port_denied","plain_http_denied","target_mismatch"}
+
+def direct_check(urls):
+    rows=[];statuses=[]
+    for url in urls:
+        codes,reasons,code=curl(url)
+        if "403" in codes and reasons and set(reasons)<=BEFORE_UPSTREAM: status="passed"
+        elif codes and (not reasons or set(reasons)&{"redirect_denied","upstream_failed","upstream_status"} or 200<=int(codes[-1])<400): status="problem"
+        else: status="inconclusive"
+        statuses.append(status)
+        rows.append(re.sub(r"^https?://([^/:]+).*$",r"\1",url)+"：HTTP "+(" / ".join(codes) or "无响应")+"，代理原因 "+(" / ".join(reasons) or "未取得"))
+    status="problem" if "problem" in statuses else "passed" if statuses and all(s=="passed" for s in statuses) else "inconclusive"
+    result(status,"；".join(rows),"不带任何凭据，经代理直接请求每个远程 MCP 服务。只有门卫在请求发出前就拒绝才算通过；请求到过服务（包括服务返回 401 或跳转）就是发现问题。")
 `
 
 func (a *App) runAttack(ctx context.Context, sbx sandbox.Sandbox, check Attack) AttackResult {
@@ -274,12 +303,12 @@ result(status,"；".join(host+":443 "+value for host,value in observations),"soc
 	case "project-boundary":
 		return a.checkProjectBoundary(ctx, sbx, check, a.inAgent(sbx))
 	case "remote-mcp-direct":
-		url := a.remoteMCPAddress(sbx)
-		if url == "" {
+		urls := a.remoteMCPAddresses(sbx)
+		if len(urls) == 0 {
 			return AttackResult{Attack: check, Status: checkSkipped, Note: "没有启用远程 MCP 服务。"}
 		}
-		target, _ := json.Marshal(url)
-		script = "curl_check(" + string(target) + `,["Authorization: Bearer aiofcage-test-foreign-credential"],None,strict=True)`
+		targets, _ := json.Marshal(urls)
+		script = "direct_check(" + string(targets) + ")"
 	case "db-direct":
 		address := a.databaseAddress(sbx)
 		if address == "" {
@@ -293,7 +322,7 @@ result(status,"；".join(host+":443 "+value for host,value in observations),"soc
 		// a connection from there also shows the database is up.
 		reach := "没有取得"
 		if out, err := a.manager.RunProbe(ctx, sbx.ID, runtime.Probe{Network: runtime.ProbeEgress,
-			Command: []string{"python3", "-c", dbControlPython, host, port}}); err == nil {
+			Command: pythonCommand(dbControlPython, host, port)}); err == nil {
 			var control struct{ IP, Reach string }
 			if json.Unmarshal(bytes.TrimSpace(out), &control) == nil {
 				reach = control.Reach
@@ -315,7 +344,7 @@ result("problem" if found or observed=="connected" else "passed" if observed=="b
 		return AttackResult{Attack: check, Status: checkSkipped, Note: "未支持的检查项。"}
 	}
 	var out bytes.Buffer
-	err := a.manager.Exec(ctx, sbx.ID, false, nil, &out, &out, "python3", "-c", checkPython+"\n"+script)
+	err := a.manager.Exec(ctx, sbx.ID, false, nil, &out, &out, pythonCommand(checkPython+"\n"+script)...)
 	return classifyCheck(check, out.Bytes(), err)
 }
 
@@ -330,19 +359,20 @@ except OSError as e: reach=type(e).__name__
 print(json.dumps(dict(ip=ip,reach=reach),ensure_ascii=False))
 `
 
-// remoteMCPAddress returns the upstream address of the sandbox's first remote MCP service: the agent
-// reaches it only through the gatekeeper's MCP gateway, never through the proxy.
-func (a *App) remoteMCPAddress(sbx sandbox.Sandbox) string {
+// remoteMCPAddresses returns the upstream addresses of the sandbox's remote MCP services: the agent
+// reaches them only through the gatekeeper's MCP gateway, never through the proxy.
+func (a *App) remoteMCPAddresses(sbx sandbox.Sandbox) []string {
+	var urls []string
 	for _, id := range sbx.MCP {
 		service, err := a.store.MCPService(id)
 		if err != nil || service.IsConnector() || service.IsBuiltin() {
 			continue
 		}
 		if url, err := service.Upstream(); err == nil {
-			return url
+			urls = append(urls, url)
 		}
 	}
-	return ""
+	return urls
 }
 
 // databaseAddress returns where the sandbox's first database service is reached from the VM.

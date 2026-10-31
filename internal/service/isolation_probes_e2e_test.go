@@ -18,7 +18,7 @@ func TestIsolationChecksCatchBrokenSandboxes(t *testing.T) {
 	defer cancel()
 	runIn := func(probe runtime.Probe) probeRunner {
 		return func(ctx context.Context, script string, args ...string) ([]byte, error) {
-			probe.Command = append([]string{"python3", "-c", script}, args...)
+			probe.Command = pythonCommand(script, args...)
 			return app.manager.RunProbe(ctx, sbx.ID, probe)
 		}
 	}
@@ -42,6 +42,11 @@ func TestIsolationChecksCatchBrokenSandboxes(t *testing.T) {
 		{"Docker socket mounted", func(c Attack, r probeRunner) AttackResult { return app.checkDockerSocket(ctx, sbx, c, r) }, withSocket},
 		{"whole workspace shared", func(c Attack, r probeRunner) AttackResult { return app.checkProjectBoundary(ctx, sbx, c, r) },
 			runIn(runtime.Probe{Network: runtime.ProbeNone, Mounts: []string{"type=bind,src=" + workspace + ",dst=" + workspace + ",readonly"}})},
+		{"workspace mounted as the project", func(c Attack, r probeRunner) AttackResult { return app.checkProjectBoundary(ctx, sbx, c, r) },
+			runIn(runtime.Probe{Network: runtime.ProbeNone, Mounts: []string{"type=bind,src=" + workspace + ",dst=" + sbx.ProjectPath + ",readonly"}})},
+		{"workspace mounted elsewhere too", func(c Attack, r probeRunner) AttackResult { return app.checkProjectBoundary(ctx, sbx, c, r) },
+			runIn(runtime.Probe{Network: runtime.ProbeNone, Mounts: []string{"type=bind,src=" + sbx.ProjectPath + ",dst=" + sbx.ProjectPath + ",readonly",
+				"type=bind,src=" + workspace + ",dst=/workspace,readonly"}})},
 	} {
 		got := settle(tt.check(Attack{ID: tt.name}, tt.agent))
 		t.Logf("%s: %s %s", tt.name, got.Status, got.Evidence)

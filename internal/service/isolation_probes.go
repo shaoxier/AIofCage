@@ -19,13 +19,22 @@ import (
 )
 
 // The checks below compare what the agent can do with helper containers that must see the same
-// thing (positive samples). Helpers run the agent's image with the agent's restrictions and are
-// removed afterwards; they never get the project, the home volume or the VM's Docker socket.
+// thing (positive samples). Helpers run the agent's image with its restrictions and are removed
+// afterwards; they never get the project, the home volume or the VM's Docker socket. Helpers on the
+// egress network do have direct internet access, so they only ever run Python's standard library
+// (see pythonCommand), never the agents installed in the image.
 
 func probeNonce() string {
 	var raw [6]byte
 	rand.Read(raw[:])
 	return hex.EncodeToString(raw[:])
+}
+
+// pythonCommand runs a check script with Python isolated from its surroundings: no PYTHON*
+// variables, no site packages or sitecustomize, and neither the working directory nor the script's
+// directory on the import path (a project could hold its own json.py).
+func pythonCommand(script string, args ...string) []string {
+	return append([]string{"python3", "-I", "-S", "-c", script}, args...)
 }
 
 // waitForProbe waits until a background probe printed marker, e.g. that it is listening.
@@ -50,7 +59,7 @@ type probeRunner func(ctx context.Context, script string, args ...string) ([]byt
 func (a *App) inAgent(sbx sandbox.Sandbox) probeRunner {
 	return func(ctx context.Context, script string, args ...string) ([]byte, error) {
 		var out bytes.Buffer
-		err := a.manager.Exec(ctx, sbx.ID, false, nil, &out, &out, append([]string{"python3", "-c", script}, args...)...)
+		err := a.manager.Exec(ctx, sbx.ID, false, nil, &out, &out, pythonCommand(script, args...)...)
 		return out.Bytes(), err
 	}
 }
@@ -58,19 +67,26 @@ func (a *App) inAgent(sbx sandbox.Sandbox) probeRunner {
 // ---- DNS ----
 
 // dnsCanaryPython answers every query with NXDOMAIN and prints the names that carry this run's
-// nonce. It also tells whether the VM resolves public names, so a failed lookup in the agent means
-// something.
-const dnsCanaryPython = `import socket,sys,json,threading
+// nonce. Before it listens it says whether the VM resolves a public name: only then does a failed
+// lookup in the agent mean anything. It quits after two minutes, in case nobody removes it.
+const dnsCanaryPython = `import socket,sys,json,threading,time
 nonce=sys.argv[1]
-def say(**value): print(json.dumps(value),flush=True)
+lock=threading.Lock()
+def say(**value):
+    with lock:
+        sys.stdout.write(json.dumps(value)+"\n");sys.stdout.flush()
+found=[]
 def public():
-    try: socket.getaddrinfo("example.com",443);say(vm_resolves=True)
-    except OSError: say(vm_resolves=False)
-s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("0.0.0.0",53))
+    try: socket.getaddrinfo("example.com",443);found.append(True)
+    except OSError: pass
+lookup=threading.Thread(target=public,daemon=True);lookup.start();lookup.join(5)
+say(vm_resolves=bool(found))
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("0.0.0.0",53));s.settimeout(1)
 say(ready=True)
-threading.Thread(target=public,daemon=True).start()
-while True:
-    data,addr=s.recvfrom(512)
+end=time.monotonic()+120
+while time.monotonic()<end:
+    try: data,addr=s.recvfrom(512)
+    except socket.timeout: continue
     labels=[];i=12
     while i<len(data) and data[i] and len(labels)<16:
         n=data[i];labels.append(data[i+1:i+1+n].decode("ascii","replace"));i+=1+n
@@ -80,7 +96,8 @@ while True:
 `
 
 // dnsClientPython sends queries named <role>-<path>-<nonce>.aiofcage.invalid. The agent also tries
-// public resolvers, TCP 53, DoT and IPv6, and resolves a real public name.
+// public resolvers, TCP 53, DoT and IPv6, DNS on its network's gateway and on the gatekeeper, and
+// resolves a real public name.
 const dnsClientPython = `import socket,sys,json,errno,time
 role,nonce,canary=sys.argv[1:4]
 LOCAL={errno.ENETUNREACH,errno.EHOSTUNREACH,errno.EACCES,errno.EPERM,errno.EADDRNOTAVAIL,errno.EAFNOSUPPORT}
@@ -96,7 +113,8 @@ def udp(name,server,family=socket.AF_INET,tries=1):
         if attempt: time.sleep(1)
         try:
             with socket.socket(family,socket.SOCK_DGRAM) as s:
-                s.settimeout(2);s.sendto(packet(name),(server,53));s.recvfrom(512)
+                # Connected, so a closed port comes back as ECONNREFUSED instead of a timeout.
+                s.settimeout(2);s.connect((server,53));s.send(packet(name));s.recv(512)
             return "answered"
         except OSError as e: result=failure(e)
     return result
@@ -109,12 +127,23 @@ def tcp(host,port,family=socket.AF_INET):
 def resolve(name):
     try: socket.getaddrinfo(name,443);return "resolved"
     except OSError: return "failed"
+def gateway():
+    for row in open("/proc/net/route").read().splitlines()[1:]:
+        cols=row.split()
+        if len(cols)>7 and cols[1]!="00000000":
+            # Little-endian hex; Docker gives the gateway the first address of the subnet.
+            return socket.inet_ntoa(((int(cols[1],16)&int(cols[7],16))|0x01000000).to_bytes(4,"little"))
+    return ""
 def label(path): return role+"-"+path+"-"+nonce+".aiofcage.invalid"
 out={"direct":udp(label("direct"),canary,tries=5 if role=="control" else 1),"embedded":resolve(label("embedded"))}
 if role=="agent":
     out.update({"udp-223.5.5.5":udp(label("ali"),"223.5.5.5"),"udp-8.8.8.8":udp(label("google"),"8.8.8.8"),
         "tcp-53":tcp("223.5.5.5",53),"tcp-853":tcp("223.5.5.5",853),
         "udp-ipv6":udp(label("v6"),"2400:3200::1",socket.AF_INET6),"public-name":resolve("example.com")})
+    try: keeper=socket.gethostbyname("gatekeeper")
+    except OSError: keeper=""
+    for name,host in (("gateway",gateway()),("gatekeeper",keeper)):
+        if host: out.update({"udp-"+name:udp(label(name),host),"tcp-"+name:tcp(host,53)})
 print(json.dumps(out))
 `
 
@@ -126,12 +155,19 @@ type dnsRun struct {
 	Negative []byte // an internal-side helper whose resolver is the canary
 	Agent    []byte
 	Err      error // the first failure running a helper
+	// What Docker says about the agent container: the isolation relies on the internal network only
+	// and on 127.0.0.1 as the upstream of Docker's resolver, where nothing answers.
+	Internal   string
+	Networks   []string
+	DNSServers []string
+	ConfigErr  error
 }
 
 func (a *App) checkDNS(ctx context.Context, sbx sandbox.Sandbox, check Attack, agent probeRunner) AttackResult {
-	run := dnsRun{Nonce: probeNonce()}
+	run := dnsRun{Nonce: probeNonce(), Internal: runtime.InternalNetwork(sbx.ID)}
+	run.Networks, run.DNSServers, run.ConfigErr = a.manager.AgentNetwork(ctx, sbx.ID)
 	canary, ip, err := a.manager.StartProbe(ctx, sbx.ID, runtime.Probe{Network: runtime.ProbeEgress,
-		Command: []string{"python3", "-u", "-c", dnsCanaryPython, run.Nonce}})
+		Command: pythonCommand(dnsCanaryPython, run.Nonce)})
 	if err != nil {
 		return classifyCheck(check, nil, err)
 	}
@@ -139,7 +175,7 @@ func (a *App) checkDNS(ctx context.Context, sbx sandbox.Sandbox, check Attack, a
 	if !a.waitForProbe(ctx, canary, `"ready"`) {
 		return classifyCheck(check, nil, errors.New("DNS 金丝雀没有启动"))
 	}
-	client := func(role string) []string { return []string{"python3", "-c", dnsClientPython, role, run.Nonce, ip} }
+	client := func(role string) []string { return pythonCommand(dnsClientPython, role, run.Nonce, ip) }
 	var errs []error
 	run.Control, err = a.manager.RunProbe(ctx, sbx.ID, runtime.Probe{Network: runtime.ProbeEgress, DNS: ip, Command: client("control")})
 	errs = append(errs, err)
@@ -158,7 +194,7 @@ func (a *App) checkDNS(ctx context.Context, sbx sandbox.Sandbox, check Attack, a
 }
 
 var dnsWords = map[string]string{"blocked": "本地拒绝", "timeout": "超时", "answered": "有应答", "connected": "已连接",
-	"resolved": "解析成功", "failed": "解析失败"}
+	"resolved": "解析成功", "failed": "解析失败", "ECONNREFUSED": "拒绝连接"}
 
 func dnsWord(value string) string {
 	if word, ok := dnsWords[value]; ok {
@@ -172,9 +208,9 @@ func dnsWord(value string) string {
 
 func judgeDNS(check Attack, run dnsRun) AttackResult {
 	r := AttackResult{Attack: check, Status: checkInconclusive,
-		Note: "金丝雀是临时放在出网网络上的 DNS 服务，代表“虚拟机以外”。只发送 aiofcage.invalid 下的随机测试名，另外解析一次 example.com；未覆盖 DNS 以外的隧道（例如经允许的 HTTPS 域名）。"}
+		Note: "金丝雀是临时放在出网网络上的 DNS 服务，代表“虚拟机以外”：它能看到直接发出的查询，以及 Docker 内嵌 DNS 转发出去的查询。Agent 自己的内嵌 DNS 只转发到它容器里的 127.0.0.1，这条路靠解析 example.com 判断，所以要求虚拟机本身能解析公网域名。只发送 aiofcage.invalid 下的随机测试名；未覆盖 DNS 以外的隧道（例如经允许的 HTTPS 域名）。"}
 	recorded := map[string]bool{}
-	vm := "未取得"
+	vmResolves := false
 	for _, line := range bytes.Split(run.Canary, []byte("\n")) {
 		var entry struct {
 			Name       string `json:"name"`
@@ -187,18 +223,36 @@ func judgeDNS(check Attack, run dnsRun) AttackResult {
 			recorded[entry.Name] = true
 		}
 		if entry.VMResolves != nil {
-			vm = map[bool]string{true: "能", false: "不能（Agent 解析不了公网域名不说明问题，只看金丝雀）"}[*entry.VMResolves]
+			vmResolves = *entry.VMResolves
 		}
 	}
 	seen := func(role, path string) bool { return recorded[role+"-"+path+"-"+run.Nonce+".aiofcage.invalid"] }
 	r.Controls = []CheckControl{
 		{Name: "出网侧对照容器直接发给金丝雀", OK: seen("control", "direct")},
 		{Name: "出网侧对照容器经 Docker 内嵌 DNS 转发给金丝雀", OK: seen("control", "embedded")},
+		{Name: "虚拟机本身能解析公网域名", OK: vmResolves},
 	}
 	var leaked []string
+	agentSeen, negativeSeen := 0, 0
 	for name := range recorded {
-		if strings.HasPrefix(name, "agent-") || strings.HasPrefix(name, "negative-") {
+		if strings.HasPrefix(name, "agent-") {
+			agentSeen++
 			leaked = append(leaked, "金丝雀收到了 "+name)
+		} else if strings.HasPrefix(name, "negative-") {
+			negativeSeen++
+			leaked = append(leaked, "金丝雀收到了 "+name)
+		}
+	}
+	slices.Sort(leaked)
+	settled := run.ConfigErr == nil
+	config := "Docker 设置：读取失败"
+	if run.ConfigErr == nil {
+		config = "Docker 设置：网络 " + strings.Join(run.Networks, "、") + "，DNS " + strings.Join(run.DNSServers, "、")
+		if !slices.Equal(run.Networks, []string{run.Internal}) {
+			leaked = append(leaked, "Agent 不只接在内部网络上")
+		}
+		if !slices.Equal(run.DNSServers, []string{"127.0.0.1"}) {
+			leaked = append(leaked, "Agent 的 DNS 上游不是 127.0.0.1")
 		}
 	}
 	parse := func(out []byte) map[string]string {
@@ -209,19 +263,39 @@ func judgeDNS(check Attack, run dnsRun) AttackResult {
 		return value
 	}
 	agent, negative := parse(run.Agent), parse(run.Negative)
-	public := []struct{ key, label string }{{"udp-223.5.5.5", "UDP 53 → 223.5.5.5"}, {"udp-8.8.8.8", "UDP 53 → 8.8.8.8"},
-		{"tcp-53", "TCP 53"}, {"tcp-853", "DoT 853"}, {"udp-ipv6", "IPv6 UDP 53"}}
-	settled := agent != nil && negative != nil
+	settled = settled && agent != nil && negative != nil
+	// Whatever answers is a leak, also when the canary did not see it.
+	answered := func(who string, value map[string]string) {
+		if value["direct"] == "answered" {
+			leaked = append(leaked, who+"直连金丝雀的地址有应答")
+		}
+		if value["embedded"] == "resolved" {
+			leaked = append(leaked, who+"解析到了测试域名")
+		}
+	}
 	var paths []string
 	if agent != nil {
+		answered("Agent ", agent)
 		paths = append(paths, "直连金丝雀 "+dnsWord(agent["direct"]), "内嵌 DNS "+dnsWord(agent["embedded"]))
-		for _, path := range public {
+		// Public resolvers must be refused by the kernel itself: a timeout may mean the query left.
+		for _, path := range []struct{ key, label string }{{"udp-223.5.5.5", "UDP 53 → 223.5.5.5"},
+			{"udp-8.8.8.8", "UDP 53 → 8.8.8.8"}, {"tcp-53", "TCP 53"}, {"tcp-853", "DoT 853"}, {"udp-ipv6", "IPv6 UDP 53"}} {
 			value := agent[path.key]
 			paths = append(paths, path.label+" "+dnsWord(value))
 			if value == "answered" || value == "connected" {
 				leaked = append(leaked, path.label+" "+dnsWord(value))
 			} else if value != "blocked" {
 				settled = false
+			}
+		}
+		// A resolver inside the VM could forward queries; nothing may answer there.
+		for _, path := range []struct{ key, label string }{{"udp-gateway", "网关 UDP 53"}, {"tcp-gateway", "网关 TCP 53"},
+			{"udp-gatekeeper", "门卫 UDP 53"}, {"tcp-gatekeeper", "门卫 TCP 53"}} {
+			if value, ok := agent[path.key]; ok {
+				paths = append(paths, path.label+" "+dnsWord(value))
+				if value == "answered" || value == "connected" {
+					leaked = append(leaked, path.label+" "+dnsWord(value))
+				}
 			}
 		}
 		paths = append(paths, "解析 example.com "+dnsWord(agent["public-name"]))
@@ -231,20 +305,15 @@ func judgeDNS(check Attack, run dnsRun) AttackResult {
 			settled = false
 		}
 	}
-	agentSeen, negativeSeen := 0, 0
-	for name := range recorded {
-		if strings.HasPrefix(name, "agent-") {
-			agentSeen++
-		} else if strings.HasPrefix(name, "negative-") {
-			negativeSeen++
-		}
+	if negative != nil {
+		answered("内部网络反例", negative)
 	}
 	lines := []string{fmt.Sprintf("金丝雀收到：Agent %d 条，内部网络反例 %d 条", agentSeen, negativeSeen),
 		"Agent：" + strings.Join(paths, "，")}
 	if negative != nil {
 		lines = append(lines, "反例（内部网络、DNS 指向金丝雀）：直连 "+dnsWord(negative["direct"])+"，内嵌 DNS "+dnsWord(negative["embedded"]))
 	}
-	lines = append(lines, "虚拟机解析公网域名："+vm)
+	lines = append(lines, config)
 	r.Evidence = strings.Join(lines, "\n")
 	switch {
 	case len(leaked) > 0:
@@ -273,19 +342,22 @@ def serve(path):
     threading.Thread(target=loop,daemon=True).start()
 `
 
-// dockerScanPython looks for a reachable container runtime: DOCKER_HOST, mounts and socket files
-// (pinging each with GET /_ping), and the Docker TCP ports on loopback, the gatekeeper and the
-// network's gateway. As the agent, it first starts its own fake API under /tmp, which it must find.
+// dockerScanPython looks for a reachable container runtime: DOCKER_HOST, mounts, socket files and
+// the Docker TCP ports on loopback, the gatekeeper and the network's gateway. It pings sockets that
+// are mounted in or named like a container runtime's, and leaves other programs' sockets alone. As
+// the agent it first starts its own fake API under /tmp, which it must find.
 const dockerScanPython = fakeDockerPython + `import stat,json,re,errno
 role,nonce,project=sys.argv[1:4]
 KNOWN=re.compile(r"(docker|containerd|podman|buildkit|crio|guestagent)[^/]*\.sock$")
+# Our own fakes, also those of another check running at the same time.
+FAKE=re.compile(r"^/tmp/aiofcage-probe-[0-9a-f]+/probe-api\.sock$")
 PATHS=["/var/run/docker.sock","/run/docker.sock","/run/containerd/containerd.sock","/run/podman/podman.sock",
     "/run/buildkit/buildkitd.sock","/run/lima-guestagent.sock",os.path.expanduser("~/.docker/run/docker.sock")]
 SKIP={"/proc","/sys","/dev","/usr",project}
 SKIP_NAMES={"node_modules",".npm",".cache",".git"}
-fake=""
+fake=folder=""
 if role=="agent":
-    folder="/tmp/aiofcage-probe-"+nonce;os.mkdir(folder,0o700);fake=folder+"/docker.sock";serve(fake)
+    folder="/tmp/aiofcage-probe-"+nonce;os.mkdir(folder,0o700);fake=folder+"/probe-api.sock";serve(fake)
 def ping(connect):
     try:
         with connect() as s:
@@ -320,36 +392,41 @@ for p in PATHS:
     try:
         if stat.S_ISSOCK(os.stat(p).st_mode): sockets.add(os.path.realpath(p))
     except OSError: pass
-findings=[];answers=0;control=""
+findings=[];answers=0;control="";mounted=set()
 for key in ("DOCKER_HOST","CONTAINER_HOST"):
     if os.environ.get(key): findings.append("环境变量 "+key)
 for line in open("/proc/self/mountinfo"):
     point=line.split()[4].replace("\\040"," ")
     try: is_socket=stat.S_ISSOCK(os.stat(point).st_mode)
     except OSError: is_socket=False
-    if (KNOWN.search(point) or is_socket) and point!=fake: findings.append("挂载 "+point)
-for path in sorted(sockets):
+    if is_socket: mounted.add(os.path.realpath(point))
+    if KNOWN.search(point) or is_socket: findings.append("挂载 "+point)
+others=0
+for path in sorted(sockets|mounted):
+    if path==fake: control=ping(unix(path));continue
+    if FAKE.match(path): continue
+    others+=1
+    if not (KNOWN.search(path) or path in mounted): continue
     answer=ping(unix(path))
-    if path==fake: control=answer;continue
     answers+=answer=="docker"
-    if answer=="docker" or KNOWN.search(path): findings.append("socket "+path+("（Docker 接口应答）" if answer=="docker" else ""))
-hosts={"127.0.0.1"}
-try: hosts.add(socket.gethostbyname("gatekeeper"))
+    findings.append("socket "+path+("（Docker 接口应答）" if answer=="docker" else ""))
+local=set()
+try: local.add(socket.gethostbyname("gatekeeper"))
 except OSError: pass
 for row in open("/proc/net/route").read().splitlines()[1:]:
     cols=row.split()
     if len(cols)>7 and cols[1]!="00000000":
-        # Little-endian hex of the address; Docker gives the gateway the first address of the subnet.
-        net=int(cols[1],16)&int(cols[7],16)
-        hosts.add(socket.inet_ntoa((net|0x01000000).to_bytes(4,"little")))
+        local.add(socket.inet_ntoa(((int(cols[1],16)&int(cols[7],16))|0x01000000).to_bytes(4,"little")))
 tcp={}
-for host in sorted(hosts):
+for host in ["127.0.0.1"]+sorted(local):
     for port in (2375,2376):
         tcp[host+":"+str(port)]=answer=ping(lambda: socket.create_connection((host,port),timeout=2))
         answers+=answer=="docker"
-        if answer=="docker": findings.append("TCP "+host+":"+str(port)+"（Docker 接口应答）")
+        # In its own container the agent may run anything on these ports; elsewhere nothing may listen.
+        if answer=="docker" or (answer=="other" and host!="127.0.0.1"):
+            findings.append("TCP "+host+":"+str(port)+("（Docker 接口应答）" if answer=="docker" else "（有服务在监听）"))
 if fake: os.unlink(fake);os.rmdir(folder)
-print(json.dumps(dict(findings=findings,answers=answers,control=control,sockets=len(sockets)-bool(fake),visited=visited,
+print(json.dumps(dict(findings=findings,answers=answers,control=control,sockets=others,visited=visited,
     truncated=truncated,tcp=tcp),ensure_ascii=False))
 `
 
@@ -367,7 +444,7 @@ func (a *App) checkDockerSocket(ctx context.Context, sbx sandbox.Sandbox, check 
 	mounted, mountedErr := a.withFakeDocker(ctx, sbx, func(path string) ([]byte, error) {
 		return a.manager.RunProbe(ctx, sbx.ID, runtime.Probe{Network: runtime.ProbeNone,
 			Mounts:  []string{"type=bind,src=" + path + ",dst=/var/run/docker.sock"},
-			Command: []string{"python3", "-c", dockerScanPython, "control", "", ""}})
+			Command: pythonCommand(dockerScanPython, "control", "", "")})
 	})
 	out, err := agent(ctx, dockerScanPython, "agent", probeNonce(), sbx.ProjectPath)
 	return judgeDockerSocket(check, mounted, mountedErr, out, err)
@@ -384,7 +461,7 @@ func (a *App) withFakeDocker(ctx context.Context, sbx sandbox.Sandbox, run func(
 	defer a.manager.RemoveProbeVolume(volume)
 	server, _, err := a.manager.StartProbe(ctx, sbx.ID, runtime.Probe{Network: runtime.ProbeNone, Root: true,
 		Mounts:  []string{"type=volume,src=" + volume + ",dst=/sock"},
-		Command: []string{"python3", "-u", "-c", fakeDockerPython + "serve('/sock/docker.sock');print('ready',flush=True);threading.Event().wait()"}})
+		Command: pythonCommand(fakeDockerPython + "serve('/sock/docker.sock');print('ready',flush=True);threading.Event().wait(120)")})
 	if err != nil {
 		return nil, err
 	}
@@ -397,7 +474,7 @@ func (a *App) withFakeDocker(ctx context.Context, sbx sandbox.Sandbox, run func(
 
 func judgeDockerSocket(check Attack, mounted []byte, mountedErr error, agentOut []byte, agentErr error) AttackResult {
 	r := AttackResult{Attack: check, Status: checkInconclusive,
-		Note: "查看环境变量、挂载、根目录下 5 层以内的 socket 文件（不进项目、/usr 和 node_modules 等目录），对每个 socket 和 2375/2376 端口发 GET /_ping。不检查容器逃逸。"}
+		Note: "查看环境变量、挂载、根目录下 5 层以内的 socket 文件（不进项目、/usr 和 node_modules 等目录），对挂进来的或名字像容器运行时的 socket 和 2375/2376 端口发 GET /_ping。不检查容器逃逸。"}
 	var control dockerScan
 	controlOK := mountedErr == nil && json.Unmarshal(bytes.TrimSpace(mounted), &control) == nil && control.Answers > 0 && len(control.Findings) > 0
 	detail := ""
@@ -424,20 +501,18 @@ func judgeDockerSocket(check Attack, mounted []byte, mountedErr error, agentOut 
 	if len(agent.Findings) > 0 {
 		found = "发现：" + strings.Join(agent.Findings, "，")
 	}
-	var hosts []string
-	for endpoint := range agent.TCP {
-		if host, _, ok := strings.Cut(endpoint, ":"); ok && !slices.Contains(hosts, host) {
-			hosts = append(hosts, host)
-		}
+	endpoints := make([]string, 0, len(agent.TCP))
+	for endpoint, answer := range agent.TCP {
+		endpoints = append(endpoints, endpoint+" "+dnsWord(answer))
 	}
-	slices.Sort(hosts)
-	r.Evidence = fmt.Sprintf("%s；socket 文件 %d 个（不含测试用的假接口）；查看了 %d 个文件和目录；%s 的 2375/2376 端口没有 Docker 应答",
-		found, agent.Sockets, agent.Visited, strings.Join(hosts, "、"))
+	slices.Sort(endpoints)
+	r.Evidence = fmt.Sprintf("%s\n其他 socket 文件 %d 个（不含测试用的假接口）；查看了 %d 个文件和目录\n2375/2376 端口：%s",
+		found, agent.Sockets, agent.Visited, strings.Join(endpoints, "，"))
 	switch {
 	case len(agent.Findings) > 0:
 		r.Status = checkProblem
 	case agent.Truncated:
-		r.Evidence += "；条目太多，扫描没有做完"
+		r.Evidence += "\n条目太多，扫描没有做完"
 	default:
 		r.Status = checkPassed
 	}
@@ -446,16 +521,41 @@ func judgeDockerSocket(check Attack, mounted []byte, mountedErr error, agentOut 
 
 // ---- Project boundary ----
 
-const boundaryPython = `import os,sys,json
-project,folder,marker=sys.argv[1:4]
+// boundaryPython reads the agent's mount table. Of the shared folder (~/CageWorkspace, one
+// virtiofs device), only the project may be mounted, at its own path; the sentinel beside the
+// project must not show up through any mount. It also lists what each folder above the project
+// contains.
+const boundaryPython = `import os,sys,json,re
+project,workspace,marker=sys.argv[1:4]
+def unescape(field): return re.sub(r"\\([0-7]{3})",lambda m: chr(int(m.group(1),8)),field)
+mounts=[]
+for line in open("/proc/self/mountinfo"):
+    left,_,right=line.partition(" - ")
+    f=left.split()
+    mounts.append(dict(dev=f[2],root=unescape(f[3]),point=unescape(f[4]),fs=(right.split() or [""])[0]))
+own=[m for m in mounts if m["point"]==project]
+device=own[-1]["dev"] if own else None
+shared=[m for m in mounts if m["dev"]==device or m["fs"] in ("virtiofs","9p","fuse.sshfs")]
+# The project's mount exposes <share root><root>; the root must be the project's own path below it.
+root=own[-1]["root"].rstrip("/") if own else ""
+rooted=bool(own) and root.endswith("/"+os.path.relpath(project,workspace)) and project.endswith(root)
+share=project[:len(project)-len(root)] if rooted else workspace
+extra=sorted({m["point"]+"（"+m["root"]+"）" for m in shared if not (m["point"]==project and rooted)})
+seen=[p for p in {marker} if os.path.exists(p)]
+for m in shared:
+    exposed=(share+m["root"]).rstrip("/")
+    if marker.startswith(exposed+"/"):
+        path=m["point"].rstrip("/")+marker[len(exposed):]
+        if os.path.exists(path) and path not in seen: seen.append(path)
 parts=project.strip("/").split("/")
-extra=[]
+listed=[]
 for i in range(1,len(parts)):
     parent="/"+"/".join(parts[:i])
     try: names=os.listdir(parent)
     except OSError: continue
-    extra+=[parent+"/"+name for name in sorted(names) if name!=parts[i]]
-print(json.dumps(dict(project=os.path.isdir(project),probe=os.path.exists(folder) or os.path.exists(marker),extra=extra[:20]),ensure_ascii=False))
+    listed+=[parent+"/"+name for name in sorted(names) if name!=parts[i]]
+print(json.dumps(dict(project=os.path.isdir(project),mounted=bool(own),rooted=rooted,mounts=extra[:10],probe=seen[:5],
+    extra=listed[:20]),ensure_ascii=False))
 `
 
 func (a *App) checkProjectBoundary(ctx context.Context, sbx sandbox.Sandbox, check Attack, agent probeRunner) AttackResult {
@@ -463,9 +563,10 @@ func (a *App) checkProjectBoundary(ctx context.Context, sbx sandbox.Sandbox, che
 	if err != nil {
 		return classifyCheck(check, nil, errors.New("找不到工作区 ~/CageWorkspace"))
 	}
+	sweepSentinels(workspace)
 	nonce := probeNonce()
 	// A sibling of the project: shared with the VM, but not with this sandbox.
-	folder := filepath.Join(workspace, ".aiofcage-probe-"+nonce)
+	folder := filepath.Join(workspace, sentinelPrefix+nonce)
 	if strings.ContainsAny(folder, ",\"\n") {
 		return classifyCheck(check, nil, errors.New("工作区路径含有逗号或引号，无法挂给对照容器"))
 	}
@@ -489,13 +590,30 @@ func (a *App) checkProjectBoundary(ctx context.Context, sbx sandbox.Sandbox, che
 			Mounts: []string{"type=bind,src=" + folder + ",dst=/probe,readonly"}, Command: []string{"cat", "/probe/marker.txt"}})
 		vmSees = controlErr == nil && strings.TrimSpace(string(out)) == nonce
 	}
-	out, err := agent(ctx, boundaryPython, sbx.ProjectPath, folder, marker)
+	out, err := agent(ctx, boundaryPython, sbx.ProjectPath, workspace, marker)
 	return judgeBoundary(check, vmSees, controlErr, out, err)
+}
+
+const sentinelPrefix = ".aiofcage-probe-"
+
+// sweepSentinels removes test folders an interrupted check left in the workspace: folders of our
+// own name pattern that are older than ten minutes and hold nothing but the marker.
+func sweepSentinels(workspace string) {
+	folders, _ := filepath.Glob(filepath.Join(workspace, sentinelPrefix+"*"))
+	for _, folder := range folders {
+		info, err := os.Lstat(folder)
+		if err != nil || !info.IsDir() || time.Since(info.ModTime()) < 10*time.Minute {
+			continue
+		}
+		if entries, err := os.ReadDir(folder); err == nil && len(entries) <= 1 && (len(entries) == 0 || entries[0].Name() == "marker.txt") {
+			os.RemoveAll(folder)
+		}
+	}
 }
 
 func judgeBoundary(check Attack, vmSees bool, controlErr error, out []byte, err error) AttackResult {
 	r := AttackResult{Attack: check, Status: checkInconclusive,
-		Note: "宿主在 ~/CageWorkspace 下临时建一个与项目并列的测试目录，检查后删除；同时列出项目各级上级目录里能看到的条目。只覆盖共享目录内的边界。"}
+		Note: "宿主在 ~/CageWorkspace 下临时建一个与项目并列的测试目录，检查后删除。看 Agent 的挂载表里共享目录只挂了项目本身，测试目录从哪个挂载点都看不到，项目各级上级目录里也没有别的条目。只覆盖共享目录内的边界。"}
 	control := CheckControl{Name: "虚拟机里能看到测试目录", OK: vmSees}
 	if controlErr != nil && !vmSees {
 		control.Detail = controlErr.Error()
@@ -507,7 +625,10 @@ func judgeBoundary(check Attack, vmSees bool, controlErr error, out []byte, err 
 	}
 	var value struct {
 		Project bool     `json:"project"`
-		Probe   bool     `json:"probe"`
+		Mounted bool     `json:"mounted"`
+		Rooted  bool     `json:"rooted"`
+		Mounts  []string `json:"mounts"`
+		Probe   []string `json:"probe"`
 		Extra   []string `json:"extra"`
 	}
 	if json.Unmarshal(bytes.TrimSpace(out), &value) != nil {
@@ -515,16 +636,19 @@ func judgeBoundary(check Attack, vmSees bool, controlErr error, out []byte, err 
 		return r
 	}
 	yes := map[bool]string{true: "是", false: "否"}
-	r.Evidence = "Agent 能看到项目目录：" + yes[value.Project] + "；能看到项目旁的测试目录：" + yes[value.Probe] + "；上级目录里的其他条目："
-	if len(value.Extra) == 0 {
-		r.Evidence += "无"
-	} else {
-		r.Evidence += strings.Join(value.Extra, "，")
+	list := func(items []string) string {
+		if len(items) == 0 {
+			return "无"
+		}
+		return strings.Join(items, "，")
 	}
+	r.Evidence = "Agent 能看到项目目录：" + yes[value.Project] + "；项目按自己的路径挂载：" + yes[value.Rooted] +
+		"\n共享目录的其他挂载：" + list(value.Mounts) + "\n能看到项目旁的测试目录：" + list(value.Probe) +
+		"\n上级目录里的其他条目：" + list(value.Extra)
 	switch {
-	case value.Probe || len(value.Extra) > 0:
+	case len(value.Probe) > 0 || len(value.Mounts) > 0 || len(value.Extra) > 0 || (value.Mounted && !value.Rooted):
 		r.Status = checkProblem
-	case value.Project:
+	case value.Project && value.Mounted:
 		r.Status = checkPassed
 	}
 	return r
