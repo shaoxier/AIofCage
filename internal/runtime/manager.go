@@ -1272,6 +1272,9 @@ func (m *Manager) removeRuntimeObjects(ctx context.Context, id string, keepHome 
 	if err := m.removeConnectors(ctx, id); err != nil {
 		errs = append(errs, err)
 	}
+	if err := m.removeProbes(ctx, id); err != nil {
+		errs = append(errs, err)
+	}
 	for _, args := range [][]string{{"rm", "--force", n.agent}, {"rm", "--force", n.gate},
 		{"network", "rm", "--force", n.internal}, {"network", "rm", "--force", n.egress}} {
 		if _, err := m.docker.run(ctx, 30*time.Second, nil, args...); err != nil && !strings.Contains(err.Error(), "No such") &&
