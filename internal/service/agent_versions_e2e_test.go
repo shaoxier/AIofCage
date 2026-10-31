@@ -33,7 +33,7 @@ func TestAgentVersionUpgradeEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = app.DeleteSandbox(s.ID, false); _ = os.RemoveAll(s.ProjectPath) })
-	manager.Progress = func(_ string, message string) { t.Log(message) }
+	manager.Progress = func(_ string, update runtime.Update) { t.Log(update.Step, update.Detail) }
 	startCtx, startCancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer startCancel()
 	if err := manager.Start(startCtx, s.ID); err != nil {

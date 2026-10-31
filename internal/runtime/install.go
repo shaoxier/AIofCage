@@ -34,8 +34,11 @@ func addedBindings(current []sandbox.Binding, agents []session.Agent) ([]sandbox
 
 // AddAgents 在镜像准备完成后才中断运行；失败时恢复配置和原运行状态。
 func (m *Manager) AddAgents(ctx context.Context, id string, agents []session.Agent) error {
-	m.environmentMu.RLock()
-	defer m.environmentMu.RUnlock()
+	unlockShared, err := m.shareEnvironment(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlockShared()
 	unlockEnvironment, environmentErr := m.useEnvironment(ctx, false)
 	if environmentErr != nil {
 		return environmentErr
@@ -74,8 +77,11 @@ func (m *Manager) AddAgents(ctx context.Context, id string, agents []session.Age
 
 // UpgradeAgents 只更新用户选择的智能体到当前新沙箱默认版本；其他沙箱不受影响。
 func (m *Manager) UpgradeAgents(ctx context.Context, id string, agents []session.Agent) error {
-	m.environmentMu.RLock()
-	defer m.environmentMu.RUnlock()
+	unlockShared, err := m.shareEnvironment(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlockShared()
 	unlockEnvironment, environmentErr := m.useEnvironment(ctx, false)
 	if environmentErr != nil {
 		return environmentErr
@@ -122,19 +128,29 @@ func (m *Manager) replaceAgents(ctx context.Context, id string, original, candid
 		return err
 	}
 	m.progress(id, "准备智能体镜像，当前沙箱继续运行")
-	if err := m.env.Ensure(ctx); err != nil {
+	if err := m.env.Ensure(ctx, func(line string) { m.detail(id, line) }); err != nil {
 		return err
 	}
-	if err := m.ensureImage(ctx, build, func(message string) { m.progress(id, message) }); err != nil {
+	if err := m.ensureImage(ctx, build, id); err != nil {
 		return err
 	}
-	state := m.Status(ctx, id).State
-	if state == statePartial {
+	// Nothing has changed so far. From here on containers are replaced: a stop no longer applies,
+	// and the replacement either finishes or restores the original sandbox.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
+	defer cancel()
+	current, err := m.state(ctx, id)
+	if err != nil {
+		return fmt.Errorf("无法确认沙箱是否在运行，没有更新：%w", err)
+	}
+	if current.State == statePartial {
 		return errors.New("沙箱组件状态不一致，请先停止沙箱再更新智能体")
 	}
-	running := state == stateRunning
+	running := current.State == stateRunning
 	if running {
-		m.progress(id, "保存用量并更新容器，终端会话将结束")
+		m.finalStep(id, "保存用量并更新容器，终端会话将结束")
 		if m.BeforeReplace != nil {
 			m.BeforeReplace(id)
 		}

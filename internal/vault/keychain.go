@@ -95,6 +95,9 @@ func (k *Keychain) readItem(ctx context.Context, service string) ([]byte, error)
 		if errors.As(err, &exit) && exit.ExitCode() == 44 {
 			return nil, ErrNotFound
 		}
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("读取钥匙串（%s）被中断：%w", service, ctx.Err())
+		}
 		return nil, fmt.Errorf("读取钥匙串失败（%s）", service)
 	}
 	value := bytes.TrimRight(stdout.Bytes(), "\n")

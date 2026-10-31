@@ -81,7 +81,7 @@ func (a *App) startConversation(id, sandboxID string, agent session.Agent, recov
 	if a.manager.Status(context.Background(), sandboxID).State != "running" {
 		return ConversationInfo{}, errors.New("请先启动沙箱")
 	}
-	if label, _ := a.ops.get(sbx.ID); label != "" {
+	if a.ops.changingContainers(sbx.ID) != "" {
 		return ConversationInfo{}, errors.New("沙箱正在更新，请完成后再打开会话")
 	}
 	bindings := sbx.Bindings
@@ -166,7 +166,7 @@ func (a *App) SendConversationMessage(id, text string, images []TerminalImage, o
 	if err != nil {
 		return err
 	}
-	if label, _ := a.ops.get(c.sandbox.ID); label != "" {
+	if a.ops.changingContainers(c.sandbox.ID) != "" {
 		return errors.New("沙箱正在更新，请稍后重试")
 	}
 	if err := validateConversationOptions(options); err != nil {

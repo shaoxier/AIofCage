@@ -55,7 +55,7 @@ func TestWorkspaceEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	app := NewApp(st, keychain, manager, nil, nil)
-	manager.Progress = func(id, message string) { t.Logf("%s %s", id, message) }
+	manager.Progress = func(id string, update runtime.Update) { t.Logf("%s %s %s", id, update.Step, update.Detail) }
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	s, err := app.CreateSandbox(CreateSandboxRequest{Name: "uat-engine-" + time.Now().Format("150405"), ProjectMode: ProjectNew, MaxRequests: 30, MaxTokens: 60000})

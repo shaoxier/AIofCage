@@ -237,7 +237,7 @@ func (m *Manager) syncConnectors(ctx context.Context, sbx sandbox.Sandbox, servi
 	if err != nil {
 		return nil, err
 	}
-	if err := m.ensureImage(ctx, build, func(message string) { m.progress(sbx.ID, message) }); err != nil {
+	if err := m.ensureImage(ctx, build, sbx.ID); err != nil {
 		return nil, err
 	}
 	n := names(sbx.ID)
@@ -393,7 +393,7 @@ func (m *Manager) CheckConnector(ctx context.Context, service mcp.Service, secre
 		if listErr != nil || len(strings.TrimSpace(string(out))) == 0 {
 			return false, "", ErrConnectorNotBuilt
 		}
-		if err := m.ensureImage(ctx, build, nil); err != nil {
+		if err := m.ensureImage(ctx, build, ""); err != nil {
 			return false, "", err
 		}
 	}

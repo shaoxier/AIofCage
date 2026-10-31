@@ -41,6 +41,9 @@ type App struct {
 	monitor       *monitor
 	explain       explainCache
 	ops           operations
+	// root is the parent of every lifecycle operation's context; it ends when the app quits.
+	root          context.Context
+	rootCancel    context.CancelFunc
 	terms         terminals
 	conversations conversationSessions
 	usageMu       sync.Mutex
@@ -66,13 +69,14 @@ func NewApp(st *store.Store, secrets vault.Store, manager *runtime.Manager, mana
 		emit: func(string, any) {}, terminal: openInTerminal, monitor: newMonitor(), explain: explainCache{items: map[string]Explanation{}},
 		client: client, oauth: oauth.NewClient(client, openURL), isolationRuns: map[string]SecurityIsolationRun{},
 		explainClient: &http.Client{Transport: &http.Transport{Proxy: nil, TLSHandshakeTimeout: 10 * time.Second}, CheckRedirect: noRedirect}}
+	a.root, a.rootCancel = context.WithCancel(context.Background())
+	// Progress is remembered as well as emitted, so a page opened later still shows it.
+	a.ops.send = func(id string, view OperationView) {
+		a.emit("sandbox:progress", map[string]any{"id": id, "activity": view})
+	}
 	if manager != nil {
 		manager.BeforeReplace = a.closeSandboxConversations
-		// Progress is remembered as well as emitted, so a page opened later still shows it.
-		manager.Progress = func(id, message string) {
-			a.ops.setProgress(id, message)
-			a.emit("sandbox:progress", map[string]string{"id": id, "message": message})
-		}
+		manager.Progress = a.ops.update
 	}
 	return a
 }
@@ -422,9 +426,11 @@ type SandboxView struct {
 	DevSources     []string            `json:"dev_sources"`
 	CreatedAt      time.Time           `json:"created_at"`
 	// Operation is the lifecycle operation in progress (启动、停止、删除) and Progress its latest step.
-	Operation     string `json:"operation,omitempty"`
-	Progress      string `json:"progress,omitempty"`
-	ConfigPending bool   `json:"config_pending"`
+	Operation string `json:"operation,omitempty"`
+	Progress  string `json:"progress,omitempty"`
+	// Activity is the operation in progress with its steps, or else the last one and how it ended.
+	Activity      *OperationView `json:"activity,omitempty"`
+	ConfigPending bool           `json:"config_pending"`
 }
 
 type BindingView struct {
@@ -496,6 +502,9 @@ func (a *App) ListSandboxes() ([]SandboxView, error) {
 			view.State = a.manager.Status(ctx, s.ID).State
 		}
 		view.Operation, view.Progress = a.ops.get(s.ID)
+		if activity, ok := a.ops.view(s.ID); ok {
+			view.Activity = &activity
+		}
 		for _, b := range s.Bindings {
 			activeID := b.ProviderID
 			if s.AppliedProviders != nil {

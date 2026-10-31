@@ -154,6 +154,21 @@ main:focus { outline: none; }
 .version { display: block; color: var(--muted); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
 .pending { color: var(--warn); background: var(--warn-bg); border-radius: 8px; padding: 10px 12px; }
 .progress { font-size: var(--text-sm); color: var(--warn); margin-top: 8px; }
+/* 长操作进度：步骤列表、当前步骤的细节、停止按钮 */
+.op-progress { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--warn-bg); font-size: var(--text-sm); }
+.op-progress .op-head { display: flex; align-items: center; gap: 10px; }
+.op-progress .op-head strong { font-weight: 600; color: var(--warn); }
+.op-progress .op-stop { margin-left: auto; }
+.op-progress.compact { display: grid; gap: 2px; }
+.op-progress.compact p { margin: 0; }
+.op-progress.compact .op-stop { justify-self: start; margin: 4px 0 0; }
+.op-steps { list-style: none; padding: 0; margin: 8px 0 0; }
+.op-steps li { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; padding: 4px 0 4px 20px; position: relative; color: var(--muted); }
+.op-steps li::before { content: "✓"; position: absolute; left: 2px; color: var(--ok); }
+.op-steps li.current { color: var(--ink); }
+.op-steps li.current::before { content: "●"; color: var(--warn); }
+.op-detail { grid-column: 1 / -1; margin: 0; font-family: var(--font-mono); overflow-wrap: anywhere; }
+.op-result { margin-top: 8px; }
 .usage { display: grid; gap: 4px; font-size: var(--text-sm); color: var(--muted); font-variant-numeric: tabular-nums; }
 .usage strong { color: var(--ink); font-weight: 600; }
 .usage .link { justify-content: flex-start; font-size: var(--text-sm); }

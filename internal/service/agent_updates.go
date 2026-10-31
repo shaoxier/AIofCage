@@ -135,14 +135,9 @@ func (a *App) UpgradeSandboxAgents(id string, agents []session.Agent) error {
 	if err := a.runtimeReady(); err != nil {
 		return err
 	}
-	done, err := a.beginOperation(id, "更新智能体")
-	if err != nil {
-		return err
-	}
-	defer done()
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Minute)
-	defer cancel()
-	return a.manager.UpgradeAgents(ctx, id, agents)
+	return a.operation(id, "更新智能体", 40*time.Minute, true, func(ctx context.Context) error {
+		return a.manager.UpgradeAgents(ctx, id, agents)
+	})
 }
 
 // 版本只接受 runtime 校验的 SemVer 子集；数字比较，正式版优先于同号预发布。

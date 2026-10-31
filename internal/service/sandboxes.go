@@ -98,37 +98,98 @@ func (a *App) StartSandbox(id string) error {
 	if err := a.runtimeReady(); err != nil {
 		return err
 	}
-	done, err := a.beginOperation(id, "启动")
+	return a.operation(id, "启动", 40*time.Minute, true, func(ctx context.Context) error {
+		return a.manager.Start(ctx, id)
+	})
+}
+
+// operation runs a lifecycle operation of a sandbox and records it for the interface. Its context
+// derives from the app's root context, so quitting the app cancels it; a stoppable one can also be
+// stopped with CancelSandboxOperation. A stopped operation fails with a message saying what state
+// it left the sandbox in, never as a success.
+func (a *App) operation(id, label string, timeout time.Duration, stoppable bool, run func(context.Context) error) error {
+	sbx, err := a.store.Sandbox(id)
 	if err != nil {
 		return err
 	}
-	defer done()
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Minute)
+	ctx, cancel := context.WithTimeout(a.root, timeout)
 	defer cancel()
-	return a.manager.Start(ctx, id)
+	var stop context.CancelFunc
+	if stoppable {
+		stop = cancel
+	}
+	if err := a.ops.begin(sbx.ID, sbx.Name, label, stop); err != nil {
+		return err
+	}
+	err = run(ctx)
+	switch {
+	case err == nil:
+		a.ops.end(sbx.ID, "done", "")
+	case stoppable && errors.Is(err, context.Canceled) && (a.ops.stopping(sbx.ID) || a.root.Err() != nil):
+		// Only an error that the stop itself caused counts as stopped; a real failure that
+		// happened meanwhile is reported as one.
+		message := a.stoppedState(sbx.ID, label)
+		a.ops.end(sbx.ID, "stopped", message)
+		return errors.New(message)
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		message := fmt.Sprintf("%s超时（超过 %d 分钟）：%v", label, int(timeout.Minutes()), err)
+		a.ops.end(sbx.ID, "failed", message)
+		return errors.New(message)
+	default:
+		a.ops.end(sbx.ID, "failed", err.Error())
+	}
+	return err
 }
 
-func (a *App) beginOperation(id, label string) (func(), error) {
-	sbx, err := a.store.Sandbox(id)
-	if err != nil {
-		return nil, err
+// stoppedState says how a stopped operation left the sandbox.
+func (a *App) stoppedState(id, label string) string {
+	if a.manager == nil {
+		return "已停止" + label
 	}
-	return a.ops.begin(sbx.ID, sbx.Name, label)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	switch a.manager.Status(ctx, id).State {
+	case "running":
+		return "已停止" + label + "；沙箱仍在运行"
+	case "partial":
+		return "已停止" + label + "；沙箱的组件状态不一致，建议重新启动"
+	}
+	return "已停止" + label + "；沙箱没有运行"
+}
+
+// CancelSandboxOperation stops a sandbox's long operation (a start, reset or agent install). It
+// returns at once; the operation ends when its current step allows: a build stops right away, a
+// VM start finishes first.
+func (a *App) CancelSandboxOperation(id string) error {
+	return a.ops.stop(id)
+}
+
+// RunningOperations describes the operations in progress, for a confirmation before quitting.
+func (a *App) RunningOperations() []string { return a.ops.running() }
+
+// StopOperations stops every operation that can be stopped and waits up to timeout for all of
+// them to end. It reports whether none is left.
+func (a *App) StopOperations(timeout time.Duration) bool {
+	a.ops.stopAll()
+	return a.ops.wait(timeout)
+}
+
+// Shutdown runs when the app quits: operations stop, and anything still running after timeout is
+// cancelled, so no build or other command the app started keeps running after it.
+func (a *App) Shutdown(timeout time.Duration) {
+	a.StopOperations(timeout)
+	a.rootCancel()
+	a.ops.wait(5 * time.Second)
 }
 
 func (a *App) StopSandbox(id string) error {
 	if err := a.runtimeReady(); err != nil {
 		return err
 	}
-	done, err := a.beginOperation(id, "停止")
-	if err != nil {
-		return err
-	}
-	defer done()
-	a.closeSandboxConversations(id)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	return a.manager.Stop(ctx, id)
+	return a.operation(id, "停止", 2*time.Minute, false, func(ctx context.Context) error {
+		a.closeSandboxConversations(id)
+		return a.manager.Stop(ctx, id)
+	})
 }
 
 // ResetSandbox rebuilds the isolated runtime objects while keeping the sandbox configuration
@@ -138,21 +199,16 @@ func (a *App) ResetSandbox(id string, keepHome, restart bool) error {
 	if err := a.runtimeReady(); err != nil {
 		return err
 	}
-	done, err := a.beginOperation(id, "重置")
-	if err != nil {
-		return err
-	}
-	defer done()
-	a.closeSandboxConversations(id)
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Minute)
-	defer cancel()
-	if err := a.manager.Reset(ctx, id, keepHome, restart); err != nil {
-		return err
-	}
-	if !keepHome {
-		return a.removeSandboxConversationRecoveries(id)
-	}
-	return nil
+	return a.operation(id, "重置", 40*time.Minute, true, func(ctx context.Context) error {
+		a.closeSandboxConversations(id)
+		if err := a.manager.Reset(ctx, id, keepHome, restart); err != nil {
+			return err
+		}
+		if !keepHome {
+			return a.removeSandboxConversationRecoveries(id)
+		}
+		return nil
+	})
 }
 
 // DeleteSandbox removes containers and networks. The project folder is never deleted; keepHome
@@ -161,23 +217,18 @@ func (a *App) DeleteSandbox(id string, keepHome bool) error {
 	if err := a.runtimeReady(); err != nil {
 		return err
 	}
-	done, err := a.beginOperation(id, "删除")
-	if err != nil {
-		return err
-	}
-	defer done()
-	a.closeSandboxConversations(id)
-	sbx, err := a.store.Sandbox(id)
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	if err := a.manager.Delete(ctx, id, keepHome); err != nil {
-		return err
-	}
-	_ = a.removeSandboxConversationRecoveries(sbx.ID)
-	return a.retireUsage(sbx)
+	return a.operation(id, "删除", 2*time.Minute, false, func(ctx context.Context) error {
+		a.closeSandboxConversations(id)
+		sbx, err := a.store.Sandbox(id)
+		if err != nil {
+			return err
+		}
+		if err := a.manager.Delete(ctx, id, keepHome); err != nil {
+			return err
+		}
+		_ = a.removeSandboxConversationRecoveries(sbx.ID)
+		return a.retireUsage(sbx)
+	})
 }
 
 // BindProvider 保存供应商选择，运行中的沙箱在重启后应用。
@@ -409,14 +460,9 @@ func (a *App) AddSandboxAgents(id string, agents []session.Agent) error {
 	if err := a.runtimeReady(); err != nil {
 		return err
 	}
-	done, err := a.beginOperation(id, "添加智能体")
-	if err != nil {
-		return err
-	}
-	defer done()
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Minute)
-	defer cancel()
-	return a.manager.AddAgents(ctx, id, agents)
+	return a.operation(id, "添加智能体", 40*time.Minute, true, func(ctx context.Context) error {
+		return a.manager.AddAgents(ctx, id, agents)
+	})
 }
 
 // ListDevSources lists the development sources a sandbox can open.
@@ -428,7 +474,8 @@ func (a *App) SetSandboxDevSources(id string, sources []string) error {
 	if err := a.runtimeReady(); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	return a.markStale(id, a.manager.SetDevSources(ctx, id, sources))
+	// Recorded as an operation, so its progress shows and quitting waits for it.
+	return a.operation(id, "更新开发环境", time.Minute, false, func(ctx context.Context) error {
+		return a.markStale(id, a.manager.SetDevSources(ctx, id, sources))
+	})
 }

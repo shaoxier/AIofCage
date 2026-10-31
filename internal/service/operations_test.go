@@ -1,31 +1,224 @@
 package service
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/shaoxier/AIofCage/internal/runtime"
 	"github.com/shaoxier/AIofCage/internal/sandbox"
 	"github.com/shaoxier/AIofCage/internal/session"
 )
 
+// blocked runs an operation that waits until release closes or its context ends.
+func blocked(app *App, id, label string, stoppable bool, release chan struct{}) chan error {
+	result := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		result <- app.operation(id, label, time.Minute, stoppable, func(ctx context.Context) error {
+			close(started)
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+	}()
+	<-started
+	return result
+}
+
 func TestOperationsAreExclusiveAndVisible(t *testing.T) {
 	app, _, st := newApp(t)
 	st.SaveSandbox(sandbox.Sandbox{ID: "sbx-a", Name: "alpha", Bindings: []sandbox.Binding{{Agent: session.Codex}}})
-	done, err := app.beginOperation("sbx-a", "启动")
-	if err != nil {
-		t.Fatal(err)
-	}
-	app.ops.setProgress("sbx-a", "正在构建镜像")
-	if _, err := app.beginOperation("sbx-a", "启动"); err == nil || !strings.Contains(err.Error(), "正在启动") {
+	release := make(chan struct{})
+	result := blocked(app, "sbx-a", "启动", true, release)
+	app.ops.update("sbx-a", runtime.Update{Step: "检查专用虚拟机"})
+	app.ops.update("sbx-a", runtime.Update{Step: "正在构建镜像"})
+	app.ops.update("sbx-a", runtime.Update{Detail: "第 3/9 步：RUN npm install"})
+	if err := app.operation("sbx-a", "启动", time.Minute, true, func(context.Context) error { return nil }); err == nil || !strings.Contains(err.Error(), "正在启动") {
 		t.Fatalf("a second start must be refused while the first runs: %v", err)
 	}
 	views, _ := app.ListSandboxes()
-	if views[0].Operation != "启动" || views[0].Progress != "正在构建镜像" {
-		t.Fatalf("operation must be visible to every page: %+v", views[0])
+	activity := views[0].Activity
+	if views[0].Operation != "启动" || views[0].Progress != "正在构建镜像" || activity == nil || len(activity.Steps) != 2 ||
+		activity.Steps[0].Ended == nil || activity.Steps[1].Ended != nil || activity.Detail != "第 3/9 步：RUN npm install" || !activity.Stoppable {
+		t.Fatalf("operation must be visible to every page: %+v %+v", views[0], activity)
 	}
-	done()
-	if views, _ = app.ListSandboxes(); views[0].Operation != "" || views[0].Progress != "" {
-		t.Fatalf("finished operation still shown: %+v", views[0])
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	views, _ = app.ListSandboxes()
+	if views[0].Operation != "" || views[0].Activity == nil || views[0].Activity.Outcome != "done" || views[0].Activity.Ended == nil {
+		t.Fatalf("a finished operation is no longer running but says how it ended: %+v %+v", views[0], views[0].Activity)
+	}
+}
+
+// A stopped operation ends as stopped, never as a success, and says what it left behind.
+func TestStoppedOperationIsNotASuccess(t *testing.T) {
+	app, _, st := newApp(t)
+	st.SaveSandbox(sandbox.Sandbox{ID: "sbx-a", Name: "alpha"})
+	result := blocked(app, "sbx-a", "启动", true, make(chan struct{}))
+	if err := app.CancelSandboxOperation("sbx-a"); err != nil {
+		t.Fatal(err)
+	}
+	err := <-result
+	activity, _ := app.ops.view("sbx-a")
+	if err == nil || !strings.HasPrefix(err.Error(), "已停止启动") || activity.Outcome != "stopped" || activity.Message != err.Error() {
+		t.Fatalf("got %v %+v", err, activity)
+	}
+	if err := app.CancelSandboxOperation("sbx-a"); err == nil {
+		t.Fatal("nothing is left to stop")
+	}
+}
+
+// Stopping a sandbox or deleting it runs to the end; quitting waits for it.
+func TestShortOperationsCannotBeStopped(t *testing.T) {
+	app, _, st := newApp(t)
+	st.SaveSandbox(sandbox.Sandbox{ID: "sbx-a", Name: "alpha"})
+	release := make(chan struct{})
+	result := blocked(app, "sbx-a", "停止", false, release)
+	if err := app.CancelSandboxOperation("sbx-a"); err == nil || !strings.Contains(err.Error(), "不能中途停止") {
+		t.Fatalf("got %v", err)
+	}
+	if app.StopOperations(200 * time.Millisecond) {
+		t.Fatal("an operation that cannot be stopped is still running")
+	}
+	close(release)
+	if err := <-result; err != nil || !app.StopOperations(time.Second) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// Quitting stops every stoppable operation and waits for it to end.
+func TestShutdownStopsOperations(t *testing.T) {
+	app, _, st := newApp(t)
+	st.SaveSandbox(sandbox.Sandbox{ID: "sbx-a", Name: "alpha"})
+	st.SaveSandbox(sandbox.Sandbox{ID: "sbx-b", Name: "beta"})
+	first := blocked(app, "sbx-a", "启动", true, make(chan struct{}))
+	second := blocked(app, "sbx-b", "添加智能体", true, make(chan struct{}))
+	if running := app.RunningOperations(); strings.Join(running, "、") != "「alpha」启动、「beta」添加智能体" {
+		t.Fatalf("got %v", running)
+	}
+	app.Shutdown(time.Second)
+	for _, result := range []chan error{first, second} {
+		if err := <-result; err == nil || !strings.HasPrefix(err.Error(), "已停止") {
+			t.Fatalf("got %v", err)
+		}
+	}
+	if len(app.RunningOperations()) != 0 {
+		t.Fatal("operations left after shutdown")
+	}
+}
+
+// Detail updates arrive often (every line of a build); they reach the interface at most every
+// detailInterval, and the latest one is never lost.
+func TestDetailUpdatesAreBatched(t *testing.T) {
+	app, _, st := newApp(t)
+	st.SaveSandbox(sandbox.Sandbox{ID: "sbx-a", Name: "alpha"})
+	var mu sync.Mutex
+	var sent []OperationView
+	app.ops.send = func(_ string, view OperationView) {
+		mu.Lock()
+		sent = append(sent, view)
+		mu.Unlock()
+	}
+	release := make(chan struct{})
+	result := blocked(app, "sbx-a", "启动", true, release)
+	app.ops.update("sbx-a", runtime.Update{Step: "正在构建镜像"})
+	for i := range 50 {
+		app.ops.update("sbx-a", runtime.Update{Detail: fmt.Sprintf("第 1/9 步 · 第 %d 行", i)})
+	}
+	time.Sleep(2 * detailInterval)
+	mu.Lock()
+	count, latest := len(sent), sent[len(sent)-1].Detail
+	mu.Unlock()
+	if count > 5 || latest != "第 1/9 步 · 第 49 行" {
+		t.Fatalf("%d updates sent, latest %q", count, latest)
+	}
+	close(release)
+	<-result
+}
+
+// A real failure that happens while a stop is pending is reported as a failure with its cause,
+// not hidden behind "已停止".
+func TestFailureDuringAStopIsNotHidden(t *testing.T) {
+	app, _, st := newApp(t)
+	st.SaveSandbox(sandbox.Sandbox{ID: "sbx-a", Name: "alpha"})
+	release := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- app.operation("sbx-a", "启动", time.Minute, true, func(ctx context.Context) error {
+			<-release
+			return errors.New("启动专用虚拟机失败：下载系统镜像失败")
+		})
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if err := app.CancelSandboxOperation("sbx-a"); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	err := <-result
+	activity, _ := app.ops.view("sbx-a")
+	if err == nil || !strings.Contains(err.Error(), "下载系统镜像失败") || activity.Outcome != "failed" {
+		t.Fatalf("got %v %+v", err, activity)
+	}
+}
+
+// Once the app is quitting, no new operation begins: it would not be stopped.
+func TestNoNewOperationsWhileQuitting(t *testing.T) {
+	app, _, st := newApp(t)
+	st.SaveSandbox(sandbox.Sandbox{ID: "sbx-a", Name: "alpha"})
+	if !app.StopOperations(time.Second) {
+		t.Fatal("nothing was running")
+	}
+	err := app.operation("sbx-a", "启动", time.Minute, true, func(context.Context) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "正在退出") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// Delivering new MCP or development-source settings does not hold up sessions; changing the
+// containers does.
+func TestSettingsUpdatesDoNotBlockSessions(t *testing.T) {
+	app, _, st := newApp(t)
+	st.SaveSandbox(sandbox.Sandbox{ID: "sbx-a", Name: "alpha"})
+	release := make(chan struct{})
+	result := blocked(app, "sbx-a", "更新 MCP", false, release)
+	if label := app.ops.changingContainers("sbx-a"); label != "" {
+		t.Fatalf("a settings update blocks sessions: %q", label)
+	}
+	close(release)
+	<-result
+	release = make(chan struct{})
+	result = blocked(app, "sbx-a", "启动", true, release)
+	if label := app.ops.changingContainers("sbx-a"); label != "启动" {
+		t.Fatalf("a start must block sessions: %q", label)
+	}
+	close(release)
+	<-result
+}
+
+// After a final step (replacing containers) the operation runs to its end: no stop button.
+func TestFinalStepCannotBeStopped(t *testing.T) {
+	app, _, st := newApp(t)
+	st.SaveSandbox(sandbox.Sandbox{ID: "sbx-a", Name: "alpha"})
+	release := make(chan struct{})
+	result := blocked(app, "sbx-a", "添加智能体", true, release)
+	app.ops.update("sbx-a", runtime.Update{Step: "保存用量并更新容器，终端会话将结束", Final: true})
+	activity, _ := app.ops.view("sbx-a")
+	if err := app.CancelSandboxOperation("sbx-a"); err == nil || activity.Stoppable {
+		t.Fatalf("got %v %+v", err, activity)
+	}
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
 	}
 }
 

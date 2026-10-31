@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/shaoxier/AIofCage/internal/runtime"
 	"github.com/shaoxier/AIofCage/internal/service"
@@ -35,6 +38,69 @@ func main() {
 	}
 }
 
+// Quit states: the app runs, waits for its operations to stop before quitting, or quits now.
+const (
+	quitIdle int32 = iota
+	quitStopping
+	quitNow
+	quitForced
+)
+
+// keepOpen runs when the window is closed or the app is quit; it reports whether to keep the app
+// open. With operations in progress it asks first. On 停止并退出 the window stays while they stop
+// (a VM start finishes first, so the VM is not left broken), then the app quits, so no build or
+// download it started keeps running after it. Closing again meanwhile asks whether to wait.
+func keepOpen(ctx context.Context, app *service.App, state *atomic.Int32) bool {
+	switch state.Load() {
+	case quitNow, quitForced:
+		return false
+	case quitStopping:
+		choice, err := wailsruntime.MessageDialog(ctx, wailsruntime.MessageDialogOptions{Type: wailsruntime.QuestionDialog,
+			Title: "正在停止操作",
+			Message: "停完后会自动退出。也可以立即退出：正在启动的专用虚拟机会在后台启动完成；" +
+				"正在替换容器、重置或更新设置的沙箱可能停在一半，之后需要重新启动。",
+			Buttons: []string{"继续等待", "立即退出"}, DefaultButton: "继续等待", CancelButton: "继续等待"})
+		if err == nil && choice == "立即退出" {
+			state.Store(quitForced)
+			go exitAfter(app, 5*time.Second, 2*time.Second)
+			return false
+		}
+		return true
+	}
+	running := app.RunningOperations()
+	if len(running) == 0 {
+		return false
+	}
+	choice, err := wailsruntime.MessageDialog(ctx, wailsruntime.MessageDialogOptions{Type: wailsruntime.QuestionDialog,
+		Title:   "还有操作没有完成",
+		Message: strings.Join(running, "、") + "还在进行。退出前会先停止它们；如果专用虚拟机正在启动，要等它启动完成才能退出，以免损坏虚拟机。",
+		Buttons: []string{"停止并退出", "继续使用"}, DefaultButton: "继续使用", CancelButton: "继续使用"})
+	if err != nil || choice != "停止并退出" {
+		return true
+	}
+	state.Store(quitStopping)
+	wailsruntime.EventsEmit(ctx, "app:quitting")
+	go func() {
+		// The longest step that cannot be interrupted is creating the VM (20 minutes at most).
+		app.StopOperations(20 * time.Minute)
+		if !state.CompareAndSwap(quitStopping, quitNow) {
+			return // the user chose to quit at once
+		}
+		wailsruntime.Quit(ctx)
+		exitAfter(app, 5*time.Second, 5*time.Second)
+	}()
+	return true
+}
+
+// exitAfter ends the process if the app has not quit within delay: Wails quits with [NSApp stop:],
+// which ends the event loop only after the next event. The shutdown waits up to wait.
+func exitAfter(app *service.App, delay, wait time.Duration) {
+	time.Sleep(delay)
+	app.Shutdown(wait)
+	app.CloseAllTerminals()
+	os.Exit(0)
+}
+
 func run() error {
 	frontend, err := fs.Sub(assets, "frontend/src")
 	if err != nil {
@@ -53,6 +119,7 @@ func run() error {
 	// page explains what is missing.
 	manager, managerErr := runtime.NewManager(st, keychain)
 	var desktopContext context.Context
+	var quitState atomic.Int32
 	app := service.NewApp(st, keychain, manager, managerErr, func() (string, error) {
 		if desktopContext == nil {
 			return "", fmt.Errorf("桌面窗口尚未就绪")
@@ -74,7 +141,15 @@ func run() error {
 			app.SetEmitter(func(event string, data any) { wailsruntime.EventsEmit(ctx, event, data) })
 			app.StartMonitor(ctx)
 		},
-		OnShutdown: func(context.Context) { app.CloseAllTerminals() },
-		Bind:       []interface{}{app},
+		OnBeforeClose: func(ctx context.Context) bool { return keepOpen(ctx, app, &quitState) },
+		OnShutdown: func(context.Context) {
+			wait := 30 * time.Second
+			if quitState.Load() == quitForced {
+				wait = 2 * time.Second // the user chose not to wait
+			}
+			app.Shutdown(wait)
+			app.CloseAllTerminals()
+		},
+		Bind: []interface{}{app},
 	})
 }

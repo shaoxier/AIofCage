@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"text/template"
 	"time"
 
@@ -152,8 +153,8 @@ func agentContextVersions(agents []session.Agent, versions map[session.Agent]str
 }
 
 // ensureImage builds the image inside the dedicated VM unless an image with the same content
-// digest already exists.
-func (m *Manager) ensureImage(ctx context.Context, build buildContext, progress func(string)) error {
+// digest already exists. Progress goes to the sandbox id, if any.
+func (m *Manager) ensureImage(ctx context.Context, build buildContext, id string) error {
 	if _, err := m.docker.run(ctx, 15*time.Second, nil, "image", "inspect", build.tag); err == nil {
 		return nil
 	}
@@ -171,12 +172,56 @@ func (m *Manager) ensureImage(ctx context.Context, build buildContext, progress 
 			return err
 		}
 	}
-	if progress != nil {
-		progress("正在构建镜像 " + build.tag + "（首次需要几分钟）")
-	}
-	if _, err := m.docker.run(ctx, 30*time.Minute, nil, "build", "--platform", "linux/arm64",
+	m.progress(id, "正在构建镜像 "+build.tag+"（首次需要几分钟）")
+	var steps buildSteps
+	if err := m.docker.runLines(ctx, 30*time.Minute, func(line string) {
+		if detail, changed := steps.feed(line); changed {
+			m.detail(id, detail)
+		}
+	}, "build", "--progress=plain", "--platform", "linux/arm64",
 		"--label", "io.aiofcage.managed=true", "--tag", build.tag, dir); err != nil {
 		return fmt.Errorf("构建镜像失败：%w", err)
 	}
 	return nil
+}
+
+var (
+	// "#7 [3/9] RUN npm install …", or "#7 [builder 3/9] …" in a multi-stage build.
+	buildStepLine = regexp.MustCompile(`^#(\d+) \[(?:[^\]]*\s)?(\d+)/(\d+)\] (.+)$`)
+	// "#7 12.345 added 120 packages": output of a running step.
+	buildOutputLine = regexp.MustCompile(`^#(\d+) \d+\.\d+ (.+)$`)
+	// "#5 sha256:4f4f… 12.58MB / 49.55MB 3.2s": a base image layer being downloaded.
+	buildPullLine = regexp.MustCompile(`^#(\d+) sha256:[0-9a-f]+ (\S+ / \S+)`)
+)
+
+// buildSteps follows `docker build --progress=plain` output and says which step of the build is
+// running and what it printed last.
+type buildSteps struct {
+	names   map[string]string // vertex number → "第 k/N 步：…"
+	current string
+	latest  string
+	shown   string
+}
+
+func (b *buildSteps) feed(line string) (string, bool) {
+	if b.names == nil {
+		b.names = map[string]string{}
+	}
+	if match := buildStepLine.FindStringSubmatch(line); match != nil {
+		b.names[match[1]] = fmt.Sprintf("第 %s/%s 步：%s", match[2], match[3], clip(match[4], 140))
+		b.current, b.latest = b.names[match[1]], ""
+	} else if match := buildPullLine.FindStringSubmatch(line); match != nil && b.names[match[1]] != "" {
+		b.current, b.latest = b.names[match[1]], "下载基础镜像 "+match[2]
+	} else if match := buildOutputLine.FindStringSubmatch(line); match != nil && b.names[match[1]] != "" {
+		b.current, b.latest = b.names[match[1]], clip(match[2], 120)
+	}
+	detail := b.current
+	if b.latest != "" {
+		detail += " · " + b.latest
+	}
+	if detail == b.shown {
+		return detail, false
+	}
+	b.shown = detail
+	return detail, detail != ""
 }

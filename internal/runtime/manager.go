@@ -53,8 +53,8 @@ type Manager struct {
 	store  *store.Store
 	vault  vault.Store
 
-	// Progress, when set, receives human-readable steps for long operations.
-	Progress func(sandboxID, message string)
+	// Progress, when set, receives the steps of long operations and details within them.
+	Progress func(sandboxID string, update Update)
 	// BeforeReplace 仅在候选镜像就绪、即将中断旧容器时关闭桌面会话。
 	BeforeReplace func(sandboxID string)
 	// OAuth refreshes tokens of OAuth MCP services before they are handed to a gatekeeper.
@@ -81,9 +81,31 @@ func NewManager(st *store.Store, secrets vault.Store) (*Manager, error) {
 
 func (m *Manager) Environment() *Environment { return m.env }
 
+// Update is one progress report of a long operation. A non-empty Step starts the next step;
+// otherwise Detail says where the current step is (a build step, the latest line of a tool).
+// Final marks a step after which the operation runs to its end: a stop no longer applies.
+type Update struct {
+	Step   string
+	Detail string
+	Final  bool
+}
+
 func (m *Manager) progress(id, message string) {
 	if m.Progress != nil {
-		m.Progress(id, message)
+		m.Progress(id, Update{Step: message})
+	}
+}
+
+// finalStep starts a step that the operation cannot be stopped from, such as replacing containers.
+func (m *Manager) finalStep(id, message string) {
+	if m.Progress != nil {
+		m.Progress(id, Update{Step: message, Final: true})
+	}
+}
+
+func (m *Manager) detail(id, detail string) {
+	if m.Progress != nil && detail != "" {
+		m.Progress(id, Update{Detail: detail})
 	}
 }
 
@@ -441,8 +463,11 @@ func (m *Manager) providersFor(sbx sandbox.Sandbox) (map[string]provider.Provide
 // Start brings the sandbox up: VM, images, networks, gatekeeper (configured before the agent runs),
 // then the agent with the gatekeeper CA and agent settings.
 func (m *Manager) Start(ctx context.Context, id string) error {
-	m.environmentMu.RLock()
-	defer m.environmentMu.RUnlock()
+	unlockShared, err := m.shareEnvironment(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlockShared()
 	unlockEnvironment, environmentErr := m.useEnvironment(ctx, false)
 	if environmentErr != nil {
 		return environmentErr
@@ -477,7 +502,7 @@ func (m *Manager) startSnapshot(ctx context.Context, id string, original *sandbo
 		}
 	}
 	m.progress(sbx.ID, "检查专用虚拟机")
-	if err := m.env.Ensure(ctx); err != nil {
+	if err := m.env.Ensure(ctx, func(line string) { m.detail(sbx.ID, line) }); err != nil {
 		return err
 	}
 	gateBuild, err := gatekeeperContext()
@@ -489,7 +514,7 @@ func (m *Manager) startSnapshot(ctx context.Context, id string, original *sandbo
 		return err
 	}
 	for _, build := range []buildContext{gateBuild, agentBuild} {
-		if err := m.ensureImage(ctx, build, func(message string) { m.progress(sbx.ID, message) }); err != nil {
+		if err := m.ensureImage(ctx, build, sbx.ID); err != nil {
 			return err
 		}
 	}
@@ -1171,8 +1196,11 @@ func (m *Manager) stopContainers(ctx context.Context, n objectNames) error {
 // project directory. When restart is true, the normal start path recreates the VM objects and
 // reapplies the saved configuration after the teardown succeeds.
 func (m *Manager) Reset(ctx context.Context, id string, keepHome, restart bool) error {
-	m.environmentMu.RLock()
-	defer m.environmentMu.RUnlock()
+	unlockShared, err := m.shareEnvironment(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlockShared()
 	unlockEnvironment, environmentErr := m.useEnvironment(ctx, false)
 	if environmentErr != nil {
 		return environmentErr
@@ -1187,15 +1215,20 @@ func (m *Manager) Reset(ctx context.Context, id string, keepHome, restart bool) 
 	if err != nil {
 		return err
 	}
-	m.saveUsage(ctx, sbx)
+	// The teardown takes seconds and does not stop half-way, which would leave the sandbox cut
+	// off yet still running; a stop takes effect before the restart.
+	m.progress(id, "停止并删除旧的容器和网络")
+	teardown, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
+	defer cancel()
+	m.saveUsage(teardown, sbx)
 	var errs []error
-	if err := m.revokeRuntime(ctx, sbx); err != nil {
+	if err := m.revokeRuntime(teardown, sbx); err != nil {
 		errs = append(errs, err)
 	}
-	if err := m.stopContainers(ctx, names(sbx.ID)); err != nil {
+	if err := m.stopContainers(teardown, names(sbx.ID)); err != nil {
 		errs = append(errs, err)
 	}
-	if err := m.removeRuntimeObjects(ctx, sbx.ID, keepHome); err != nil {
+	if err := m.removeRuntimeObjects(teardown, sbx.ID, keepHome); err != nil {
 		errs = append(errs, err)
 	}
 	if len(errs) > 0 {
@@ -1209,10 +1242,26 @@ func (m *Manager) Reset(ctx context.Context, id string, keepHome, restart bool) 
 	}); err != nil {
 		return err
 	}
-	if restart {
-		return m.startSnapshot(ctx, id, nil)
+	if !restart {
+		return nil
 	}
-	return nil
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return m.startSnapshot(ctx, id, nil)
+}
+
+// shareEnvironment takes the in-process environment lock shared, like the file lock beside it,
+// but gives up when ctx ends: stopping the environment holds it exclusively for a while.
+func (m *Manager) shareEnvironment(ctx context.Context) (func(), error) {
+	for !m.environmentMu.TryRLock() {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	return m.environmentMu.RUnlock, nil
 }
 
 // removeRuntimeObjects removes containers, networks and optionally the Agent home volume. The
