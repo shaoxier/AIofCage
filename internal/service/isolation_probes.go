@@ -64,6 +64,17 @@ func (a *App) inAgent(sbx sandbox.Sandbox) probeRunner {
 	}
 }
 
+// internalGateway returns the VM's address on the sandbox's internal network, "" when it has none
+// there (as it should, see checkVMPorts). The first address of the subnet is no clue: without a
+// gateway it goes to a container, usually the agent itself.
+func (a *App) internalGateway(ctx context.Context, sbx sandbox.Sandbox) string {
+	internal, err := a.manager.SandboxNetwork(ctx, sbx.ID, runtime.ProbeInternal)
+	if err != nil || len(internal.Gateways) == 0 {
+		return ""
+	}
+	return internal.Gateways[0]
+}
+
 // ---- DNS ----
 
 // dnsCanaryPython answers every query with NXDOMAIN and prints the names that carry this run's
@@ -96,10 +107,11 @@ while time.monotonic()<end:
 `
 
 // dnsClientPython sends queries named <role>-<path>-<nonce>.aiofcage.invalid. The agent also tries
-// public resolvers, TCP 53, DoT and IPv6, DNS on its network's gateway and on the gatekeeper, and
-// resolves a real public name.
+// public resolvers, TCP 53, DoT and IPv6, DNS on its network's gateway (the VM, when it has an
+// address there) and on the gatekeeper, and resolves a real public name.
 const dnsClientPython = `import socket,sys,json,errno,time
 role,nonce,canary=sys.argv[1:4]
+gateway=sys.argv[4] if len(sys.argv)>4 else ""
 LOCAL={errno.ENETUNREACH,errno.EHOSTUNREACH,errno.EACCES,errno.EPERM,errno.EADDRNOTAVAIL,errno.EAFNOSUPPORT}
 def packet(name):
     return b"\x12\x34\x01\x00\x00\x01"+b"\x00"*6+b"".join(bytes([len(p)])+p.encode() for p in name.split("."))+b"\x00\x00\x01\x00\x01"
@@ -127,13 +139,6 @@ def tcp(host,port,family=socket.AF_INET):
 def resolve(name):
     try: socket.getaddrinfo(name,443);return "resolved"
     except OSError: return "failed"
-def gateway():
-    for row in open("/proc/net/route").read().splitlines()[1:]:
-        cols=row.split()
-        if len(cols)>7 and cols[1]!="00000000":
-            # Little-endian hex; Docker gives the gateway the first address of the subnet.
-            return socket.inet_ntoa(((int(cols[1],16)&int(cols[7],16))|0x01000000).to_bytes(4,"little"))
-    return ""
 def label(path): return role+"-"+path+"-"+nonce+".aiofcage.invalid"
 out={"direct":udp(label("direct"),canary,tries=5 if role=="control" else 1),"embedded":resolve(label("embedded"))}
 if role=="agent":
@@ -142,7 +147,7 @@ if role=="agent":
         "udp-ipv6":udp(label("v6"),"2400:3200::1",socket.AF_INET6),"public-name":resolve("example.com")})
     try: keeper=socket.gethostbyname("gatekeeper")
     except OSError: keeper=""
-    for name,host in (("gateway",gateway()),("gatekeeper",keeper)):
+    for name,host in (("gateway",gateway),("gatekeeper",keeper)):
         if host: out.update({"udp-"+name:udp(label(name),host),"tcp-"+name:tcp(host,53)})
 print(json.dumps(out))
 `
@@ -181,7 +186,7 @@ func (a *App) checkDNS(ctx context.Context, sbx sandbox.Sandbox, check Attack, a
 	errs = append(errs, err)
 	run.Negative, err = a.manager.RunProbe(ctx, sbx.ID, runtime.Probe{Network: runtime.ProbeInternal, DNS: ip, Command: client("negative")})
 	errs = append(errs, err)
-	run.Agent, err = agent(ctx, dnsClientPython, "agent", run.Nonce, ip)
+	run.Agent, err = agent(ctx, dnsClientPython, "agent", run.Nonce, ip, a.internalGateway(ctx, sbx))
 	errs = append(errs, err)
 	run.Err = errors.Join(errs...)
 	// The canary prints each query as it arrives; give the last one a moment.
@@ -343,11 +348,13 @@ def serve(path):
 `
 
 // dockerScanPython looks for a reachable container runtime: DOCKER_HOST, mounts, socket files and
-// the Docker TCP ports on loopback, the gatekeeper and the network's gateway. It pings sockets that
-// are mounted in or named like a container runtime's, and leaves other programs' sockets alone. As
-// the agent it first starts its own fake API under /tmp, which it must find.
+// the Docker TCP ports on loopback, the gatekeeper and the network's gateway (the VM, when it has an
+// address there). It pings sockets that are mounted in or named like a container runtime's, and
+// leaves other programs' sockets alone. As the agent it first starts its own fake API under /tmp,
+// which it must find.
 const dockerScanPython = fakeDockerPython + `import stat,json,re,errno
 role,nonce,project=sys.argv[1:4]
+gateway=sys.argv[4] if len(sys.argv)>4 else ""
 KNOWN=re.compile(r"(docker|containerd|podman|buildkit|crio|guestagent)[^/]*\.sock$")
 # Our own fakes, also those of another check running at the same time.
 FAKE=re.compile(r"^/tmp/aiofcage-probe-[0-9a-f]+/probe-api\.sock$")
@@ -410,13 +417,9 @@ for path in sorted(sockets|mounted):
     answer=ping(unix(path))
     answers+=answer=="docker"
     findings.append("socket "+path+("（Docker 接口应答）" if answer=="docker" else ""))
-local=set()
+local={gateway} if gateway else set()
 try: local.add(socket.gethostbyname("gatekeeper"))
 except OSError: pass
-for row in open("/proc/net/route").read().splitlines()[1:]:
-    cols=row.split()
-    if len(cols)>7 and cols[1]!="00000000":
-        local.add(socket.inet_ntoa(((int(cols[1],16)&int(cols[7],16))|0x01000000).to_bytes(4,"little")))
 tcp={}
 for host in ["127.0.0.1"]+sorted(local):
     for port in (2375,2376):
@@ -446,7 +449,7 @@ func (a *App) checkDockerSocket(ctx context.Context, sbx sandbox.Sandbox, check 
 			Mounts:  []string{"type=bind,src=" + path + ",dst=/var/run/docker.sock"},
 			Command: pythonCommand(dockerScanPython, "control", "", "")})
 	})
-	out, err := agent(ctx, dockerScanPython, "agent", probeNonce(), sbx.ProjectPath)
+	out, err := agent(ctx, dockerScanPython, "agent", probeNonce(), sbx.ProjectPath, a.internalGateway(ctx, sbx))
 	return judgeDockerSocket(check, mounted, mountedErr, out, err)
 }
 
@@ -514,6 +517,184 @@ func judgeDockerSocket(check Attack, mounted []byte, mountedErr error, agentOut 
 	case agent.Truncated:
 		r.Evidence += "\n条目太多，扫描没有做完"
 	default:
+		r.Status = checkPassed
+	}
+	return r
+}
+
+// ---- VM ports ----
+
+// vmPorts are services commonly found on the VM, or put there by mistake: SSH, DNS, web, Docker,
+// PostgreSQL, Kubernetes and the gatekeeper's own ports.
+var vmPorts = []int{22, 53, 80, 443, 2375, 2376, 5432, 6443, 8080, 8888, 8890, 8899, 10250}
+
+// vmPortsPython opens a TCP connection to each of the ports (a JSON list) on each address, sending
+// nothing, and lists the container's IPv6 addresses: with one on its network card, the bridge's own
+// link-local address would lead to the VM as well.
+const vmPortsPython = `import socket,sys,json,errno
+from concurrent.futures import ThreadPoolExecutor
+LOCAL={errno.ENETUNREACH,errno.EHOSTUNREACH,errno.EACCES,errno.EPERM,errno.EADDRNOTAVAIL,errno.EAFNOSUPPORT}
+targets=[(host,port) for host in sys.argv[2:] for port in json.loads(sys.argv[1])]
+def tcp(target):
+    try:
+        with socket.create_connection(target,timeout=2): return "connected"
+    except OSError as e:
+        if isinstance(e,socket.timeout): return "timeout"
+        return "blocked" if e.errno in LOCAL else errno.errorcode.get(e.errno,type(e).__name__)
+with ThreadPoolExecutor(16) as pool: answers=list(pool.map(tcp,targets))
+try: ipv6=[line.split()[0] for line in open("/proc/net/if_inet6") if line.split()[-1]!="lo"]
+except OSError: ipv6=[]
+print(json.dumps(dict(ports={host+":"+str(port):answer for (host,port),answer in zip(targets,answers)},ipv6=ipv6)))
+`
+
+// vmPortsRun is what one check of the VM's ports observed.
+type vmPortsRun struct {
+	Internal    runtime.NetworkView
+	InternalErr error
+	Egress      []string // the VM's addresses on the egress network
+	Control     []byte   // an egress-side helper connecting to those
+	ControlErr  error
+	Agent       []byte // the agent connecting to the VM's addresses on both networks
+	AgentErr    error
+}
+
+func (a *App) checkVMPorts(ctx context.Context, sbx sandbox.Sandbox, check Attack, agent probeRunner) AttackResult {
+	egress, err := a.manager.SandboxNetwork(ctx, sbx.ID, runtime.ProbeEgress)
+	if err == nil && len(egress.Gateways) == 0 {
+		err = errors.New("出网网络没有网关")
+	}
+	if err != nil {
+		return classifyCheck(check, nil, err)
+	}
+	ports, _ := json.Marshal(vmPorts)
+	run := vmPortsRun{Egress: egress.Gateways}
+	run.Internal, run.InternalErr = a.manager.SandboxNetwork(ctx, sbx.ID, runtime.ProbeInternal)
+	run.Control, run.ControlErr = a.manager.RunProbe(ctx, sbx.ID, runtime.Probe{Network: runtime.ProbeEgress,
+		Command: pythonCommand(vmPortsPython, append([]string{string(ports)}, run.Egress...)...)})
+	run.Agent, run.AgentErr = agent(ctx, vmPortsPython, append(append([]string{string(ports)}, run.Internal.Gateways...), run.Egress...)...)
+	return judgeVMPorts(check, run)
+}
+
+type vmPortsScan struct {
+	Ports map[string]string `json:"ports"` // by host:port
+	IPv6  []string          `json:"ipv6"`
+}
+
+func parseVMPorts(out []byte, err error) (vmPortsScan, bool) {
+	var scan vmPortsScan
+	return scan, err == nil && json.Unmarshal(bytes.TrimSpace(out), &scan) == nil && scan.Ports != nil
+}
+
+// describePorts sums up what one address answered, e.g. "22 已连接，其余 12 个拒绝连接".
+func describePorts(scan vmPortsScan, host string) string {
+	answer := func(port int) string { return scan.Ports[fmt.Sprintf("%s:%d", host, port)] }
+	count := map[string]int{}
+	for _, port := range vmPorts {
+		count[answer(port)]++
+	}
+	common := answer(vmPorts[0])
+	for _, port := range vmPorts {
+		if count[answer(port)] > count[common] {
+			common = answer(port)
+		}
+	}
+	var others []string
+	for _, port := range vmPorts {
+		if answer(port) != common {
+			others = append(others, fmt.Sprintf("%d %s", port, dnsWord(answer(port))))
+		}
+	}
+	if len(others) == 0 {
+		return fmt.Sprintf("%d 个端口都%s", len(vmPorts), dnsWord(common))
+	}
+	return strings.Join(others, "，") + fmt.Sprintf("，其余 %d 个%s", count[common], dnsWord(common))
+}
+
+func judgeVMPorts(check Attack, run vmPortsRun) AttackResult {
+	r := AttackResult{Attack: check, Status: checkInconclusive,
+		Note: "虚拟机在出网网络上有地址（门卫经它出网），在内部网络上不应有：否则虚拟机上监听所有地址的服务（例如 sshd）Agent 都连得到，Docker 的隔离规则管不到发给虚拟机自己的流量。Agent 连虚拟机在两个网络上的地址的常见端口，只建 TCP 连接、不发送数据，虚拟机有回应（连上或拒绝连接）就是发现问题；另看 Agent 网卡上有没有 IPv6 地址，有的话网桥的链路本地地址也可能通到虚拟机。只覆盖这些端口。"}
+	ports := make([]string, len(vmPorts))
+	for i, port := range vmPorts {
+		ports[i] = fmt.Sprint(port)
+	}
+	control, controlOK := parseVMPorts(run.Control, run.ControlErr)
+	var open []string
+	for _, host := range run.Egress {
+		for _, port := range vmPorts {
+			if endpoint := fmt.Sprintf("%s:%d", host, port); control.Ports[endpoint] == "connected" {
+				open = append(open, endpoint)
+			}
+		}
+	}
+	detail := strings.Join(open, "、")
+	if run.ControlErr != nil {
+		detail = run.ControlErr.Error()
+	} else if !controlOK {
+		detail = "未取得结果"
+	}
+	r.Controls = []CheckControl{{Name: "出网网络上的对照容器能连上虚拟机的端口", OK: len(open) > 0, Detail: detail}}
+	var problems, lines []string
+	settled := true
+	switch {
+	case run.InternalErr != nil:
+		settled = false
+		lines = append(lines, "内部网络的设置读取失败："+run.InternalErr.Error())
+	case len(run.Internal.Gateways) > 0:
+		problems = append(problems, "虚拟机在内部网络上有地址 "+strings.Join(run.Internal.Gateways, "、")+"（网关）")
+	default:
+		lines = append(lines, "内部网络 "+run.Internal.Name+" 上没有虚拟机的地址（Docker 没有给它分配网关）")
+	}
+	agent, agentOK := parseVMPorts(run.Agent, run.AgentErr)
+	switch {
+	case run.AgentErr != nil:
+		settled = false
+		lines = append(lines, "检查命令执行失败："+run.AgentErr.Error())
+	case !agentOK:
+		settled = false
+		lines = append(lines, "未取得完整检查结果")
+	default:
+		where := map[string]string{}
+		for _, host := range run.Internal.Gateways {
+			where[host] = "（内部网关）"
+		}
+		for _, host := range run.Egress {
+			where[host] = "（虚拟机在出网网络上的地址）"
+		}
+		for _, host := range append(append([]string{}, run.Internal.Gateways...), run.Egress...) {
+			lines = append(lines, "Agent 连 "+host+where[host]+"："+describePorts(agent, host))
+			var connected []string
+			refused := false
+			for _, port := range vmPorts {
+				switch agent.Ports[fmt.Sprintf("%s:%d", host, port)] {
+				case "connected":
+					connected = append(connected, fmt.Sprint(port))
+				case "ECONNREFUSED":
+					refused = true
+				case "blocked":
+				default:
+					settled = false
+				}
+			}
+			if len(connected) > 0 {
+				problems = append(problems, "Agent 连上了虚拟机 "+host+" 的 "+strings.Join(connected, "、")+" 端口")
+			} else if refused {
+				problems = append(problems, "虚拟机 "+host+" 回应了 Agent 的连接（拒绝连接）")
+			}
+		}
+		ipv6 := "无"
+		if len(agent.IPv6) > 0 {
+			ipv6 = strings.Join(agent.IPv6, "、")
+			problems = append(problems, "Agent 网卡上有 IPv6 地址")
+		}
+		lines = append(lines, "Agent 网卡上的 IPv6 地址："+ipv6)
+	}
+	lines = append(lines, "端口："+strings.Join(ports, "、"))
+	r.Evidence = strings.Join(lines, "\n")
+	switch {
+	case len(problems) > 0:
+		r.Status = checkProblem
+		r.Evidence = strings.Join(problems, "；") + "\n" + r.Evidence
+	case settled:
 		r.Status = checkPassed
 	}
 	return r

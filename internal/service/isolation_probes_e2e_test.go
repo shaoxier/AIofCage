@@ -40,6 +40,8 @@ func TestIsolationChecksCatchBrokenSandboxes(t *testing.T) {
 		{"agent on the egress network", func(c Attack, r probeRunner) AttackResult { return app.checkDNS(ctx, sbx, c, r) },
 			runIn(runtime.Probe{Network: runtime.ProbeEgress})},
 		{"Docker socket mounted", func(c Attack, r probeRunner) AttackResult { return app.checkDockerSocket(ctx, sbx, c, r) }, withSocket},
+		{"agent on a network the VM is on", func(c Attack, r probeRunner) AttackResult { return app.checkVMPorts(ctx, sbx, c, r) },
+			runIn(runtime.Probe{Network: runtime.ProbeEgress})},
 		{"whole workspace shared", func(c Attack, r probeRunner) AttackResult { return app.checkProjectBoundary(ctx, sbx, c, r) },
 			runIn(runtime.Probe{Network: runtime.ProbeNone, Mounts: []string{"type=bind,src=" + workspace + ",dst=" + workspace + ",readonly"}})},
 		{"workspace mounted as the project", func(c Attack, r probeRunner) AttackResult { return app.checkProjectBoundary(ctx, sbx, c, r) },
