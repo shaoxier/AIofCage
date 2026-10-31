@@ -416,7 +416,7 @@ func (a *App) SetSandboxMCPPermissions(id string, ids []string, filesystem bool,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	return a.manager.SetMCPPermissions(ctx, id, ids, filesystem, permissions)
+	return a.markStale(id, a.manager.SetMCPPermissions(ctx, id, ids, filesystem, permissions))
 }
 
 // testDatabase logs in through a throwaway connector and runs a read-only query, which checks the

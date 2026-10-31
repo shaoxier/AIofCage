@@ -430,5 +430,5 @@ func (a *App) SetSandboxDevSources(id string, sources []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	return a.manager.SetDevSources(ctx, id, sources)
+	return a.markStale(id, a.manager.SetDevSources(ctx, id, sources))
 }

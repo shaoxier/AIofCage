@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/shaoxier/AIofCage/internal/gatekeeper"
+	"github.com/shaoxier/AIofCage/internal/mcp"
 	"github.com/shaoxier/AIofCage/internal/policy"
 	"github.com/shaoxier/AIofCage/internal/provider"
 	"github.com/shaoxier/AIofCage/internal/sandbox"
@@ -304,5 +305,28 @@ func TestUnreachableGatekeeperIsStopped(t *testing.T) {
 	commands, _ := os.ReadFile(log)
 	if err == nil || !strings.Contains(err.Error(), "已停止它的门卫") || !strings.Contains(string(commands), "stop --time 5 aiofcage-sbx-live0001-gate") {
 		t.Fatalf("the gatekeeper must be stopped: %v\n%s", err, commands)
+	}
+}
+
+// A connector launches with the service as it is when it starts, not as the sandbox's settings
+// were read minutes earlier: an edited database address comes with its own password.
+func TestConnectorsLaunchWithTheServiceAsItIsNow(t *testing.T) {
+	m, st, vault := newRemoteManager(t, nil)
+	read := mcp.Service{ID: "shop", Name: "Shop", Kind: mcp.KindPostgres, URL: "postgresql://app@old.example/shop", KeyRef: mcp.KeyRefFor("shop")}
+	edited := read
+	edited.URL = "postgresql://app@new.example/shop"
+	if err := st.SaveMCPService(edited); err != nil {
+		t.Fatal(err)
+	}
+	vault[read.KeyRef] = []byte("synthetic-new-password")
+	service, secret, err := m.connectorSecret(context.Background(), read)
+	if err != nil || service.URL != edited.URL || string(secret) != "synthetic-new-password" {
+		t.Fatalf("got %q %q %v", service.URL, secret, err)
+	}
+	if err := st.SaveMCPService(mcp.Service{ID: "shop", Name: "Shop", URL: "https://docs.example.com/mcp", KeyRef: read.KeyRef}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := m.connectorSecret(context.Background(), read); err == nil {
+		t.Fatal("a service that is no longer a connector must not be launched")
 	}
 }

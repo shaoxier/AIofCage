@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/shaoxier/AIofCage/internal/oauth"
+	"github.com/shaoxier/AIofCage/internal/sandbox"
 )
 
 func TestOAuthServiceRefreshesBeforeUse(t *testing.T) {
@@ -138,5 +140,46 @@ func TestLoginForAnEditedServiceIsNotSaved(t *testing.T) {
 	}
 	if _, saved := secrets[view.KeyRef]; saved {
 		t.Fatal("nothing may be stored")
+	}
+}
+
+// A sandbox whose refresh failed gets its stored settings again every minute until it succeeds,
+// at most staleRetries times; a deleted sandbox is not refreshed.
+func TestStaleSandboxesAreRetried(t *testing.T) {
+	app, _, st := newApp(t)
+	if err := st.SaveSandbox(sandbox.Sandbox{ID: "sbx-stale001", Name: "stale", ProjectPath: "/Users/u/CageWorkspace/p"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"sbx-stale001", "sbx-gone0001"} {
+		if err := app.markStale(id, errors.New("没能下发")); err == nil {
+			t.Fatal("markStale returns the error it records")
+		}
+	}
+	app.markStale("sbx-fine0001", nil)
+	calls := map[string]int{}
+	failing := true
+	refresh := func(_ context.Context, id string) error {
+		calls[id]++
+		if failing {
+			return errors.New("门卫没有回应")
+		}
+		return nil
+	}
+	app.retryStale(context.Background(), refresh)
+	if calls["sbx-stale001"] != 1 || calls["sbx-gone0001"] != 0 || calls["sbx-fine0001"] != 0 {
+		t.Fatalf("only marked sandboxes that still exist are refreshed: %v", calls)
+	}
+	failing = false
+	app.retryStale(context.Background(), refresh)
+	if _, still := app.monitor.stale["sbx-stale001"]; still || calls["sbx-stale001"] != 2 {
+		t.Fatalf("a successful retry clears the mark: %v %v", calls, app.monitor.stale)
+	}
+	failing = true
+	app.markStale("sbx-stale001", errors.New("没能下发"))
+	for range staleRetries {
+		app.retryStale(context.Background(), refresh)
+	}
+	if len(app.monitor.stale) != 0 || calls["sbx-stale001"] != 2+staleRetries {
+		t.Fatalf("retries stop after %d attempts: %v %v", staleRetries, calls, app.monitor.stale)
 	}
 }
