@@ -9,6 +9,7 @@ import { LogsPage } from "./logs.js";
 import { TerminalView, openTerminal, closeTerminal, useTerminals, updateTerminalDraft, addTerminalImages, handleTerminalPaste, handleTerminalImageKey } from "./terminal.js";
 import { IMAGE_ACCEPT, removeImage, sendDraft } from "./terminal-draft.js";
 import { SandboxAgentUpdates } from "./agent-versions.js";
+import { OperationProgress } from "./progress.js";
 import { DemoTask } from "./demo-cases.js";
 import { placeTerminalMenu, terminalMenuKey } from "./terminal-menu.js";
 
@@ -23,7 +24,7 @@ const TABS = [
   { id: "logs", label: "日志", icon: "list" },
 ];
 
-export function SandboxDetail({ sandbox, detail, setDetail, providers, services, recoverable, events, usage, vm, busy, progress, run, notify,
+export function SandboxDetail({ sandbox, detail, setDetail, providers, services, recoverable, events, usage, vm, busy, run, notify,
   onAddAgents, onEditMCP, onAttack, onReset, onDelete, onLogs, dialogs, devSources, onEditDev }) {
   const [restartConfirm, setRestartConfirm] = useState(false);
   const tab = detail.tab ?? "overview";
@@ -52,7 +53,7 @@ export function SandboxDetail({ sandbox, detail, setDetail, providers, services,
       </div>
       <button class="link mono" onClick=${() => call("OpenProjectFolder", sandbox.id).catch((e) => notify(e.message, true))}
         title="在访达中打开">${sandbox.project_path}</button>
-      ${busy && progress && html`<p class="progress" role="status">${progress}</p>`}
+      <${OperationProgress} sandboxId=${sandbox.id} activity=${sandbox.activity} notify=${notify} />
       ${sandbox.demo_case && tab === "overview" && html`<${DemoTask} caseID=${sandbox.demo_case} notify=${notify} />`}
       <div class="tabs" role="tablist">
         ${TABS.map((t) => html`<button role="tab" aria-selected=${t.id === tab} tabindex=${t.id === tab ? 0 : -1} class=${t.id === tab ? "tab active" : "tab"}

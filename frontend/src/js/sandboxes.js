@@ -1,11 +1,12 @@
 // 沙箱页：参考 Docker Desktop 的容器列表——创建、启停、打开终端、切换供应商、删除。
-import { useEffect, useState } from "preact/hooks";
+import { useState } from "preact/hooks";
 import { html, call, AGENTS, agentName, STATES, formatTokens, formatBytes, Icon, agentIcon, PageTitle } from "./core.js";
 import { cleanGrants, MCPChoices } from "./mcp.js";
 import { DevSourceChoices, DevSourceDialog, useDevSources } from "./dev-sources.js";
 import { AttackDialog } from "./ai.js";
 import { useTerminals } from "./terminal.js";
 import { SandboxDetail } from "./sandbox-detail.js";
+import { OperationProgress } from "./progress.js";
 
 export function SandboxesPage({ sandboxes, providers, services, recoverable, overview, summary, events, reload, notify, onAddProvider, onLogs, detail, setDetail, tutorial }) {
   const [query, setQuery] = useState("");
@@ -17,24 +18,18 @@ export function SandboxesPage({ sandboxes, providers, services, recoverable, ove
   const [attacking, setAttacking] = useState(null);
   const [creating, setCreating] = useState(false);
   const [busy, setBusy] = useState({}); // id → 正在进行的操作
-  const [progress, setProgress] = useState({}); // id → 最近一条进度
   const [deleting, setDeleting] = useState(null);
   const [resetting, setResetting] = useState(null);
 
-  useEffect(() => {
-    const off = window.runtime?.EventsOn?.("sandbox:progress", (event) =>
-      setProgress((current) => ({ ...current, [event.id]: event.message })));
-    return () => off?.();
-  }, []);
-
   const run = async (sandbox, label, method, ...args) => {
     setBusy((current) => ({ ...current, [sandbox.id]: label }));
-    setProgress((current) => ({ ...current, [sandbox.id]: "" }));
     try {
       await call(method, ...args);
       return true;
     } catch (error) {
-      notify(`「${sandbox.name}」${label}失败：${error.message}`, true);
+      // 按要求停止的操作不算失败；后端会说明沙箱停在什么状态。
+      const stopped = error.message.startsWith("已停止");
+      notify(stopped ? `「${sandbox.name}」${error.message}` : `「${sandbox.name}」${label}失败：${error.message}`, !stopped);
       return false;
     } finally {
       setBusy((current) => ({ ...current, [sandbox.id]: undefined }));
@@ -90,7 +85,7 @@ export function SandboxesPage({ sandboxes, providers, services, recoverable, ove
   if (current) {
     return html`<${SandboxDetail} sandbox=${current} detail=${detail} setDetail=${setDetail} providers=${providers}
       services=${services} recoverable=${recoverable} events=${events} vm=${overview?.environment?.vm} usage=${summary?.sandboxes?.find((u) => u.id === current.id)}
-      busy=${busy[current.id] ?? current.operation} progress=${progress[current.id] || current.progress} run=${run} notify=${notify}
+      busy=${busy[current.id] ?? current.operation} run=${run} notify=${notify}
       onAddAgents=${() => setAddingAgents(current)} onEditMCP=${() => setEditingMCP(current)} onAttack=${() => setAttacking(current)}
       devSources=${devSources} onEditDev=${() => setEditingDev(current)}
       onReset=${() => setResetting(current)} onDelete=${() => setDeleting(current)} onLogs=${(filter) => onLogs(current.id, filter)} dialogs=${dialogs} />`;
@@ -119,7 +114,7 @@ export function SandboxesPage({ sandboxes, providers, services, recoverable, ove
             ${visible.map((s) => html`<${SandboxRow} key=${s.id} sandbox=${s} providers=${providers}
               usage=${summary?.sandboxes?.find((u) => u.id === s.id)} onLogs=${() => onLogs(s.id)}
               services=${services} onEditMCP=${() => setEditingMCP(s)} onAttack=${() => setAttacking(s)}
-              busy=${busy[s.id] ?? s.operation} progress=${progress[s.id] || s.progress} run=${run} notify=${notify}
+              busy=${busy[s.id] ?? s.operation} run=${run} notify=${notify}
               onReset=${() => setResetting(s)} onDelete=${() => setDeleting(s)} onOpen=${(view) => setDetail({ id: s.id, ...view })} />`)}
             ${!visible.length && html`<div class="panel empty"><span class="empty-icon"><${Icon} name="search" size=${40} /></span><h3>没有匹配的沙箱</h3><p>试试其他名称或状态。</p><button onClick=${() => { setQuery(""); setFilter("all"); }}>重置筛选</button></div>`}
           </div>`}
@@ -173,7 +168,7 @@ export function UsageStats({ sandbox, usage, onLogs }) {
   </div>`;
 }
 
-function SandboxRow({ sandbox, providers, usage, busy, progress, run, notify, onReset, onDelete, onOpen }) {
+function SandboxRow({ sandbox, providers, usage, busy, run, notify, onReset, onDelete, onOpen }) {
   const state = STATES[sandbox.state] ?? STATES.unknown;
   const running = sandbox.state === "running";
   const openTerminals = useTerminals(sandbox.id).filter((t) => !t.exited);
@@ -189,7 +184,8 @@ function SandboxRow({ sandbox, providers, usage, busy, progress, run, notify, on
       <p class="mono project-path" title=${sandbox.project_path}>${sandbox.project_path}</p>
       <div class="agent-summary">${sandbox.bindings.length ? sandbox.bindings.map((b) => html`<span class="binding"><${Icon} name=${agentIcon(b.agent)} size=${16} />${agentName(b.agent)}<span class="muted"> · ${b.provider_name || "待配置"}</span></span>`) : html`<span class="caption">空白沙箱</span>`}</div>
       ${sandbox.config_pending && html`<span class="caption">配置待重启生效</span>`}
-      ${busy && html`<p class="progress" role="status">${progress || "正在处理…"}</p>`}
+      ${sandbox.activity ? html`<${OperationProgress} sandboxId=${sandbox.id} activity=${sandbox.activity} compact notify=${notify} />`
+        : busy && html`<p class="progress" role="status">正在处理…</p>`}
     </div></div>
     <${UsageStats} sandbox=${sandbox} usage=${usage} />
     <div class="row-actions">

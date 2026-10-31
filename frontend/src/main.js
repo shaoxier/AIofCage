@@ -85,8 +85,13 @@ function App() {
     });
     const offStats = window.runtime?.EventsOn?.("sandbox:stats", () => refreshSummary());
     const offAlert = window.runtime?.EventsOn?.("sandbox:alert", (alert) => notify(alert.message, alert.level !== "info"));
-    // 启动进度由后端记住；收到进度就刷新列表，切换页面回来也能看到正在进行的操作。
-    const offProgress = window.runtime?.EventsOn?.("sandbox:progress", () => reload());
+    // 进度只更新对应沙箱的操作，不重读全部数据；操作结束时沙箱状态会变，再刷新一次列表。
+    // 后端也记着进度，切换页面回来照样能看到正在进行的操作。
+    const offProgress = window.runtime?.EventsOn?.("sandbox:progress", ({ id, activity }) => {
+      setSandboxes((list) => list.map((s) => s.id !== id ? s : { ...s, activity,
+        operation: activity.outcome ? "" : activity.label, progress: activity.outcome ? "" : activity.steps?.at(-1)?.text ?? "" }));
+      if (activity.outcome) reload();
+    });
     // 弹窗焦点与键盘导航统一处理，兼容现有原生表单。
     let topDialog = null;
     let returnFocus = null;
