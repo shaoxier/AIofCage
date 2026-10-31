@@ -1,5 +1,5 @@
 // 供应商页：参考 CC Switch，按 Agent 分组管理模型供应商；密钥只写入钥匙串，界面从不读取。
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { html, call, AGENTS, agentName, PROTOCOLS, COMPATIBLE, AUTHS, formatTokens, ConfirmDialog, Icon, agentIcon, PageTitle } from "./core.js";
 import { PricingLookup } from "./pricing.js";
 import { ModelPicker } from "./model-picker.js";
@@ -123,6 +123,7 @@ function ProviderDialog({ agent, presets, initial, onClose, onSaved }) {
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
   const [models, setModels] = useState({ list: [], message: "", ok: false, loading: false });
+  const fetches = useRef(0); // 连续获取时只采用最后一次的结果
   const choose = (p) => {
     setPreset(p);
     setForm({
@@ -144,12 +145,13 @@ function ProviderDialog({ agent, presets, initial, onClose, onSaved }) {
   });
   // 用表单里的地址和密钥获取模型列表，不用先保存；编辑时密钥留空就用已保存的。
   const fetchModels = async () => {
+    const turn = ++fetches.current;
     setModels((current) => ({ ...current, loading: true, message: "正在获取模型列表…" }));
     try {
       const result = await call("PreviewProviderModels", request());
-      setModels({ list: result.models ?? [], message: result.message, ok: result.ok, loading: false });
+      if (turn === fetches.current) setModels({ list: result.models ?? [], message: result.message, ok: result.ok, loading: false });
     } catch (e) {
-      setModels({ list: [], message: e.message, ok: false, loading: false });
+      if (turn === fetches.current) setModels({ list: [], message: e.message, ok: false, loading: false });
     }
   };
   // 编辑已有供应商时先显示缓存的列表。

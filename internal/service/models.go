@@ -39,8 +39,9 @@ const (
 )
 
 // modelIDPattern accepts the model names providers use (gpt-6.1-sol, claude-sonnet-4-5,
-// deepseek-ai/DeepSeek-V3, qwen:72b) and nothing that could be markup or a control character.
-var modelIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$`)
+// deepseek-ai/DeepSeek-V3, qwen:72b, @cf/meta/llama-3-8b-instruct) and nothing that could be
+// markup or a control character.
+var modelIDPattern = regexp.MustCompile(`^[A-Za-z0-9@][A-Za-z0-9._:/@+-]{0,199}$`)
 
 // modelCache keeps model lists of saved providers, keyed by what decides the answer: address,
 // protocol, authentication and Keychain item. The key itself is never part of it.

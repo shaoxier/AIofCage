@@ -51,7 +51,7 @@ func serveModels(t *testing.T, app *App, handler http.HandlerFunc) *modelServer 
 func TestModelListIsFilteredCachedAndRefreshed(t *testing.T) {
 	app, _, _ := newApp(t)
 	server := serveModels(t, app, func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"data":[{"id":"gpt-6.1-sol"},{"id":"gpt-6-sol"},{"id":"gpt-6-sol"},{"id":"<script>"},{"id":""},{"id":"a b"},{"id":"deepseek-ai/DeepSeek-V3"}]}`))
+		w.Write([]byte(`{"data":[{"id":"gpt-6.1-sol"},{"id":"gpt-6-sol"},{"id":"gpt-6-sol"},{"id":"<script>"},{"id":""},{"id":"a b"},{"id":"deepseek-ai/DeepSeek-V3"},{"id":"@cf/meta/llama-3-8b-instruct"}]}`))
 	})
 	view, err := app.SaveProvider(SaveProviderRequest{Name: "xapi", Agent: session.Codex, Protocol: provider.OpenAIResponses,
 		BaseURL: "https://xapi.example.com/v1", Model: "gpt-6.1-sol", Auth: provider.AuthBearer, APIKey: "synthetic-models-key-0123"})
@@ -59,7 +59,7 @@ func TestModelListIsFilteredCachedAndRefreshed(t *testing.T) {
 		t.Fatal(err)
 	}
 	list, err := app.ProviderModels(view.ID, false)
-	if err != nil || !list.OK || strings.Join(list.Models, ",") != "deepseek-ai/DeepSeek-V3,gpt-6-sol,gpt-6.1-sol" || list.Cached {
+	if err != nil || !list.OK || strings.Join(list.Models, ",") != "@cf/meta/llama-3-8b-instruct,deepseek-ai/DeepSeek-V3,gpt-6-sol,gpt-6.1-sol" || list.Cached {
 		t.Fatalf("got %+v %v", list, err)
 	}
 	if got := server.seen()[0]; got.URL.Path != "/v1/models" || got.Header.Get("Authorization") != "Bearer synthetic-models-key-0123" {
