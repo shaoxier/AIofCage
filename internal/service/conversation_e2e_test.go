@@ -75,7 +75,7 @@ func checkConversationAgent(t *testing.T, p provider.Provider) {
 		}
 		_ = os.RemoveAll(s.ProjectPath)
 	})
-	manager.Progress = func(_ string, message string) { t.Log(message) }
+	manager.Progress = func(_ string, update runtime.Update) { t.Log(update.Step, update.Detail) }
 	if err := app.StartSandbox(s.ID); err != nil {
 		t.Fatal(err)
 	}

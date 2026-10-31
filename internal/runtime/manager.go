@@ -53,8 +53,8 @@ type Manager struct {
 	store  *store.Store
 	vault  vault.Store
 
-	// Progress, when set, receives human-readable steps for long operations.
-	Progress func(sandboxID, message string)
+	// Progress, when set, receives the steps of long operations and details within them.
+	Progress func(sandboxID string, update Update)
 	// BeforeReplace 仅在候选镜像就绪、即将中断旧容器时关闭桌面会话。
 	BeforeReplace func(sandboxID string)
 	// OAuth refreshes tokens of OAuth MCP services before they are handed to a gatekeeper.
@@ -81,9 +81,22 @@ func NewManager(st *store.Store, secrets vault.Store) (*Manager, error) {
 
 func (m *Manager) Environment() *Environment { return m.env }
 
+// Update is one progress report of a long operation. A non-empty Step starts the next step;
+// otherwise Detail says where the current step is (a build step, the latest line of a tool).
+type Update struct {
+	Step   string
+	Detail string
+}
+
 func (m *Manager) progress(id, message string) {
 	if m.Progress != nil {
-		m.Progress(id, message)
+		m.Progress(id, Update{Step: message})
+	}
+}
+
+func (m *Manager) detail(id, detail string) {
+	if m.Progress != nil && detail != "" {
+		m.Progress(id, Update{Detail: detail})
 	}
 }
 
@@ -477,7 +490,7 @@ func (m *Manager) startSnapshot(ctx context.Context, id string, original *sandbo
 		}
 	}
 	m.progress(sbx.ID, "检查专用虚拟机")
-	if err := m.env.Ensure(ctx); err != nil {
+	if err := m.env.Ensure(ctx, func(line string) { m.detail(sbx.ID, line) }); err != nil {
 		return err
 	}
 	gateBuild, err := gatekeeperContext()
@@ -489,7 +502,7 @@ func (m *Manager) startSnapshot(ctx context.Context, id string, original *sandbo
 		return err
 	}
 	for _, build := range []buildContext{gateBuild, agentBuild} {
-		if err := m.ensureImage(ctx, build, func(message string) { m.progress(sbx.ID, message) }); err != nil {
+		if err := m.ensureImage(ctx, build, sbx.ID); err != nil {
 			return err
 		}
 	}

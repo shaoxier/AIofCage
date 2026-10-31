@@ -122,10 +122,10 @@ func (m *Manager) replaceAgents(ctx context.Context, id string, original, candid
 		return err
 	}
 	m.progress(id, "准备智能体镜像，当前沙箱继续运行")
-	if err := m.env.Ensure(ctx); err != nil {
+	if err := m.env.Ensure(ctx, func(line string) { m.detail(id, line) }); err != nil {
 		return err
 	}
-	if err := m.ensureImage(ctx, build, func(message string) { m.progress(id, message) }); err != nil {
+	if err := m.ensureImage(ctx, build, id); err != nil {
 		return err
 	}
 	state := m.Status(ctx, id).State

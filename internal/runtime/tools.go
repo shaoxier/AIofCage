@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"debug/macho"
@@ -13,6 +14,7 @@ import (
 	goruntime "runtime"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 var errToolArchitecture = errors.New("需要 ARM 原生工具")
@@ -122,11 +124,31 @@ func (e *commandError) Error() string {
 
 func summarize(stderr []byte) string {
 	lines := strings.Split(strings.TrimSpace(string(stderr)), "\n")
-	last := strings.TrimSpace(lines[len(lines)-1])
-	if len(last) > 300 {
-		last = last[:300] + "…"
+	return clip(strings.TrimSpace(lines[len(lines)-1]), 300)
+}
+
+// clip shortens s to at most limit bytes without cutting a character in half.
+func clip(s string, limit int) string {
+	if len(s) <= limit {
+		return s
 	}
-	return last
+	s = s[:limit]
+	for !utf8.ValidString(s) {
+		s = s[:len(s)-1]
+	}
+	return s + "…"
+}
+
+// scanOutputLines splits command output on newlines and on carriage returns, which progress
+// displays use to redraw a line.
+func scanOutputLines(data []byte, atEOF bool) (int, []byte, error) {
+	if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
 }
 
 type runner struct {
@@ -160,6 +182,53 @@ func (r runner) run(ctx context.Context, timeout time.Duration, stdin []byte, ar
 		return stdout.Bytes(), &commandError{filepath.Base(r.path), action, summarize(stderr.Bytes())}
 	}
 	return stdout.Bytes(), nil
+}
+
+// runLines runs a command like run, but hands each non-empty line of its output (stdout and stderr
+// together) to onLine as it arrives. The error keeps the last line, which for most tools says what
+// went wrong.
+func (r runner) runLines(ctx context.Context, timeout time.Duration, onLine func(string), args ...string) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, r.path, append(append([]string{}, r.args...), args...)...)
+	boundCommandLifetime(cmd)
+	cmd.Env = childEnv()
+	reader, writer := io.Pipe()
+	cmd.Stdout, cmd.Stderr = writer, writer
+	last := ""
+	scanned := make(chan struct{})
+	go func() {
+		defer close(scanned)
+		scanner := bufio.NewScanner(reader)
+		scanner.Buffer(make([]byte, 64<<10), 1<<20)
+		scanner.Split(scanOutputLines)
+		for scanner.Scan() {
+			if line := strings.TrimSpace(scanner.Text()); line != "" {
+				last = line
+				if onLine != nil {
+					onLine(line)
+				}
+			}
+		}
+		io.Copy(io.Discard, reader) // keep the command from blocking after an overlong line
+	}()
+	err := cmd.Run()
+	writer.Close()
+	<-scanned
+	if err == nil {
+		return nil
+	}
+	action := ""
+	if len(args) > 0 {
+		action = args[0]
+	}
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return &commandError{filepath.Base(r.path), action, "超时"}
+	case errors.Is(ctx.Err(), context.Canceled):
+		return &commandError{filepath.Base(r.path), action, "已取消"}
+	}
+	return &commandError{filepath.Base(r.path), action, clip(last, 300)}
 }
 
 // stream runs a command with caller-provided stdio, for interactive exec from the CLI.

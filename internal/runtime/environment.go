@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	goruntime "runtime"
 	"strconv"
 	"strings"
@@ -78,8 +79,9 @@ func (e *Environment) vm(ctx context.Context) (*VMInfo, error) {
 	return nil, nil
 }
 
-// Ensure creates or starts the dedicated VM and then verifies its sharing boundary.
-func (e *Environment) Ensure(ctx context.Context) error {
+// Ensure creates or starts the dedicated VM and then verifies its sharing boundary. detail, if
+// set, receives what the VM start is doing.
+func (e *Environment) Ensure(ctx context.Context, detail func(string)) error {
 	if e.store != nil {
 		unlock, err := e.store.LockOperation(ctx, "environment", false)
 		if err != nil {
@@ -97,6 +99,24 @@ func (e *Environment) Ensure(ctx context.Context) error {
 	if err := os.MkdirAll(workspace, 0o755); err != nil {
 		return fmt.Errorf("无法创建工作区：%w", err)
 	}
+	if err := e.startVM(ctx, workspace, detail); err != nil {
+		return err
+	}
+	return e.verify(ctx, true)
+}
+
+// startVM creates or starts the VM when it is not running. Only one start runs at a time, across
+// processes, so two sandboxes starting together do not create the VM twice. A start, once begun,
+// is not interrupted: stopping colima while it downloads or boots the VM can leave it broken, so a
+// stop waits for the start to finish and takes effect after it.
+func (e *Environment) startVM(ctx context.Context, workspace string, detail func(string)) error {
+	if e.store != nil {
+		unlock, err := e.store.LockOperation(ctx, "vm-start", true)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+	}
 	vm, err := e.vm(ctx)
 	if err != nil {
 		return err
@@ -105,23 +125,73 @@ func (e *Environment) Ensure(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var args []string
+	timeout := 10 * time.Minute
 	switch {
 	case vm == nil:
 		// Same flags as the validation package: no user template, no SSH config or agent
 		// forwarding, no context switch, only the workspace shared.
-		_, err = e.colima.run(ctx, 20*time.Minute, nil, "start", ColimaProfile,
+		args = []string{"start", ColimaProfile,
 			"--arch", "aarch64", "--vm-type", "vz", "--mount-type", "virtiofs",
-			"--cpu", strconv.Itoa(resources.CPUs), "--memory", strconv.Itoa(resources.MemoryGiB), "--disk", strconv.Itoa(resources.DiskGiB), "--mount", workspace+":w",
+			"--cpu", strconv.Itoa(resources.CPUs), "--memory", strconv.Itoa(resources.MemoryGiB), "--disk", strconv.Itoa(resources.DiskGiB), "--mount", workspace + ":w",
 			"--activate=false", "--ssh-config=false", "--ssh-agent=false", "--template=false",
-			"--kubernetes=false", "--runtime", "docker", "--binfmt=false")
+			"--kubernetes=false", "--runtime", "docker", "--binfmt=false"}
+		timeout = 20 * time.Minute
 	case vm.Status != "Running":
-		_, err = e.colima.run(ctx, 10*time.Minute, nil, "start", ColimaProfile, "--activate=false", "--ssh-config=false",
-			"--cpu", strconv.Itoa(resources.CPUs), "--memory", strconv.Itoa(resources.MemoryGiB), "--disk", strconv.Itoa(resources.DiskGiB))
+		args = []string{"start", ColimaProfile, "--activate=false", "--ssh-config=false",
+			"--cpu", strconv.Itoa(resources.CPUs), "--memory", strconv.Itoa(resources.MemoryGiB), "--disk", strconv.Itoa(resources.DiskGiB)}
+	default:
+		return nil
 	}
-	if err != nil {
+	report := func(line string) {
+		if detail != nil {
+			detail(line)
+		}
+	}
+	report("正在启动专用虚拟机")
+	done := make(chan error, 1)
+	go func() {
+		done <- e.colima.runLines(context.WithoutCancel(ctx), timeout, func(line string) { report(vmLine(line)) }, args...)
+	}()
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		report("已收到停止请求，等虚拟机启动完成后再停止（中途打断可能损坏虚拟机）")
+		if err = <-done; err == nil {
+			err = ctx.Err()
+		}
+	}
+	if err != nil && ctx.Err() == nil {
 		return fmt.Errorf("启动专用虚拟机失败：%w", err)
 	}
-	return e.verify(ctx, true)
+	return err
+}
+
+var (
+	colimaMessage   = regexp.MustCompile(`msg="((?:[^"\\]|\\.)*)"`)
+	limaRequirement = regexp.MustCompile(`essential requirement (\d+) of (\d+)`)
+)
+
+// vmLine turns a line of colima output into a short description of what the VM start is doing.
+func vmLine(line string) string {
+	message := line
+	if match := colimaMessage.FindStringSubmatch(line); match != nil {
+		message = strings.ReplaceAll(match[1], `\"`, `"`)
+	}
+	switch lower := strings.ToLower(message); {
+	case strings.Contains(lower, "downloading"):
+		return "正在下载虚拟机系统镜像（首次约 300 MB，网络慢时要等较久）"
+	case limaRequirement.MatchString(message):
+		match := limaRequirement.FindStringSubmatch(message)
+		return fmt.Sprintf("等待虚拟机就绪（%s/%s）", match[1], match[2])
+	case strings.Contains(lower, "creating and starting"):
+		return "正在创建并启动虚拟机"
+	case strings.Contains(lower, "provisioning"):
+		return "正在配置虚拟机里的 Docker"
+	case lower == "done":
+		return "虚拟机已启动"
+	}
+	return clip(message, 160)
 }
 
 // Verify checks the actual VM configuration and mounts rather than trusting our own flags.

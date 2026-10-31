@@ -33,7 +33,7 @@ func TestDemoCasesEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	a := NewApp(st, keys, m, nil, nil)
-	m.Progress = func(_ string, msg string) { t.Log(msg) }
+	m.Progress = func(_ string, update runtime.Update) { t.Log(update.Step, update.Detail) }
 	providerID := ""
 	if os.Getenv("AIOFCAGE_DEMO_AGENT_E2E") == "1" {
 		dir, _ := store.DefaultDir()
