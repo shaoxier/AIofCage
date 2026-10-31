@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shaoxier/AIofCage/internal/sandbox"
+	"github.com/shaoxier/AIofCage/internal/session"
 	"github.com/shaoxier/AIofCage/internal/store"
 )
 
@@ -166,5 +169,118 @@ func TestVMStartsOnceForConcurrentStarts(t *testing.T) {
 	starts, _ := os.ReadFile(filepath.Join(dir, "starts"))
 	if errs[0] != nil || errs[1] != nil || strings.Count(string(starts), "start") != 1 {
 		t.Fatalf("errors %v, starts %q", errs, starts)
+	}
+}
+
+// The VM start writes to a file, not to a pipe of this process: if the app quits during the start,
+// colima finishes instead of dying of SIGPIPE. Lines still arrive while it runs.
+func TestLoggedCommandOutlivesItsReader(t *testing.T) {
+	tool := script(t, `if [ -p /dev/stdout ]; then echo pipe; else echo file; fi; sleep 0.3; printf 'last line\n' >&2; exit 2`)
+	var lines []string
+	err := (runner{path: tool}).runLogged(context.Background(), 10*time.Second, filepath.Join(t.TempDir(), "out.log"),
+		func(line string) { lines = append(lines, line) })
+	if strings.Join(lines, "|") != "file|last line" || err == nil || !strings.HasSuffix(err.Error(), "last line") {
+		t.Fatalf("lines %q, err %v", lines, err)
+	}
+}
+
+// A command ended by a stop says so in a way callers can test, unlike one that failed.
+func TestCancelledCommandsAreRecognisable(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	tool := script(t, "sleep 5")
+	if _, err := (runner{path: tool}).run(cancelled, time.Minute, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run: %v", err)
+	}
+	if err := (runner{path: tool}).runLines(cancelled, time.Minute, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("runLines: %v", err)
+	}
+	if err := (runner{path: script(t, "exit 3")}).runLines(context.Background(), time.Minute, nil); errors.Is(err, context.Canceled) {
+		t.Fatalf("a failure is not a cancellation: %v", err)
+	}
+}
+
+// A reset stopped during its teardown finishes the teardown, so the sandbox is not left cut off
+// yet running, and does not restart.
+func TestStoppedResetFinishesTheTeardown(t *testing.T) {
+	gate := &liveGate{}
+	m, _, log := liveSandbox(t, gate)
+	if err := m.Refresh(context.Background(), "sbx-live0001"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.Progress = func(_ string, update Update) {
+		if update.Step == "停止并删除旧的容器和网络" {
+			cancel()
+		}
+	}
+	err := m.Reset(ctx, "sbx-live0001", true, true)
+	commands, _ := os.ReadFile(log)
+	if !errors.Is(err, context.Canceled) || !gate.empty() {
+		t.Fatalf("the reset ends as stopped after clearing the gatekeeper: %v %v", err, gate.rules)
+	}
+	if !strings.Contains(string(commands), "rm --force aiofcage-sbx-live0001-agent") || strings.Contains(string(commands), "start aiofcage-sbx-live0001") {
+		t.Fatalf("the teardown must finish and the restart must not run:\n%s", commands)
+	}
+}
+
+// A stop that lands just after the new agent image is built changes nothing: the running
+// containers stay, and the new version is not recorded.
+func TestStopAfterTheBuildChangesNothing(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	workspace := filepath.Join(home, "CageWorkspace")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := filepath.Join(t.TempDir(), "docker.log")
+	colima := script(t, `case "$1" in
+ list) echo '{"name":"aiofcage","status":"Running","arch":"aarch64","cpus":4,"memory":6442450944,"disk":42949672960}' ;;
+ ssh) echo "mount0 `+resolved+` virtiofs rw 0 0" ;;
+esac
+`)
+	limactl := script(t, `echo '{"config":{"vmType":"vz","mountType":"virtiofs","mounts":[{"location":"`+workspace+`","writable":true}],"ssh":{"forwardAgent":false}}}'
+`)
+	docker := script(t, `printf '%s\n' "$*" >> '`+log+`'
+case "$3 $4" in
+ "context inspect") echo '[{"Endpoints":{"docker":{"Host":"unix://`+home+`/.colima/aiofcage/docker.sock"}}}]' ;;
+ "image inspect") exit 1 ;;
+ "container inspect") echo "true aiofcage/agent:old 2" ;;
+esac
+case "$3" in
+ build) echo '#1 [1/1] FROM base'; echo '#1 DONE 0.1s' ;;
+esac
+exit 0
+`)
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sbx := sandbox.Sandbox{ID: "sbx-after001", Name: "after", ProjectPath: filepath.Join(workspace, "after"),
+		Bindings: []sandbox.Binding{{Agent: session.Codex, ProviderID: "p"}}, AgentVersions: map[session.Agent]string{session.Codex: "0.150.0"},
+		Placeholders: map[string]string{}}
+	if err := st.SaveSandbox(sbx); err != nil {
+		t.Fatal(err)
+	}
+	dockerRunner := runner{path: docker, args: []string{"--context", DockerContext}}
+	m := &Manager{store: st, docker: dockerRunner, gates: map[string]*gateClient{}, locks: map[string]*sync.Mutex{}, connectorTokens: map[string]string{},
+		env: &Environment{colima: runner{path: colima}, limactl: limactl, docker: dockerRunner, store: st}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.Progress = func(_ string, update Update) {
+		if strings.HasPrefix(update.Detail, "第 1/1 步") {
+			time.Sleep(300 * time.Millisecond) // the build has finished; 停止 is pressed now
+			cancel()
+		}
+	}
+	err = m.UpgradeAgents(ctx, sbx.ID, []session.Agent{session.Codex})
+	saved, _ := st.Sandbox(sbx.ID)
+	calls, _ := os.ReadFile(log)
+	if !errors.Is(err, context.Canceled) || saved.AgentVersions[session.Codex] != "0.150.0" || strings.Contains(string(calls), "stop --time") {
+		t.Fatalf("got %v, versions %v, calls:\n%s", err, saved.AgentVersions, calls)
 	}
 }

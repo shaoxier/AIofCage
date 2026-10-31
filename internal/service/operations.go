@@ -22,6 +22,8 @@ type operations struct {
 	mu    sync.Mutex
 	items map[string]*operation
 	last  map[string]OperationView
+	// closed refuses new operations once the app is quitting.
+	closed bool
 	now   func() time.Time
 	// send delivers a sandbox's operation to the interface; updates of the detail are batched.
 	send func(id string, view OperationView)
@@ -79,6 +81,10 @@ func (o *operations) begin(id, name, label string, cancel context.CancelFunc) er
 		o.mu.Unlock()
 		return fmt.Errorf("「%s」正在%s，请等它完成", name, current.label)
 	}
+	if o.closed {
+		o.mu.Unlock()
+		return errors.New("应用正在退出，不能开始新的操作")
+	}
 	o.items[id] = &operation{name: name, label: label, cancel: cancel, started: o.clock()}
 	delete(o.last, id)
 	view := o.viewLocked(id)
@@ -114,6 +120,9 @@ func (o *operations) update(id string, update runtime.Update) {
 	if current == nil {
 		o.mu.Unlock()
 		return
+	}
+	if update.Final {
+		current.cancel = nil // the rest runs to its end; a stop no longer applies
 	}
 	if update.Step != "" {
 		now := o.clock()
@@ -172,9 +181,10 @@ func (o *operations) stop(id string) error {
 	return nil
 }
 
-// stopAll asks every operation that can be stopped to stop.
+// stopAll asks every operation that can be stopped to stop, and refuses new ones: the app quits.
 func (o *operations) stopAll() {
 	o.mu.Lock()
+	o.closed = true
 	var ids []string
 	for id, current := range o.items {
 		if current.cancel != nil {

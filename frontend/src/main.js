@@ -1,7 +1,7 @@
 // Ai of Cage 桌面界面：左侧导航 + 各页面。样式见 main.css。
 import "./js/frames.js";
 import { render } from "preact";
-import { useEffect, useState, useCallback } from "preact/hooks";
+import { useEffect, useState, useCallback, useRef } from "preact/hooks";
 import { html, call, Icon } from "./js/core.js";
 import { ProvidersPage } from "./js/providers.js";
 import { SandboxesPage } from "./js/sandboxes.js";
@@ -27,6 +27,8 @@ function App() {
   const [presets, setPresets] = useState([]);
   const [sandboxes, setSandboxes] = useState([]);
   const [toast, setToast] = useState(null);
+  const [quitting, setQuitting] = useState(false);
+  const reloads = useRef(0); // 只采用最近一次刷新的结果，旧的响应晚到时不覆盖新状态
   const [events, setEvents] = useState([]);
   const [summary, setSummary] = useState({ sandboxes: [], providers: {} });
   const [logSandbox, setLogSandbox] = useState("");
@@ -46,8 +48,10 @@ function App() {
   }, []);
 
   const reload = useCallback(async () => {
+    const turn = ++reloads.current;
     try {
       const [p, s, m, r] = await Promise.all([call("ListProviders"), call("ListSandboxes"), call("ListMCPServices"), call("ListRecoverableConversations")]);
+      if (turn !== reloads.current) return;
       setProviders(p);
       setSandboxes(s);
       setServices(m);
@@ -85,6 +89,7 @@ function App() {
     });
     const offStats = window.runtime?.EventsOn?.("sandbox:stats", () => refreshSummary());
     const offAlert = window.runtime?.EventsOn?.("sandbox:alert", (alert) => notify(alert.message, alert.level !== "info"));
+    const offQuitting = window.runtime?.EventsOn?.("app:quitting", () => setQuitting(true));
     // 进度只更新对应沙箱的操作，不重读全部数据；操作结束时沙箱状态会变，再刷新一次列表。
     // 后端也记着进度，切换页面回来照样能看到正在进行的操作。
     const offProgress = window.runtime?.EventsOn?.("sandbox:progress", ({ id, activity }) => {
@@ -138,7 +143,7 @@ function App() {
       }
     };
     document.addEventListener("keydown", onKey);
-    return () => { offEvent?.(); offStats?.(); offAlert?.(); offProgress?.(); observer.disconnect(); document.removeEventListener("keydown", onKey); };
+    return () => { offEvent?.(); offStats?.(); offAlert?.(); offQuitting?.(); offProgress?.(); observer.disconnect(); document.removeEventListener("keydown", onKey); };
 
   }, []);
 
@@ -182,9 +187,10 @@ function App() {
         <small>${overview ? `v${overview.version}` : ""}</small></div>
     </aside>
     <main id="main-content" tabindex="-1">
+      ${quitting && html`<div class="feedback" role="status"><span>正在停止进行中的操作，停完后自动退出。</span></div>`}
       ${toast && html`<div class=${toast.isError ? "feedback error" : "feedback"} role=${toast.isError ? "alert" : "status"}>
         <span>${toast.message}</span><button class="icon-button" aria-label="关闭通知" onClick=${() => setToast(null)}><${Icon} name="x" /></button></div>`}
-      <${Onboarding} tutorial=${tutorial} page=${page} detail=${detail} />
+      <${Onboarding} tutorial=${tutorial} page=${page} detail=${detail} notify=${notify} />
       ${content}
     </main>`;
 }

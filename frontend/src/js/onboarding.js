@@ -83,7 +83,7 @@ export function useOnboarding({ providers, sandboxes, dataReady, navigate, reloa
   };
 }
 
-export function Onboarding({ tutorial: t, page, detail }) {
+export function Onboarding({ tutorial: t, page, detail, notify }) {
   const [environment, setEnvironment] = useState(null);
   const [checking, setChecking] = useState(false);
   const [checkError, setCheckError] = useState("");
@@ -176,7 +176,7 @@ export function Onboarding({ tutorial: t, page, detail }) {
           ${choices.length > 0 && html`<label for="tutorial-sandbox">也可以使用已有沙箱</label><select id="tutorial-sandbox" disabled=${t.saving} value=${sandbox?.id ?? ""} onChange=${(e) => t.save({ sandbox_id: e.target.value, conversation_verified: false })}>
             <option value="">创建新的沙箱</option>${choices.map((s) => html`<option value=${s.id}>${s.name}</option>`)}</select>`}`}
         ${t.step === 3 && html`<p>${running ? "沙箱已启动，可以打开智能体了。" : sandbox?.config_pending ? "已保存的配置尚未生效，请在下方重启以应用。" : "点击下方「启动」，等待运行环境和智能体准备完成。"}</p>
-          ${sandbox && html`<${OperationProgress} sandboxId=${sandbox.id} activity=${sandbox.activity} />`}`}
+          ${sandbox && html`<${OperationProgress} sandboxId=${sandbox.id} activity=${sandbox.activity} notify=${notify} />`}`}
         ${t.step === 4 && html`<p>${verified ? "已收到智能体的完整回复，可以完成教程。" : "打开智能体，发送一句话试试。消息会产生模型用量，也可以稍后体验。"}</p>
           <div class="tutorial-example"><code>${TUTORIAL_EXAMPLE}</code>
             <button disabled=${t.saving || !running || opening || Boolean(session?.busy || session?.draft.busy || session?.draft.reading)} onClick=${() => {

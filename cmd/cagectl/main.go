@@ -87,6 +87,27 @@ func printProgress() func(string, runtime.Update) {
 	}
 }
 
+// interruptible returns a context that the first Ctrl-C (or SIGTERM) ends, so a running build
+// stops; a second one ends cagectl at once. A VM start in progress finishes in the background.
+func interruptible() (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		if _, ok := <-signals; !ok {
+			return
+		}
+		signal.Stop(signals) // the next signal ends the process
+		fmt.Fprintln(os.Stderr, "正在停止；再按一次 Ctrl-C 立即退出（正在启动的虚拟机会在后台启动完成）")
+		cancel()
+	}()
+	return ctx, func() {
+		signal.Stop(signals)
+		close(signals)
+		cancel()
+	}
+}
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "错误：", err)
@@ -99,7 +120,7 @@ func run(args []string) error {
 		fmt.Fprint(os.Stderr, usage)
 		return errors.New("缺少子命令")
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := interruptible()
 	defer stop()
 	dir, err := store.DefaultDir()
 	if err != nil {

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -143,6 +144,61 @@ func TestDetailUpdatesAreBatched(t *testing.T) {
 	}
 	close(release)
 	<-result
+}
+
+// A real failure that happens while a stop is pending is reported as a failure with its cause,
+// not hidden behind "已停止".
+func TestFailureDuringAStopIsNotHidden(t *testing.T) {
+	app, _, st := newApp(t)
+	st.SaveSandbox(sandbox.Sandbox{ID: "sbx-a", Name: "alpha"})
+	release := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- app.operation("sbx-a", "启动", time.Minute, true, func(ctx context.Context) error {
+			<-release
+			return errors.New("启动专用虚拟机失败：下载系统镜像失败")
+		})
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if err := app.CancelSandboxOperation("sbx-a"); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	err := <-result
+	activity, _ := app.ops.view("sbx-a")
+	if err == nil || !strings.Contains(err.Error(), "下载系统镜像失败") || activity.Outcome != "failed" {
+		t.Fatalf("got %v %+v", err, activity)
+	}
+}
+
+// Once the app is quitting, no new operation begins: it would not be stopped.
+func TestNoNewOperationsWhileQuitting(t *testing.T) {
+	app, _, st := newApp(t)
+	st.SaveSandbox(sandbox.Sandbox{ID: "sbx-a", Name: "alpha"})
+	if !app.StopOperations(time.Second) {
+		t.Fatal("nothing was running")
+	}
+	err := app.operation("sbx-a", "启动", time.Minute, true, func(context.Context) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "正在退出") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// After a final step (replacing containers) the operation runs to its end: no stop button.
+func TestFinalStepCannotBeStopped(t *testing.T) {
+	app, _, st := newApp(t)
+	st.SaveSandbox(sandbox.Sandbox{ID: "sbx-a", Name: "alpha"})
+	release := make(chan struct{})
+	result := blocked(app, "sbx-a", "添加智能体", true, release)
+	app.ops.update("sbx-a", runtime.Update{Step: "保存用量并更新容器，终端会话将结束", Final: true})
+	activity, _ := app.ops.view("sbx-a")
+	if err := app.CancelSandboxOperation("sbx-a"); err == nil || activity.Stoppable {
+		t.Fatalf("got %v %+v", err, activity)
+	}
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestProviderUsageSurvivesSandboxDeletion(t *testing.T) {

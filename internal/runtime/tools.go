@@ -113,7 +113,10 @@ type commandError struct {
 	tool   string
 	action string
 	detail string
+	cause  error // the context error of a cancelled or timed-out command
 }
+
+func (e *commandError) Unwrap() error { return e.cause }
 
 func (e *commandError) Error() string {
 	if e.detail == "" {
@@ -174,12 +177,12 @@ func (r runner) run(ctx context.Context, timeout time.Duration, stdin []byte, ar
 			action = args[0]
 		}
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return stdout.Bytes(), &commandError{filepath.Base(r.path), action, "超时"}
+			return stdout.Bytes(), &commandError{filepath.Base(r.path), action, "超时", ctx.Err()}
 		}
 		if errors.Is(ctx.Err(), context.Canceled) {
-			return stdout.Bytes(), &commandError{filepath.Base(r.path), action, "已取消"}
+			return stdout.Bytes(), &commandError{filepath.Base(r.path), action, "已取消", ctx.Err()}
 		}
-		return stdout.Bytes(), &commandError{filepath.Base(r.path), action, summarize(stderr.Bytes())}
+		return stdout.Bytes(), &commandError{filepath.Base(r.path), action, summarize(stderr.Bytes()), nil}
 	}
 	return stdout.Bytes(), nil
 }
@@ -215,6 +218,12 @@ func (r runner) runLines(ctx context.Context, timeout time.Duration, onLine func
 	err := cmd.Run()
 	writer.Close()
 	<-scanned
+	return r.failure(ctx, err, last, args)
+}
+
+// failure turns a command's error into a commandError that keeps the last line of output, or says
+// the command was cancelled or timed out.
+func (r runner) failure(ctx context.Context, err error, last string, args []string) error {
 	if err == nil {
 		return nil
 	}
@@ -224,11 +233,90 @@ func (r runner) runLines(ctx context.Context, timeout time.Duration, onLine func
 	}
 	switch {
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
-		return &commandError{filepath.Base(r.path), action, "超时"}
+		return &commandError{filepath.Base(r.path), action, "超时", ctx.Err()}
 	case errors.Is(ctx.Err(), context.Canceled):
-		return &commandError{filepath.Base(r.path), action, "已取消"}
+		return &commandError{filepath.Base(r.path), action, "已取消", ctx.Err()}
 	}
-	return &commandError{filepath.Base(r.path), action, clip(last, 300)}
+	return &commandError{filepath.Base(r.path), action, clip(last, 300), nil}
+}
+
+// runLogged runs a command whose output goes to the file at path instead of to this process, so
+// the command can outlive the process: with a pipe it would die of SIGPIPE once the app quits.
+// New lines of the file reach onLine while the command runs.
+func (r runner) runLogged(ctx context.Context, timeout time.Duration, path string, onLine func(string), args ...string) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	out, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	cmd := exec.CommandContext(ctx, r.path, append(append([]string{}, r.args...), args...)...)
+	boundCommandLifetime(cmd)
+	cmd.Env = childEnv()
+	cmd.Stdout, cmd.Stderr = out, out
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	follow := &logFollower{path: path, onLine: onLine}
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-done:
+			follow.read(true)
+			return r.failure(ctx, err, follow.last, args)
+		case <-ticker.C:
+			follow.read(false)
+		}
+	}
+}
+
+// logFollower hands the lines appended to a file to onLine.
+type logFollower struct {
+	path    string
+	onLine  func(string)
+	offset  int64
+	partial []byte
+	last    string
+}
+
+func (f *logFollower) read(final bool) {
+	file, err := os.Open(f.path)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	if _, err := file.Seek(f.offset, io.SeekStart); err != nil {
+		return
+	}
+	data, _ := io.ReadAll(io.LimitReader(file, 1<<20))
+	f.offset += int64(len(data))
+	data = append(f.partial, data...)
+	for {
+		i := bytes.IndexAny(data, "\r\n")
+		if i < 0 {
+			break
+		}
+		f.line(data[:i])
+		data = data[i+1:]
+	}
+	f.partial = append([]byte(nil), data...)
+	if final && len(f.partial) > 0 {
+		f.line(f.partial)
+		f.partial = nil
+	}
+}
+
+func (f *logFollower) line(raw []byte) {
+	if line := strings.TrimSpace(string(raw)); line != "" {
+		f.last = line
+		if f.onLine != nil {
+			f.onLine(line)
+		}
+	}
 }
 
 // stream runs a command with caller-provided stdio, for interactive exec from the CLI.

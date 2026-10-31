@@ -38,13 +38,35 @@ func main() {
 	}
 }
 
+// Quit states: the app runs, waits for its operations to stop before quitting, or quits now.
+const (
+	quitIdle int32 = iota
+	quitStopping
+	quitNow
+	quitForced
+)
+
 // keepOpen runs when the window is closed or the app is quit; it reports whether to keep the app
 // open. With operations in progress it asks first. On 停止并退出 the window stays while they stop
 // (a VM start finishes first, so the VM is not left broken), then the app quits, so no build or
-// download it started keeps running after it.
-func keepOpen(ctx context.Context, app *service.App, quitting *atomic.Bool) bool {
+// download it started keeps running after it. Closing again meanwhile asks whether to wait.
+func keepOpen(ctx context.Context, app *service.App, state *atomic.Int32) bool {
+	switch state.Load() {
+	case quitNow, quitForced:
+		return false
+	case quitStopping:
+		choice, err := wailsruntime.MessageDialog(ctx, wailsruntime.MessageDialogOptions{Type: wailsruntime.QuestionDialog,
+			Title:   "正在停止操作",
+			Message: "停完后会自动退出。也可以立即退出：构建已经停止；正在启动的专用虚拟机会在后台启动完成。",
+			Buttons: []string{"继续等待", "立即退出"}, DefaultButton: "继续等待", CancelButton: "继续等待"})
+		if err == nil && choice == "立即退出" {
+			state.Store(quitForced)
+			return false
+		}
+		return true
+	}
 	running := app.RunningOperations()
-	if quitting.Load() || len(running) == 0 {
+	if len(running) == 0 {
 		return false
 	}
 	choice, err := wailsruntime.MessageDialog(ctx, wailsruntime.MessageDialogOptions{Type: wailsruntime.QuestionDialog,
@@ -54,11 +76,20 @@ func keepOpen(ctx context.Context, app *service.App, quitting *atomic.Bool) bool
 	if err != nil || choice != "停止并退出" {
 		return true
 	}
-	quitting.Store(true)
+	state.Store(quitStopping)
+	wailsruntime.EventsEmit(ctx, "app:quitting")
 	go func() {
 		// The longest step that cannot be interrupted is creating the VM (20 minutes at most).
 		app.StopOperations(20 * time.Minute)
+		if !state.CompareAndSwap(quitStopping, quitNow) {
+			return // the user chose to quit at once
+		}
 		wailsruntime.Quit(ctx)
+		// [NSApp stop:] ends the event loop only after the next event; without one, finish here.
+		time.Sleep(5 * time.Second)
+		app.Shutdown(5 * time.Second)
+		app.CloseAllTerminals()
+		os.Exit(0)
 	}()
 	return true
 }
@@ -81,7 +112,7 @@ func run() error {
 	// page explains what is missing.
 	manager, managerErr := runtime.NewManager(st, keychain)
 	var desktopContext context.Context
-	var quitting atomic.Bool
+	var quitState atomic.Int32
 	app := service.NewApp(st, keychain, manager, managerErr, func() (string, error) {
 		if desktopContext == nil {
 			return "", fmt.Errorf("桌面窗口尚未就绪")
@@ -103,9 +134,13 @@ func run() error {
 			app.SetEmitter(func(event string, data any) { wailsruntime.EventsEmit(ctx, event, data) })
 			app.StartMonitor(ctx)
 		},
-		OnBeforeClose: func(ctx context.Context) bool { return keepOpen(ctx, app, &quitting) },
+		OnBeforeClose: func(ctx context.Context) bool { return keepOpen(ctx, app, &quitState) },
 		OnShutdown: func(context.Context) {
-			app.Shutdown(30 * time.Second)
+			wait := 30 * time.Second
+			if quitState.Load() == quitForced {
+				wait = 2 * time.Second // the user chose not to wait
+			}
+			app.Shutdown(wait)
 			app.CloseAllTerminals()
 		},
 		Bind: []interface{}{app},

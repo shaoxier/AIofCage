@@ -148,15 +148,24 @@ func (e *Environment) startVM(ctx context.Context, workspace string, detail func
 			detail(line)
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err // stopped before colima started: nothing to wait for
+	}
 	report("正在启动专用虚拟机")
 	done := make(chan error, 1)
 	go func() {
-		done <- e.colima.runLines(context.WithoutCancel(ctx), timeout, func(line string) { report(vmLine(line)) }, args...)
+		// Output goes to a file: should the app quit meanwhile, colima finishes the start instead
+		// of dying of SIGPIPE half-way.
+		done <- e.colima.runLogged(context.WithoutCancel(ctx), timeout, e.startLog(), func(line string) { report(vmLine(line)) }, args...)
 	}()
 	select {
 	case err = <-done:
 	case <-ctx.Done():
-		report("已收到停止请求，等虚拟机启动完成后再停止（中途打断可能损坏虚拟机）")
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			report("操作超时，等虚拟机启动完成后再结束（中途打断可能损坏虚拟机）")
+		} else {
+			report("已收到停止请求，等虚拟机启动完成后再停止（中途打断可能损坏虚拟机）")
+		}
 		if err = <-done; err == nil {
 			err = ctx.Err()
 		}
@@ -165,6 +174,15 @@ func (e *Environment) startVM(ctx context.Context, workspace string, detail func
 		return fmt.Errorf("启动专用虚拟机失败：%w", err)
 	}
 	return err
+}
+
+// startLog is where the output of the last VM start is kept.
+func (e *Environment) startLog() string {
+	dir := os.TempDir()
+	if e.store != nil {
+		dir = e.store.Dir()
+	}
+	return filepath.Join(dir, "vm-start.log")
 }
 
 var (

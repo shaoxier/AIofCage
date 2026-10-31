@@ -414,9 +414,10 @@ func (a *App) SetSandboxMCPPermissions(id string, ids []string, filesystem bool,
 	if err := a.runtimeReady(); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	return a.markStale(id, a.manager.SetMCPPermissions(ctx, id, ids, filesystem, permissions))
+	// Recorded as an operation: building a connector image shows its progress, and quitting waits.
+	return a.operation(id, "更新 MCP", time.Minute, false, func(ctx context.Context) error {
+		return a.markStale(id, a.manager.SetMCPPermissions(ctx, id, ids, filesystem, permissions))
+	})
 }
 
 // testDatabase logs in through a throwaway connector and runs a read-only query, which checks the

@@ -125,7 +125,9 @@ func (a *App) operation(id, label string, timeout time.Duration, stoppable bool,
 	switch {
 	case err == nil:
 		a.ops.end(sbx.ID, "done", "")
-	case a.ops.stopping(sbx.ID) || a.root.Err() != nil:
+	case stoppable && errors.Is(err, context.Canceled) && (a.ops.stopping(sbx.ID) || a.root.Err() != nil):
+		// Only an error that the stop itself caused counts as stopped; a real failure that
+		// happened meanwhile is reported as one.
 		message := a.stoppedState(sbx.ID, label)
 		a.ops.end(sbx.ID, "stopped", message)
 		return errors.New(message)
@@ -472,7 +474,8 @@ func (a *App) SetSandboxDevSources(id string, sources []string) error {
 	if err := a.runtimeReady(); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	return a.markStale(id, a.manager.SetDevSources(ctx, id, sources))
+	// Recorded as an operation, so its progress shows and quitting waits for it.
+	return a.operation(id, "更新开发环境", time.Minute, false, func(ctx context.Context) error {
+		return a.markStale(id, a.manager.SetDevSources(ctx, id, sources))
+	})
 }

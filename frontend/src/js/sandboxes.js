@@ -7,6 +7,7 @@ import { AttackDialog } from "./ai.js";
 import { useTerminals } from "./terminal.js";
 import { SandboxDetail } from "./sandbox-detail.js";
 import { OperationProgress } from "./progress.js";
+import { activityRunning } from "./progress-state.js";
 
 export function SandboxesPage({ sandboxes, providers, services, recoverable, overview, summary, events, reload, notify, onAddProvider, onLogs, detail, setDetail, tutorial }) {
   const [query, setQuery] = useState("");
@@ -184,8 +185,8 @@ function SandboxRow({ sandbox, providers, usage, busy, run, notify, onReset, onD
       <p class="mono project-path" title=${sandbox.project_path}>${sandbox.project_path}</p>
       <div class="agent-summary">${sandbox.bindings.length ? sandbox.bindings.map((b) => html`<span class="binding"><${Icon} name=${agentIcon(b.agent)} size=${16} />${agentName(b.agent)}<span class="muted"> · ${b.provider_name || "待配置"}</span></span>`) : html`<span class="caption">空白沙箱</span>`}</div>
       ${sandbox.config_pending && html`<span class="caption">配置待重启生效</span>`}
-      ${sandbox.activity ? html`<${OperationProgress} sandboxId=${sandbox.id} activity=${sandbox.activity} compact notify=${notify} />`
-        : busy && html`<p class="progress" role="status">正在处理…</p>`}
+      ${activityRunning(sandbox.activity) || !busy ? html`<${OperationProgress} sandboxId=${sandbox.id} activity=${sandbox.activity} compact notify=${notify} />`
+        : html`<p class="progress" role="status">正在处理…</p>`}
     </div></div>
     <${UsageStats} sandbox=${sandbox} usage=${usage} />
     <div class="row-actions">
