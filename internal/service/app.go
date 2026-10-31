@@ -41,6 +41,7 @@ type App struct {
 	monitor       *monitor
 	explain       explainCache
 	ops           operations
+	models        modelCache
 	// root is the parent of every lifecycle operation's context; it ends when the app quits.
 	root          context.Context
 	rootCancel    context.CancelFunc
@@ -194,12 +195,13 @@ func (a *App) SaveProvider(request SaveProviderRequest) (ProviderView, error) {
 	defer cancel()
 	var p provider.Provider
 	existing := request.ID != ""
+	previousKeyRef := ""
 	if existing {
 		current, err := a.store.Provider(request.ID)
 		if err != nil {
 			return ProviderView{}, err
 		}
-		p = current
+		p, previousKeyRef = current, current.KeyRef
 	} else {
 		p = provider.Provider{ID: newProviderID(), CreatedAt: a.now().UTC()}
 	}
@@ -277,7 +279,11 @@ func (a *App) SaveProvider(request SaveProviderRequest) (ProviderView, error) {
 	if err := a.store.SaveProvider(p); err != nil {
 		return ProviderView{}, err
 	}
-
+	// The address, protocol or key may have changed: model lists fetched before no longer apply.
+	a.models.forget(p.KeyRef)
+	if previousKeyRef != "" {
+		a.models.forget(previousKeyRef)
+	}
 	return a.view(p, sandboxes), nil
 }
 
@@ -319,6 +325,7 @@ func (a *App) DeleteProvider(id string) error {
 	if err := a.store.DeleteProvider(id); err != nil {
 		return err
 	}
+	a.models.forget(p.KeyRef)
 	a.forgetRetiredUsage(p.ID)
 	if p.KeyRef == provider.KeyRefFor(p.ID) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -342,55 +349,21 @@ func (a *App) TestProvider(id string) (TestResult, error) {
 	if err != nil {
 		return TestResult{}, err
 	}
-	if err := p.KeyRefAllowed(); err != nil {
-		return TestResult{Message: err.Error()}, nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	key, err := a.vault.Read(ctx, p.KeyRef)
-	if err != nil {
-		return TestResult{Message: "钥匙串中没有这个供应商的密钥"}, nil
-	}
-	defer clear(key)
-	host, base, err := p.Endpoint()
-	if err != nil {
-		return TestResult{}, err
-	}
-	path := base + "/models"
-	if p.Protocol == provider.Anthropic {
-		path = base + "/v1/models"
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+host+path, nil)
-	if err != nil {
-		return TestResult{}, err
-	}
-	header, prefix := p.Injection()
-	req.Header.Set(header, prefix+string(key))
-	if p.Protocol == provider.Anthropic {
-		req.Header.Set("anthropic-version", "2023-06-01")
-	}
-	started := a.now()
-	resp, err := a.client.Do(req)
-	result := TestResult{LatencyMS: a.now().Sub(started).Milliseconds()}
-	if err != nil {
-		result.Message = "无法连接到 " + host + "（" + networkReason(err) + "）"
-		return result, nil
-	}
-	resp.Body.Close()
-	result.Status = resp.StatusCode
-	switch {
-	case resp.StatusCode == 200:
-		result.OK, result.Message = true, "连接正常，密钥有效"
-	case resp.StatusCode >= 300 && resp.StatusCode < 400:
-		result.Message = fmt.Sprintf("服务返回了跳转（%d）。为保护密钥，AIofCage 不跟随跳转，请检查接口地址", resp.StatusCode)
-	case resp.StatusCode == 401 || resp.StatusCode == 403:
-		result.Message = "服务可达，但密钥无效或没有权限"
-	case resp.StatusCode == 404 || resp.StatusCode == 405:
+	// A test always asks the service, and refreshes the cached model list on the way.
+	list := a.providerModels(p, true)
+	result := TestResult{Status: list.Status, LatencyMS: list.LatencyMS, Message: list.Message}
+	switch list.Status {
+	case http.StatusOK:
+		result.OK = true
+		if list.OK {
+			result.Message = fmt.Sprintf("连接正常，密钥有效（取得 %d 个模型）", len(list.Models))
+		} else {
+			result.Message = "连接正常，密钥有效（模型列表为空或无法识别，可以手动填写模型名称）"
+		}
+	case http.StatusNotFound, http.StatusMethodNotAllowed:
 		result.OK, result.Message = true, "服务可达（该服务不提供模型列表接口，无法在这里校验密钥）"
-	case resp.StatusCode == 429:
+	case http.StatusTooManyRequests:
 		result.OK, result.Message = true, "服务可达，但当前被限流"
-	default:
-		result.Message = fmt.Sprintf("服务返回了 %d", resp.StatusCode)
 	}
 	return result, nil
 }
