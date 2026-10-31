@@ -91,6 +91,9 @@ function App() {
     const offStats = window.runtime?.EventsOn?.("sandbox:stats", () => refreshSummary());
     const offAlert = window.runtime?.EventsOn?.("sandbox:alert", (alert) => notify(alert.message, alert.level !== "info"));
     const offQuitting = window.runtime?.EventsOn?.("app:quitting", () => setQuitting(true));
+    // 恢复记录变了（首轮拿到会话 ID、关闭标签、记录失效），只重读可恢复列表。
+    const offRecovery = window.runtime?.EventsOn?.("conversation:recovery", () =>
+      call("ListRecoverableConversations").then((list) => setRecoverable(list ?? [])).catch(() => {}));
     // 进度只更新对应沙箱的操作，不重读全部数据；操作结束时沙箱状态会变，再刷新一次列表。
     // 后端也记着进度，切换页面回来照样能看到正在进行的操作。
     const offProgress = window.runtime?.EventsOn?.("sandbox:progress", ({ id, activity }) => {
@@ -144,7 +147,7 @@ function App() {
       }
     };
     document.addEventListener("keydown", onKey);
-    return () => { offEvent?.(); offStats?.(); offAlert?.(); offQuitting?.(); offProgress?.(); observer.disconnect(); document.removeEventListener("keydown", onKey); };
+    return () => { offEvent?.(); offStats?.(); offAlert?.(); offQuitting?.(); offRecovery?.(); offProgress?.(); observer.disconnect(); document.removeEventListener("keydown", onKey); };
 
   }, []);
 

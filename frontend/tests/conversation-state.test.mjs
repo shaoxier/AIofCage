@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { applyConversationEvent } from "../src/js/conversation-state.js";
+import { applyConversationEvent, tabTitle, recoveryPanel } from "../src/js/conversation-state.js";
 
 test("用户、回复、工具与完整 final 分开保留", () => {
   const session = { messages: [] };
@@ -26,4 +26,24 @@ test("续聊不拼入上轮回复，停止保留部分输出", () => {
   assert.equal(session.messages.length, 4);
   assert.equal(session.messages[3].text, "部分");
   assert.equal(session.status, "已停止");
+});
+
+test("同名标签按最小的空闲序号编号", () => {
+  assert.equal(tabTitle("Codex", []), "Codex 1");
+  assert.equal(tabTitle("Codex", ["Codex 1", "Shell 1"]), "Codex 2");
+  assert.equal(tabTitle("Codex", ["Codex 2"]), "Codex 1");
+  assert.equal(tabTitle("Shell", ["Codex 1", "Codex 2"]), "Shell 1");
+});
+
+test("恢复面板只列出真能恢复、还没打开的会话，其余作为诊断", () => {
+  const records = [
+    { id: "a", sandbox_id: "s1", ready: true },
+    { id: "b", sandbox_id: "s1", ready: false, reason: "供应商配置已变化" },
+    { id: "c", sandbox_id: "s1", ready: true },
+    { id: "d", sandbox_id: "s2", ready: true },
+  ];
+  const { ready, stale } = recoveryPanel(records, "s1", ["c"]);
+  assert.deepEqual(ready.map((item) => item.id), ["a"]);
+  assert.deepEqual(stale.map((item) => item.id), ["b"]);
+  assert.deepEqual(recoveryPanel(undefined, "s1", []), { ready: [], stale: [] });
 });

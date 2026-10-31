@@ -10,6 +10,7 @@ import { TerminalView, openTerminal, closeTerminal, useTerminals, updateTerminal
 import { IMAGE_ACCEPT, removeImage, sendDraft } from "./terminal-draft.js";
 import { SandboxAgentUpdates } from "./agent-versions.js";
 import { OperationProgress } from "./progress.js";
+import { recoveryPanel } from "./conversation-state.js";
 import { DemoTask } from "./demo-cases.js";
 import { placeTerminalMenu, terminalMenuKey } from "./terminal-menu.js";
 
@@ -115,20 +116,27 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
   };
   const recover = async (item) => {
     if (creating || !item.ready) return;
+    // 先确认记录还在、还能恢复，再决定要不要启动沙箱。
+    const current = (await call("ListRecoverableConversations").catch(() => [])).find((record) => record.id === item.id);
+    if (!current?.ready) {
+      notify(current ? `这条会话不能恢复：${current.reason}` : "这条会话记录已经不在了", true);
+      return;
+    }
     if (!running && !await run(sandbox, "启动", "StartSandbox", sandbox.id)) return;
     setCreating(true);
     try { setActive(await openTerminal(sandbox, item.agent, item)); }
     finally { setCreating(false); }
   };
-  const pendingRecoveries = (recoverable ?? []).filter((item) => item.sandbox_id === sandbox.id && !sessions.some((session) => session.id === item.id && !session.exited));
-  const recoveryPanel = pendingRecoveries.length > 0 && html`<div class="conversation-recovery panel" role="status">
-    <div><strong>可恢复会话</strong><p class="caption">这些记录只保存原生会话元数据，不保存消息正文。启动沙箱后可继续。</p></div>
-    ${pendingRecoveries.map((item) => html`<div class="conversation-recovery-row" key=${item.id}>
-      <span><${Icon} name="sparkles" size=${17} />${agentName(item.agent)} · ${item.provider_name || "供应商不可用"} · ${item.model}</span>
-      ${item.ready ? html`<button class="primary" onClick=${() => recover(item)} disabled=${Boolean(busy) || creating || !running && Boolean(busy)}>恢复</button>`
-        : html`<span class="caption">${item.reason}</span>`}
-    </div>`)}
-  </div>`;
+  // 面板只列出真能恢复的会话；不能恢复的旧记录只作为诊断信息，不出现“恢复”字样。
+  const { ready, stale } = recoveryPanel(recoverable, sandbox.id, sessions.filter((session) => !session.exited).map((session) => session.id));
+  const recoveries = html`${ready.length > 0 && html`<div class="conversation-recovery panel" role="status">
+      <div><strong>可恢复会话</strong><p class="caption">这些记录只保存原生会话元数据，不保存消息正文。${running ? "" : "恢复时会先启动沙箱。"}</p></div>
+      ${ready.map((item) => html`<div class="conversation-recovery-row" key=${item.id}>
+        <span><${Icon} name="sparkles" size=${17} />${agentName(item.agent)} · ${item.provider_name} · ${item.model}</span>
+        <button class="primary" onClick=${() => recover(item)} disabled=${Boolean(busy) || creating}>恢复</button>
+      </div>`)}</div>`}
+    ${stale.length > 0 && html`<details class="caption recovery-diagnostics"><summary>${stale.length} 条旧会话记录不能继续</summary>
+      <ul>${stale.map((item) => html`<li key=${item.id}>${agentName(item.agent)} · ${item.model}：${item.reason}</li>`)}</ul></details>`}`;
 
   // 从沙箱列表点“打开终端”过来时，按选中的 Agent 新开一个标签。
   useEffect(() => {
@@ -147,7 +155,7 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
   const choices = [...sandbox.bindings.map((b) => ({ agent: b.agent, label: agentName(b.agent) })), { agent: "", label: "Shell" }];
 
   if (!running && sessions.length === 0) {
-    return html`<div>${recoveryPanel}<div class="panel empty">
+    return html`<div>${recoveries}<div class="panel empty">
       <span class="empty-icon"><${Icon} name="terminal" size=${40} /></span><h3>沙箱还没有启动</h3>
       <p>启动沙箱后，打开智能体或 Shell 开始工作。</p>
       <button class="primary" onClick=${() => run(sandbox, "启动", "StartSandbox", sandbox.id)} disabled=${Boolean(busy)}>启动沙箱</button>
@@ -159,7 +167,7 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
     onDragOver=${(e) => { if (e.dataTransfer.types.includes("Files")) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; setDragging(true); } }}
     onDragLeave=${(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setDragging(false); }}
     onDrop=${(e) => { e.preventDefault(); setDragging(false); if (current?.agent && !current.exited) addTerminalImages(current, e.dataTransfer.files); }}>
-    ${recoveryPanel}
+    ${recoveries}
     <div class="terminal-tabs">
       ${sessions.length > 0 && html`<div class="terminal-session-tabs" role="tablist" aria-label="终端会话">${sessions.map((s) => html`<div class=${`terminal-tab ${s.id === current?.id ? "active" : ""} ${s.exited ? "exited" : ""}`} key=${s.id}>
         <button role="tab" aria-selected=${s.id === current?.id} tabindex=${s.id === current?.id ? 0 : -1} onClick=${() => setActive(s.id)}><${Icon} name=${agentIcon(s.agent)} size=${16} />${s.title}${s.exited ? "（已结束）" : ""}</button>

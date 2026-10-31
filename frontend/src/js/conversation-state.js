@@ -34,3 +34,19 @@ export function applyConversationEvent(session, event) {
   if (message.text.length > 524288) { message.text = message.text.slice(0, 524288); message.truncated = true; }
   if (message.thinking.length > 131072) message.thinking = message.thinking.slice(0, 131072);
 }
+
+// tabTitle 给新标签起名：同名的标签按序号区分，用最小的空闲序号，例如“Codex 1”“Codex 2”。
+export function tabTitle(name, titles) {
+  const used = new Set(titles);
+  let n = 1;
+  while (used.has(`${name} ${n}`)) n++;
+  return `${name} ${n}`;
+}
+
+// recoveryPanel 把一个沙箱的恢复记录分成两类：ready 可以直接恢复（已经打开的除外），
+// stale 不能恢复的只作为诊断信息，不出现“恢复”按钮。
+export function recoveryPanel(recoverable, sandboxId, openIds) {
+  const open = new Set(openIds);
+  const mine = (recoverable ?? []).filter((item) => item.sandbox_id === sandboxId && !open.has(item.id));
+  return { ready: mine.filter((item) => item.ready), stale: mine.filter((item) => !item.ready) };
+}

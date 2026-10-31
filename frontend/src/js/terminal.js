@@ -5,7 +5,7 @@ import { Terminal } from "xterm";
 import { FitAddon } from "xterm-fit";
 import { html, call, agentName } from "./core.js";
 import { addImages, createDraft, disposeDraft } from "./terminal-draft.js";
-import { applyConversationEvent } from "./conversation-state.js";
+import { applyConversationEvent, tabTitle } from "./conversation-state.js";
 import { ConversationView } from "./conversation-view.js";
 
 const sessions = new Map(); // id → { id, sandboxId, agent, title, term, fit, element, exited, code }
@@ -113,11 +113,14 @@ const THEME = {
 
 const newID = () => "t-" + Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => (b % 36).toString(36)).join("");
 
+// 同一沙箱里同名的标签按序号区分，例如“Codex 1”“Codex 2”。
+const titleFor = (sandboxId, name) => tabTitle(name, [...sessions.values()].filter((s) => s.sandboxId === sandboxId).map((s) => s.title));
+
 export async function openTerminal(sandbox, agent, recovery = null) {
   wire();
   const id = recovery?.id ?? newID();
   if (agent) {
-    const session = { id, sandboxId: sandbox.id, agent, title: agentName(agent), kind: "conversation", resumed: Boolean(recovery),
+    const session = { id, sandboxId: sandbox.id, agent, title: titleFor(sandbox.id, agentName(agent)), kind: "conversation", resumed: Boolean(recovery),
       draft: createDraft(), messages: [], models: [], model: "", effort: "", busy: false, started: false, status: "" };
     sessions.set(id, session); notifyChange();
     try {
@@ -147,7 +150,7 @@ export async function openTerminal(sandbox, agent, recovery = null) {
   const element = document.createElement("div");
   element.className = "terminal-host";
   parking().appendChild(element);
-  const session = { id, sandboxId: sandbox.id, agent, title: agent ? agentName(agent) : "Shell", term, fit, element, opened: false, exited: false, draft: createDraft() };
+  const session = { id, sandboxId: sandbox.id, agent, title: titleFor(sandbox.id, agent ? agentName(agent) : "Shell"), term, fit, element, opened: false, exited: false, draft: createDraft() };
   sessions.set(id, session);
   term.onData((data) => { if (!session.exited) call("WriteTerminal", id, data).catch(() => {}); });
   term.onResize(({ cols, rows }) => { if (!session.exited) call("ResizeTerminal", id, cols, rows).catch(() => {}); });
