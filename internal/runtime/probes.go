@@ -184,6 +184,32 @@ func (m *Manager) AgentNetwork(ctx context.Context, id string) ([]string, []stri
 // InternalNetwork is the name of a sandbox's internal network, the only one its agent may use.
 func InternalNetwork(id string) string { return names(id).internal }
 
+// NetworkView is what Docker says about one of a sandbox's networks.
+type NetworkView struct {
+	Name string
+	// Gateways are the VM's own addresses on the network; none when the VM is kept off it.
+	Gateways []string
+}
+
+// SandboxNetwork reads a sandbox's ProbeInternal or ProbeEgress network.
+func (m *Manager) SandboxNetwork(ctx context.Context, id, network string) (NetworkView, error) {
+	name := map[string]string{ProbeInternal: names(id).internal, ProbeEgress: names(id).egress}[network]
+	if name == "" {
+		return NetworkView{}, fmt.Errorf("未知网络 %q", network)
+	}
+	info, err := m.network(ctx, name)
+	if err != nil {
+		return NetworkView{}, err
+	}
+	view := NetworkView{Name: name}
+	for _, entry := range info.IPAM.Config {
+		if entry.Gateway != "" {
+			view.Gateways = append(view.Gateways, entry.Gateway)
+		}
+	}
+	return view, nil
+}
+
 // RemoveProbes removes probes and probe volumes a check left behind, e.g. when the app quit in
 // the middle of one.
 func (m *Manager) RemoveProbes(ctx context.Context, id string) error { return m.removeProbes(ctx, id) }
