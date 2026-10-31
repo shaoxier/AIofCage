@@ -194,7 +194,7 @@ function SandboxRow({ sandbox, providers, usage, busy, run, notify, onReset, onD
       <details class="action-menu"><summary aria-label=${`更多操作：${sandbox.name}`}><${Icon} name="more" /></summary><div class="menu-items">
         <button onClick=${() => onOpen({ tab: "agents" })}><${Icon} name="cpu" size=${18} />管理智能体</button>
         <button onClick=${() => onOpen({ tab: "overview" })}><${Icon} name="box" size=${18} />沙箱详情</button>
-        <button onClick=${() => call("OpenProjectFolder", sandbox.id).catch((e) => notify(e.message, true))}><${Icon} name="folder" size=${18} />在访达中打开</button>
+        <button onClick=${() => call("OpenProjectFolder", sandbox.id).catch((e) => notify(e.message, true))}><${Icon} name="folder" size=${18} />在访达中显示</button>
         ${running && html`<button disabled=${Boolean(busy)} onClick=${() => run(sandbox, "停止", "StopSandbox", sandbox.id)}><${Icon} name="stop" size=${18} />停止沙箱</button>`}
         <button disabled=${Boolean(busy)} onClick=${onReset}>重置运行环境…</button>
         <button class="danger" disabled=${Boolean(busy)} onClick=${onDelete}><${Icon} name="trash" size=${18} />删除沙箱…</button>
