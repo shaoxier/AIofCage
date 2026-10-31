@@ -48,9 +48,14 @@ type Provider struct {
 }
 
 var (
-	modelPattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`)
+	// modelPattern accepts the model names providers list (gpt-6.1-sol, deepseek-ai/DeepSeek-V3,
+	// qwen:72b, org/model+beta, @cf/meta/llama-3-8b-instruct). Configurations quote the name.
+	modelPattern  = regexp.MustCompile(`^[A-Za-z0-9@][A-Za-z0-9._:/@+-]{0,199}$`)
 	keyRefPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 )
+
+// ValidModel reports whether a model name can be saved for a provider.
+func ValidModel(name string) bool { return modelPattern.MatchString(name) }
 
 // KeyRefFor is the Keychain service name used for keys entered in AIofCage.
 func KeyRefFor(id string) string { return "aiofcage-provider-" + id }

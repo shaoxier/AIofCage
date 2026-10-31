@@ -137,8 +137,9 @@ func TestModelListFailuresAreExplained(t *testing.T) {
 		if list.OK || len(list.Models) != 0 || !strings.Contains(list.Message, c.want) || server.calls.Load() != 1 {
 			t.Errorf("%d %q: %+v after %d calls", c.status, c.body, list, server.calls.Load())
 		}
-		if again, _ := app.ProviderModels(view.ID, false); again.Cached {
-			t.Errorf("%d: a failed list is not cached", c.status)
+		// A service without a list endpoint is remembered; other failures are asked again.
+		if again, _ := app.ProviderModels(view.ID, false); again.Cached != (c.status == http.StatusNotFound) {
+			t.Errorf("%d: cached=%v", c.status, again.Cached)
 		}
 	}
 }
@@ -171,5 +172,76 @@ func TestPreviewBeforeSaving(t *testing.T) {
 	if list, _ := app.PreviewProviderModels(SaveProviderRequest{Name: "p", Agent: session.Codex, Protocol: provider.OpenAIResponses,
 		BaseURL: "https://api.example.com/v1", Auth: provider.AuthBearer}); list.OK || !strings.Contains(list.Message, "API Key") {
 		t.Fatalf("without a key: %+v", list)
+	}
+}
+
+// Every name the list offers can be saved.
+func TestListedModelNamesCanBeSaved(t *testing.T) {
+	app, _, _ := newApp(t)
+	for _, model := range []string{"@cf/meta/llama-3-8b-instruct", "org/model+beta", "qwen:72b", strings.Repeat("m", 200)} {
+		if _, err := app.SaveProvider(SaveProviderRequest{Name: "p", Agent: session.Codex, Protocol: provider.OpenAIResponses,
+			BaseURL: "https://api.example.com/v1", Model: model, Auth: provider.AuthBearer, APIKey: "synthetic-save-key-0123"}); err != nil {
+			t.Errorf("%s: %v", model, err)
+		}
+	}
+}
+
+// A list fetched with a key that changed meanwhile is not stored.
+func TestListFetchedBeforeAKeyChangeIsNotCached(t *testing.T) {
+	app, _, _ := newApp(t)
+	asked, release := make(chan struct{}, 1), make(chan struct{})
+	serveModels(t, app, func(w http.ResponseWriter, r *http.Request) {
+		asked <- struct{}{}
+		<-release
+		w.Write([]byte(`{"data":[{"id":"listed-with-old-key"}]}`))
+	})
+	view, err := app.SaveProvider(SaveProviderRequest{Name: "p", Agent: session.Codex, Protocol: provider.OpenAIResponses,
+		BaseURL: "https://api.example.com/v1", Model: "m", Auth: provider.AuthBearer, APIKey: "synthetic-old-key-0123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan ModelList, 1)
+	go func() { list, _ := app.ProviderModels(view.ID, true); done <- list }()
+	<-asked
+	app.models.forget(view.KeyRef) // the key is replaced while the request is out
+	close(release)
+	if list := <-done; !list.OK {
+		t.Fatalf("the fetch itself failed: %+v", list)
+	}
+	if _, ok := app.models.get(modelCacheKey(view.Provider), app.now()); ok {
+		t.Fatal("a list fetched with the old key was cached")
+	}
+}
+
+// A later page that fails keeps what earlier pages listed.
+func TestPartialAnthropicListIsKept(t *testing.T) {
+	app, _, _ := newApp(t)
+	serveModels(t, app, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("after_id") == "" {
+			w.Write([]byte(`{"data":[{"id":"claude-a"}],"has_more":true,"last_id":"claude-a"}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	view, err := app.SaveProvider(SaveProviderRequest{Name: "a", Agent: session.ClaudeCode, Protocol: provider.Anthropic,
+		BaseURL: "https://api.example.com", Model: "claude-a", Auth: provider.AuthXAPIKey, APIKey: "synthetic-partial-key-0123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, _ := app.ProviderModels(view.ID, false)
+	if !list.OK || strings.Join(list.Models, ",") != "claude-a" || !strings.Contains(list.Message, "没有读完") {
+		t.Fatalf("got %+v", list)
+	}
+}
+
+// A preview reaches a provider's own Keychain item only through the saved provider.
+func TestPreviewRefusesAnUnsavedProvidersItem(t *testing.T) {
+	app, secrets, _ := newApp(t)
+	server := serveModels(t, app, func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{"data":[{"id":"m"}]}`)) })
+	secrets[provider.KeyRefFor("p-orphan")] = []byte("synthetic-orphan-key-0123")
+	_, err := app.PreviewProviderModels(SaveProviderRequest{ID: "p-orphan", Name: "p", Agent: session.Codex, Protocol: provider.OpenAIResponses,
+		BaseURL: "https://elsewhere.example.com/v1", Auth: provider.AuthBearer, ExistingKeyRef: provider.KeyRefFor("p-orphan")})
+	if err == nil || server.calls.Load() != 0 {
+		t.Fatalf("an orphaned item was sent: %v, %d calls", err, server.calls.Load())
 	}
 }

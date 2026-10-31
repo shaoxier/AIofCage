@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -38,16 +37,14 @@ const (
 	anthropicPages = 5
 )
 
-// modelIDPattern accepts the model names providers use (gpt-6.1-sol, claude-sonnet-4-5,
-// deepseek-ai/DeepSeek-V3, qwen:72b, @cf/meta/llama-3-8b-instruct) and nothing that could be
-// markup or a control character.
-var modelIDPattern = regexp.MustCompile(`^[A-Za-z0-9@][A-Za-z0-9._:/@+-]{0,199}$`)
-
 // modelCache keeps model lists of saved providers, keyed by what decides the answer: address,
 // protocol, authentication and Keychain item. The key itself is never part of it.
 type modelCache struct {
 	mu    sync.Mutex
 	items map[string]ModelList
+	// generation counts forget calls per Keychain item: a list fetched with a key that changed
+	// meanwhile is not stored.
+	generation map[string]int
 }
 
 func modelCacheKey(p provider.Provider) string {
@@ -65,9 +62,20 @@ func (c *modelCache) get(key string, now time.Time) (ModelList, bool) {
 	return list, true
 }
 
-func (c *modelCache) put(key string, list ModelList) {
+// current returns the generation of a Keychain item, to pass to put.
+func (c *modelCache) current(keyRef string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.generation[keyRef]
+}
+
+// put stores a list unless the Keychain item was forgotten after the fetch began.
+func (c *modelCache) put(key, keyRef string, generation int, list ModelList) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.generation[keyRef] != generation {
+		return
+	}
 	if c.items == nil {
 		c.items = map[string]ModelList{}
 	}
@@ -79,6 +87,10 @@ func (c *modelCache) put(key string, list ModelList) {
 func (c *modelCache) forget(keyRef string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.generation == nil {
+		c.generation = map[string]int{}
+	}
+	c.generation[keyRef]++
 	for key := range c.items {
 		if strings.HasSuffix(key, "\n"+keyRef) {
 			delete(c.items, key)
@@ -106,6 +118,7 @@ func (a *App) providerModels(p provider.Provider, refresh bool) ModelList {
 	if err := p.KeyRefAllowed(); err != nil {
 		return ModelList{Message: err.Error()}
 	}
+	generation := a.models.current(p.KeyRef)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	key, err := a.vault.Read(ctx, p.KeyRef)
@@ -114,8 +127,9 @@ func (a *App) providerModels(p provider.Provider, refresh bool) ModelList {
 	}
 	defer clear(key)
 	list := a.fetchModels(ctx, p, key)
-	if list.OK {
-		a.models.put(cacheKey, list)
+	// A service without a list endpoint is remembered too, so every new tab does not ask again.
+	if list.OK || list.Status == http.StatusNotFound || list.Status == http.StatusMethodNotAllowed {
+		a.models.put(cacheKey, p.KeyRef, generation, list)
 	}
 	return list
 }
@@ -136,8 +150,9 @@ func (a *App) PreviewProviderModels(request SaveProviderRequest) (ModelList, err
 	if len(key) == 0 {
 		switch {
 		case request.ExistingKeyRef != "":
-			if !allowedExistingKeyRef(request.ExistingKeyRef, request.ID) {
-				return ModelList{}, errors.New("只能使用 AIofCage 保存的密钥，或预设中列出的钥匙串条目")
+			// Only a preset's item: a provider's own item is reached through its saved provider.
+			if !allowedExistingKeyRef(request.ExistingKeyRef, "") {
+				return ModelList{}, errors.New("只能使用预设中列出的钥匙串条目")
 			}
 			p.KeyRef = request.ExistingKeyRef
 		case request.ID != "":
@@ -195,8 +210,15 @@ func (a *App) fetchModels(ctx context.Context, p provider.Provider, key []byte) 
 			list.LatencyMS = a.now().Sub(started).Milliseconds()
 		}
 		if err != nil {
+			if page > 0 {
+				return partialModels(list, networkReason(err))
+			}
 			list.Message = "无法连接到 " + host + "（" + networkReason(err) + "），可以手动填写模型名称"
 			return list
+		}
+		if resp.StatusCode != http.StatusOK && page > 0 {
+			resp.Body.Close()
+			return partialModels(list, fmt.Sprintf("服务返回了 %d", resp.StatusCode))
 		}
 		list.Status = resp.StatusCode
 		if resp.StatusCode != http.StatusOK {
@@ -214,11 +236,19 @@ func (a *App) fetchModels(ctx context.Context, p provider.Provider, key []byte) 
 		err = json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&body)
 		resp.Body.Close()
 		if err != nil {
-			list.Message = "服务可达，但模型列表的格式无法识别，可以手动填写模型名称"
+			switch reason := networkReason(err); {
+			case page > 0:
+				return partialModels(list, reason)
+			case reason == "超时":
+				list.Message = "读取模型列表超时，可以手动填写模型名称"
+			default:
+				list.Message = "服务可达，但模型列表的格式无法识别，可以手动填写模型名称"
+			}
 			return list
 		}
 		for _, model := range body.Data {
-			if modelIDPattern.MatchString(model.ID) && !seen[model.ID] && len(list.Models) < maxModels {
+			// Only names a provider can be saved with: nothing that could be markup or a control character.
+			if provider.ValidModel(model.ID) && !seen[model.ID] && len(list.Models) < maxModels {
 				seen[model.ID] = true
 				list.Models = append(list.Models, model.ID)
 			}
@@ -235,6 +265,18 @@ func (a *App) fetchModels(ctx context.Context, p provider.Provider, key []byte) 
 	sort.Strings(list.Models)
 	list.OK = true
 	list.Message = fmt.Sprintf("连接正常，取得 %d 个模型", len(list.Models))
+	return list
+}
+
+// partialModels keeps what earlier pages listed when a later page fails.
+func partialModels(list ModelList, reason string) ModelList {
+	if len(list.Models) == 0 {
+		list.Message = "读取模型列表没有完成（" + reason + "），可以手动填写模型名称"
+		return list
+	}
+	sort.Strings(list.Models)
+	list.OK = true
+	list.Message = fmt.Sprintf("取得 %d 个模型，列表没有读完（%s）", len(list.Models), reason)
 	return list
 }
 
