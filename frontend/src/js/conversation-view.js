@@ -34,7 +34,9 @@ export function ConversationView({ session, changed }) {
     finally { session.loadingModels = false; changed(); }
   };
   useEffect(() => {
-    if (session.info && !session.started && session.models === undefined && !session.loadingModels) loadModels(false);
+    if (!session.info || session.started || session.modelsRequested) return;
+    session.modelsRequested = true; // 每个会话只自动读一次，之后靠刷新按钮
+    loadModels(false);
   }, [session.info]);
   const unpriced = session.info?.priced && session.model && session.model !== session.info.provider_model;
   return html`<div class="conversation-container">
