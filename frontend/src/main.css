@@ -494,7 +494,11 @@ details.advanced label:first-of-type { margin-top: 12px; }
   .metric-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .settings-list > div { grid-template-columns: 180px minmax(0,1fr); }
   .terminal-panel { min-height: 360px; }
-  .project-files { flex-basis: 260px; }
+}
+/* 窗口窄时文件栏浮在终端上，不挤占对话区。 */
+@media (max-width: 1179px) {
+  .terminal-body { position: relative; }
+  .project-files { position: absolute; top: 0; right: 0; bottom: 0; z-index: 3; width: min(300px, 85%); box-shadow: -8px 0 24px #0008; }
 }
 @media (max-width: 760px) {
   :root { --sidebar-width: 76px; }

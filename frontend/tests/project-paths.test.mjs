@@ -14,6 +14,8 @@ test("Shell 路径需要时加引号，以“-”开头的不会被当成选项"
   assert.equal(shellQuote("my docs/计划.md"), "'my docs/计划.md'");
   assert.equal(shellQuote("it's.txt"), `'it'\\''s.txt'`);
   assert.equal(shellQuote("-rf"), "./-rf");
+  assert.equal(shellQuote("+!cmd"), "'./+!cmd'");
+  assert.equal(shellQuote("/Users/u/CageWorkspace/p/a b.txt"), "'/Users/u/CageWorkspace/p/a b.txt'");
   assert.equal(shellQuote("$(rm -rf ~)"), "'$(rm -rf ~)'");
 });
 
@@ -22,4 +24,9 @@ test("含控制字符的路径不插入，免得终端把它当成按键", () =>
   assert.equal(insertable("a\nrm -rf ~"), false);
   assert.equal(insertable("a\u0003"), false);
   assert.equal(insertable(""), false);
+  assert.equal(insertable("a\u009b2J"), false, "C1 控制字符");
+  assert.equal(insertable("invoice\u202Etxt.exe"), false, "双向排版控制符");
+  assert.equal(insertable("a\u200Bb"), false, "零宽字符");
+  assert.equal(insertable("a\u2028b"), false);
+  assert.equal(insertable("报告 2026.md"), true);
 });

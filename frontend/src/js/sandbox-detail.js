@@ -1,5 +1,5 @@
 // 沙箱详情页（参考 Docker Desktop 点开容器）：终端、概览、日志三个标签。
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { DevSourceLine } from "./dev-sources.js";
 import { html, call, AGENTS, agentName, STATES, ConfirmDialog, Icon, agentIcon } from "./core.js";
 import { BindingSelects, MCPLine, UsageStats } from "./sandboxes.js";
@@ -18,11 +18,12 @@ import { insertAt, insertable, shellQuote } from "./project-paths.js";
 
 const activeTerminals = new Map();
 
-// 文件栏按沙箱记住展开状态；没有记录时，窗口够宽才默认展开。
+// 文件栏按沙箱记住展开状态；窗口窄时总是先收起，展开后浮在终端上，不挤占对话区。
 const filesKey = (id) => `aiofcage.files.${id}`;
 function filesPreference(id) {
+  if (window.innerWidth < 1180) return false;
   try { const value = localStorage.getItem(filesKey(id)); if (value) return value === "open"; } catch { /* 无痕或禁用存储 */ }
-  return window.innerWidth >= 1180;
+  return true;
 }
 
 const TABS = [
@@ -62,14 +63,14 @@ export function SandboxDetail({ sandbox, detail, setDetail, providers, services,
         </div>
       </div>
       <button class="link mono" onClick=${() => call("OpenProjectFolder", sandbox.id).catch((e) => notify(e.message, true))}
-        title="在访达中打开">${sandbox.project_path}</button>
+        title="在访达中显示">${sandbox.project_path}</button>
       <${OperationProgress} sandboxId=${sandbox.id} activity=${sandbox.activity} notify=${notify} />
       ${sandbox.demo_case && tab === "overview" && html`<${DemoTask} caseID=${sandbox.demo_case} notify=${notify} />`}
       <div class="tabs" role="tablist">
         ${TABS.map((t) => html`<button role="tab" aria-selected=${t.id === tab} tabindex=${t.id === tab ? 0 : -1} class=${t.id === tab ? "tab active" : "tab"}
           onClick=${() => setDetail({ ...detail, tab: t.id, open: undefined })}><${Icon} name=${t.icon} size=${18} />${t.label}</button>`)}
       </div>
-      ${tab === "terminal" && html`<${TerminalTab} sandbox=${sandbox} request=${detail.open} recoverable=${recoverable} running=${running} busy=${busy}
+      ${tab === "terminal" && html`<${TerminalTab} key=${sandbox.id} sandbox=${sandbox} request=${detail.open} recoverable=${recoverable} running=${running} busy=${busy}
         run=${run} notify=${notify} />`}
       ${tab === "agents" && html`<div class="panel detail-overview">
         <div class="section-heading"><div><h3>已安装智能体</h3><p class="caption">为每个智能体独立选择供应商。</p></div>
@@ -106,6 +107,7 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
     setFilesOpen(value);
     try { localStorage.setItem(filesKey(sandbox.id), value ? "open" : "closed"); } catch { /* 只影响下次是否默认展开 */ }
   };
+  const closeFiles = useCallback(() => showFiles(false), []);
   const menu = useRef(null);
   useEffect(() => {
     const dismiss = (event) => { if (menu.current && !menu.current.contains(event.target)) menu.current.open = false; };
@@ -170,13 +172,14 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
     if (id === current?.id) setActive(null);
   };
   const choices = [...sandbox.bindings.map((b) => ({ agent: b.agent, label: agentName(b.agent) })), { agent: "", label: "Shell" }];
-  // 路径插入当前会话：对话插到输入框光标处，Shell 当作键入（不带回车）。
+  // 路径插入当前会话：对话插到输入框光标处（项目内的相对路径），Shell 当作键入、不带回车
+  // （绝对路径，cd 到别处也对；容器里项目的路径和宿主相同）。
   const conversation = current?.kind === "conversation";
   const canInsert = Boolean(current && !current.exited && (!conversation || (current.info && running && !current.draft.busy)));
   const insertPath = (path) => {
     if (!canInsert || !insertable(path)) return;
     if (!conversation) {
-      call("WriteTerminal", current.id, shellQuote(path) + " ").catch((error) => notify(error.message, true));
+      call("WriteTerminal", current.id, shellQuote(`${sandbox.project_path}/${path}`) + " ").catch((error) => notify(error.message, true));
       current.term?.focus();
       return;
     }
@@ -188,6 +191,10 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
     updateTerminalDraft();
     requestAnimationFrame(() => { const field = document.getElementById(inputID); field?.focus(); field?.setSelectionRange(next.cursor, next.cursor); });
   };
+  // 回调保持不变，文件栏才不会随对话的流式输出整棵重绘。
+  const insertRef = useRef(insertPath);
+  insertRef.current = insertPath;
+  const onInsert = useCallback((path) => insertRef.current(path), []);
 
   if (!running && sessions.length === 0) {
     return html`<div>${recoveries}<div class="panel empty">
@@ -196,7 +203,10 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
       <button class="primary" onClick=${() => run(sandbox, "启动", "StartSandbox", sandbox.id)} disabled=${Boolean(busy)}>启动沙箱</button>
     </div></div>`;
   }
-  return html`<div class="terminal-panel">
+  // 拖进来的文件只有落在左侧终端区才当图片；落在别处也要拦住，否则窗口会跳去显示那个文件。
+  return html`<div class="terminal-panel"
+    onDragOver=${(e) => { if (!e.defaultPrevented && e.dataTransfer.types.includes("Files")) { e.preventDefault(); e.dataTransfer.dropEffect = "none"; } }}
+    onDrop=${(e) => e.preventDefault()}>
     ${recoveries}
     <div class="terminal-tabs">
       ${sessions.length > 0 && html`<div class="terminal-session-tabs" role="tablist" aria-label="终端会话">${sessions.map((s) => html`<div class=${`terminal-tab ${s.id === current?.id ? "active" : ""} ${s.exited ? "exited" : ""}`} key=${s.id}>
@@ -235,7 +245,7 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
     ${dragging && html`<div class="terminal-drop-hint" aria-hidden="true">松开以添加图片</div>`}
     </div>
     ${filesOpen && html`<${ProjectFiles} sandboxId=${sandbox.id} busy=${sessions.filter((s) => s.busy).length} canInsert=${canInsert}
-      onInsert=${insertPath} onClose=${() => showFiles(false)} notify=${notify} />`}
+      onInsert=${onInsert} onClose=${closeFiles} notify=${notify} />`}
     </div>
   </div>`;
 }
