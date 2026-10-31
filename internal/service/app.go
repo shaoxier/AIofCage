@@ -54,6 +54,8 @@ type App struct {
 	prices        pricingCatalog
 	updatesMu     sync.Mutex
 	onboardingMu  sync.Mutex
+	// nativeSessionExists checks an agent's own session record inside a running sandbox.
+	nativeSessionExists func(ctx context.Context, sandboxID string, agent session.Agent, nativeID string) (bool, error)
 }
 
 // noRedirect keeps credentials on the host they were sent to. Go would carry custom headers such
@@ -71,6 +73,12 @@ func NewApp(st *store.Store, secrets vault.Store, manager *runtime.Manager, mana
 		client: client, oauth: oauth.NewClient(client, openURL), isolationRuns: map[string]SecurityIsolationRun{},
 		explainClient: &http.Client{Transport: &http.Transport{Proxy: nil, TLSHandshakeTimeout: 10 * time.Second}, CheckRedirect: noRedirect}}
 	a.root, a.rootCancel = context.WithCancel(context.Background())
+	a.nativeSessionExists = func(ctx context.Context, sandboxID string, agent session.Agent, nativeID string) (bool, error) {
+		if a.manager == nil {
+			return false, errors.New("运行环境不可用")
+		}
+		return a.manager.NativeSessionExists(ctx, sandboxID, agent, nativeID)
+	}
 	// Progress is remembered as well as emitted, so a page opened later still shows it.
 	a.ops.send = func(id string, view OperationView) {
 		a.emit("sandbox:progress", map[string]any{"id": id, "activity": view})

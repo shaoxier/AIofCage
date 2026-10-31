@@ -5,7 +5,7 @@ import { Terminal } from "xterm";
 import { FitAddon } from "xterm-fit";
 import { html, call, agentName } from "./core.js";
 import { addImages, createDraft, disposeDraft } from "./terminal-draft.js";
-import { applyConversationEvent } from "./conversation-state.js";
+import { applyConversationEvent, tabTitle } from "./conversation-state.js";
 import { ConversationView } from "./conversation-view.js";
 
 const sessions = new Map(); // id → { id, sandboxId, agent, title, term, fit, element, exited, code }
@@ -113,12 +113,21 @@ const THEME = {
 
 const newID = () => "t-" + Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => (b % 36).toString(36)).join("");
 
+// 同一沙箱里同名的标签按序号区分，例如“Codex 1”“Codex 2”。
+const titleFor = (sandboxId, name) => tabTitle(name, [...sessions.values()].filter((s) => s.sandboxId === sandboxId).map((s) => s.title));
+
+// 关掉还在进行的对话后，后端要先停任务、清附件再删恢复记录；这期间恢复面板不该冒出它。
+// 会话 ID 不会重复使用，这些 ID 留到应用退出也无妨。
+const forgotten = new Set();
+
 export async function openTerminal(sandbox, agent, recovery = null) {
   wire();
   const id = recovery?.id ?? newID();
   if (agent) {
-    const session = { id, sandboxId: sandbox.id, agent, title: agentName(agent), kind: "conversation", resumed: Boolean(recovery),
-      draft: createDraft(), messages: [], models: [], model: "", effort: "", busy: false, started: false, status: "" };
+    // 恢复一个已结束的标签时，沿用它的标题和没发出的草稿。
+    const previous = sessions.get(id);
+    const session = { id, sandboxId: sandbox.id, agent, title: previous?.title ?? titleFor(sandbox.id, agentName(agent)), kind: "conversation", resumed: Boolean(recovery),
+      draft: previous?.draft ?? createDraft(), messages: [], models: [], model: "", effort: "", busy: false, started: false, status: "" };
     sessions.set(id, session); notifyChange();
     try {
       session.info = recovery
@@ -147,7 +156,7 @@ export async function openTerminal(sandbox, agent, recovery = null) {
   const element = document.createElement("div");
   element.className = "terminal-host";
   parking().appendChild(element);
-  const session = { id, sandboxId: sandbox.id, agent, title: agent ? agentName(agent) : "Shell", term, fit, element, opened: false, exited: false, draft: createDraft() };
+  const session = { id, sandboxId: sandbox.id, agent, title: titleFor(sandbox.id, agent ? agentName(agent) : "Shell"), term, fit, element, opened: false, exited: false, draft: createDraft() };
   sessions.set(id, session);
   term.onData((data) => { if (!session.exited) call("WriteTerminal", id, data).catch(() => {}); });
   term.onResize(({ cols, rows }) => { if (!session.exited) call("ResizeTerminal", id, cols, rows).catch(() => {}); });
@@ -170,11 +179,17 @@ export function closeTerminal(id) {
   const s = sessions.get(id);
   if (!s) return;
   if (!s.exited) call(s.kind === "conversation" ? "CloseConversation" : "CloseTerminal", id).catch(() => {});
+  if (!s.exited && s.kind === "conversation") forgotten.add(id);
   disposeDraft(s.draft);
   s.term?.dispose();
   s.element?.remove();
   sessions.delete(id);
   notifyChange();
+}
+
+// recoveryHidden 是恢复面板不列出的会话：还开着的，以及刚关掉、记录正在删除的。
+export function recoveryHidden(sandboxId) {
+  return [...sandboxTerminals(sandboxId).filter((s) => !s.exited).map((s) => s.id), ...forgotten];
 }
 
 export function sandboxTerminals(sandboxId) {
