@@ -56,6 +56,7 @@ var attacks = []Attack{
 	{ID: "foreign-key", Title: "外来凭据请求", Layer: "凭据校验"},
 	{ID: "dns-exfil", Title: "DNS 查询外传", Layer: "DNS 与路由"},
 	{ID: "docker-socket", Title: "Docker 接口", Layer: "容器边界"},
+	{ID: "vm-ports", Title: "虚拟机网关端口", Layer: "内部网络"},
 	{ID: "project-boundary", Title: "项目以外的文件", Layer: "文件隔离"},
 	{ID: "remote-mcp-direct", Title: "绕过网关直连远程 MCP", Layer: "MCP 网关"},
 	{ID: "db-direct", Title: "直连数据库与密码配置", Layer: "可信连接器"},
@@ -300,6 +301,8 @@ result(status,"；".join(host+":443 "+value for host,value in observations),"soc
 		return a.checkDNS(ctx, sbx, check, a.inAgent(sbx))
 	case "docker-socket":
 		return a.checkDockerSocket(ctx, sbx, check, a.inAgent(sbx))
+	case "vm-ports":
+		return a.checkVMPorts(ctx, sbx, check, a.inAgent(sbx))
 	case "project-boundary":
 		return a.checkProjectBoundary(ctx, sbx, check, a.inAgent(sbx))
 	case "remote-mcp-direct":

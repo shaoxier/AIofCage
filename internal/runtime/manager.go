@@ -590,12 +590,19 @@ func (m *Manager) ensureObjects(ctx context.Context, sbx sandbox.Sandbox, gateIm
 		name     string
 		internal bool
 	}{{n.internal, true}, {n.egress, false}} {
-		if _, err := m.docker.run(ctx, 15*time.Second, nil, "network", "inspect", network.name); err == nil {
+		info, err := m.network(ctx, network.name)
+		if err == nil && (!network.internal || info.keepsVMOff()) {
 			continue
+		}
+		if err == nil {
+			// Made before the VM was kept off it: the network goes, with the containers on it.
+			if err := m.dropInternal(ctx, sbx); err != nil {
+				return err
+			}
 		}
 		args := []string{"network", "create", "--label", label}
 		if network.internal {
-			args = append(args, "--internal")
+			args = append(args, "--internal", "--opt", noVMAddress+"=true")
 		}
 		if _, err := m.docker.run(ctx, 30*time.Second, nil, append(args, network.name)...); err != nil {
 			return err
@@ -672,19 +679,67 @@ func (m *Manager) ensureObjects(ctx context.Context, sbx sandbox.Sandbox, gateIm
 	return nil
 }
 
-// hostAddress picks .2 in the network's IPv4 subnet for the gatekeeper (Docker uses .1 as gateway).
+// noVMAddress keeps the VM itself off a sandbox's internal network. Otherwise the bridge's own
+// address, the network's gateway, leads the agent to every service the VM runs on all of its
+// addresses, such as sshd: Docker's isolation rules only cover the traffic it forwards.
+const noVMAddress = "com.docker.network.bridge.inhibit_ipv4"
+
+// networkInfo is what the runtime reads of `docker network inspect`.
+type networkInfo struct {
+	Internal bool              `json:"Internal"`
+	Options  map[string]string `json:"Options"`
+	IPAM     struct {
+		Config []struct {
+			Subnet  string `json:"Subnet"`
+			Gateway string `json:"Gateway"`
+		} `json:"Config"`
+	} `json:"IPAM"`
+}
+
+func (n networkInfo) keepsVMOff() bool { return n.Internal && n.Options[noVMAddress] == "true" }
+
+func (m *Manager) network(ctx context.Context, name string) (networkInfo, error) {
+	out, err := m.docker.run(ctx, 15*time.Second, nil, "network", "inspect", "--format", "{{json .}}", name)
+	if err != nil {
+		return networkInfo{}, err
+	}
+	var info networkInfo
+	if err := json.Unmarshal(out, &info); err != nil {
+		return networkInfo{}, fmt.Errorf("无法读取网络 %s 的设置", name)
+	}
+	return info, nil
+}
+
+// dropInternal removes an internal network that still gives the VM an address. Docker only removes
+// a network nothing is attached to, so the gatekeeper and the agent go first; both are created anew
+// right after, and the project and the home volume stay.
+func (m *Manager) dropInternal(ctx context.Context, sbx sandbox.Sandbox) error {
+	n := names(sbx.ID)
+	m.detail(sbx.ID, "内部网络改为不含虚拟机的地址，重建网络、门卫和 Agent 容器（项目和主目录保留）")
+	m.saveUsage(ctx, sbx)
+	if err := m.removeProbes(ctx, sbx.ID); err != nil {
+		return err
+	}
+	for _, name := range []string{n.agent, n.gate} {
+		if _, err := m.docker.run(ctx, 30*time.Second, nil, "rm", "--force", name); err != nil && !strings.Contains(err.Error(), "No such") {
+			return err
+		}
+	}
+	if _, err := m.docker.run(ctx, 30*time.Second, nil, "network", "rm", n.internal); err != nil {
+		return fmt.Errorf("删除旧的内部网络失败：%w", err)
+	}
+	return nil
+}
+
+// hostAddress picks .2 in the network's IPv4 subnet for the gatekeeper. On the egress network .1
+// is the VM's, the gateway; the internal network has no gateway, and its .1 goes to the first
+// container that joins without a fixed address, which is the agent.
 func (m *Manager) hostAddress(ctx context.Context, network string) (string, error) {
-	out, err := m.docker.run(ctx, 15*time.Second, nil, "network", "inspect", "--format", "{{json .IPAM.Config}}", network)
+	info, err := m.network(ctx, network)
 	if err != nil {
 		return "", err
 	}
-	var config []struct {
-		Subnet string `json:"Subnet"`
-	}
-	if err := json.Unmarshal(out, &config); err != nil {
-		return "", errors.New("无法读取网络地址段")
-	}
-	for _, entry := range config {
+	for _, entry := range info.IPAM.Config {
 		prefix, err := netip.ParsePrefix(entry.Subnet)
 		if err != nil || !prefix.Addr().Is4() || prefix.Bits() > 29 {
 			continue

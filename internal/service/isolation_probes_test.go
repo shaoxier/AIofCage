@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/shaoxier/AIofCage/internal/runtime"
 )
 
 func TestFailedControlKeepsACheckFromPassing(t *testing.T) {
@@ -24,7 +27,7 @@ func TestFailedControlKeepsACheckFromPassing(t *testing.T) {
 
 func TestProbeScriptsAreValidPython(t *testing.T) {
 	for name, script := range map[string]string{"canary": dnsCanaryPython, "dns": dnsClientPython, "docker": dockerScanPython,
-		"boundary": boundaryPython, "database": dbControlPython,
+		"boundary": boundaryPython, "database": dbControlPython, "vm-ports": vmPortsPython,
 		"server": fakeDockerPython + "serve('/sock/docker.sock')"} {
 		cmd := exec.Command("python3", "-c", "import ast,sys;ast.parse(sys.stdin.read())")
 		cmd.Stdin = strings.NewReader(script)
@@ -253,5 +256,107 @@ func TestProjectBoundaryReadsTheMountTable(t *testing.T) {
 	shared := "4 1 0:41 / /W rw - virtiofs mount0 rw\n"
 	if v := boundaryRun(t, base+shared, files); v.Mounted || len(v.Mounts) != 1 || len(v.Probe) != 1 || len(v.Extra) == 0 {
 		t.Fatalf("whole workspace shared: %+v", v)
+	}
+}
+
+// vmScan is the output of vmPortsPython: every port of each host gave the host's answer, except
+// those in change.
+func vmScan(hosts map[string]string, change map[string]string, ipv6 ...string) []byte {
+	ports := map[string]string{}
+	for host, answer := range hosts {
+		for _, port := range vmPorts {
+			ports[fmt.Sprintf("%s:%d", host, port)] = answer
+		}
+	}
+	for endpoint, answer := range change {
+		ports[endpoint] = answer
+	}
+	out, _ := json.Marshal(map[string]any{"ports": ports, "ipv6": append([]string{}, ipv6...)})
+	return out
+}
+
+func TestVMPortsVerdict(t *testing.T) {
+	const vm, old = "192.168.208.1", "172.18.0.1"
+	control := vmScan(map[string]string{vm: "ECONNREFUSED"}, map[string]string{vm + ":22": "connected"})
+	good := vmPortsRun{Internal: runtime.NetworkView{Name: "net-in"}, Egress: []string{vm}, Control: control,
+		Agent: vmScan(map[string]string{vm: "blocked"}, nil)}
+	oldNetwork := runtime.NetworkView{Name: "net-in", Gateways: []string{old}}
+	for _, tt := range []struct {
+		name   string
+		change func(*vmPortsRun)
+		want   string
+	}{
+		{"no VM address, nothing reachable", func(*vmPortsRun) {}, checkPassed},
+		{"network from before the fix", func(r *vmPortsRun) {
+			r.Internal = oldNetwork
+			r.Agent = vmScan(map[string]string{old: "ECONNREFUSED", vm: "blocked"}, map[string]string{old + ":22": "connected"})
+		}, checkProblem},
+		{"VM has an address but nothing listens", func(r *vmPortsRun) {
+			r.Internal = oldNetwork
+			r.Agent = vmScan(map[string]string{old: "blocked", vm: "blocked"}, nil)
+		}, checkProblem},
+		{"VM address known even when the agent's script fails", func(r *vmPortsRun) {
+			r.Internal, r.Agent, r.AgentErr = oldNetwork, nil, errors.New("exec")
+		}, checkProblem},
+		{"agent reaches the VM's egress address", func(r *vmPortsRun) {
+			r.Agent = vmScan(map[string]string{vm: "blocked"}, map[string]string{vm + ":22": "connected"})
+		}, checkProblem},
+		{"VM answers the agent on its egress address", func(r *vmPortsRun) { r.Agent = vmScan(map[string]string{vm: "ECONNREFUSED"}, nil) }, checkProblem},
+		{"agent has an IPv6 address", func(r *vmPortsRun) {
+			r.Agent = vmScan(map[string]string{vm: "blocked"}, nil, "fe80000000000000a8c1abfffe000001")
+		}, checkProblem},
+		{"timeouts prove nothing", func(r *vmPortsRun) {
+			r.Agent = vmScan(map[string]string{vm: "blocked"}, map[string]string{vm + ":443": "timeout"})
+		}, checkInconclusive},
+		{"answers missing", func(r *vmPortsRun) { r.Agent = []byte(`{"ports":{"192.168.208.1:22":"blocked"},"ipv6":[]}`) }, checkInconclusive},
+		{"control reaches no port", func(r *vmPortsRun) { r.Control = vmScan(map[string]string{vm: "ECONNREFUSED"}, nil) }, checkInconclusive},
+		{"control failed", func(r *vmPortsRun) { r.Control, r.ControlErr = nil, errors.New("probe") }, checkInconclusive},
+		{"internal network unreadable", func(r *vmPortsRun) { r.Internal, r.InternalErr = runtime.NetworkView{}, errors.New("inspect") }, checkInconclusive},
+		{"agent's script failed", func(r *vmPortsRun) { r.Agent, r.AgentErr = nil, errors.New("exec") }, checkInconclusive},
+		{"no output", func(r *vmPortsRun) { r.Agent = []byte("Traceback") }, checkInconclusive},
+	} {
+		run := good
+		tt.change(&run)
+		got := settle(judgeVMPorts(Attack{ID: "vm-ports"}, run))
+		if got.Status != tt.want {
+			t.Errorf("%s: %s %s %+v", tt.name, got.Status, got.Evidence, got.Controls)
+		}
+	}
+	got := judgeVMPorts(Attack{ID: "vm-ports"}, good)
+	if !strings.Contains(got.Evidence, "Agent 连 192.168.208.1（虚拟机在出网网络上的地址）：13 个端口都本地拒绝") ||
+		!strings.Contains(got.Evidence, "没有虚拟机的地址") || got.Controls[0].Detail != "192.168.208.1:22" {
+		t.Fatalf("%s %+v", got.Evidence, got.Controls)
+	}
+	run := good
+	run.Internal = oldNetwork
+	run.Agent = vmScan(map[string]string{old: "ECONNREFUSED", vm: "blocked"}, map[string]string{old + ":22": "connected"})
+	if got := judgeVMPorts(Attack{}, run); !strings.Contains(got.Evidence, "Agent 连上了虚拟机 172.18.0.1 的 22 端口") ||
+		!strings.Contains(got.Evidence, "172.18.0.1（内部网关）：22 已连接，其余 12 个拒绝连接") {
+		t.Fatal(got.Evidence)
+	}
+}
+
+// The script itself, against a port that listens and one that does not.
+func TestVMPortsScriptConnectsAndReports(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	open := listener.Addr().(*net.TCPAddr).Port
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shut := closed.Addr().(*net.TCPAddr).Port
+	closed.Close()
+	ports, _ := json.Marshal([]int{open, shut})
+	out, err := exec.Command("python3", "-I", "-S", "-c", vmPortsPython, string(ports), "127.0.0.1").CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	scan, ok := parseVMPorts(out, nil)
+	if !ok || scan.Ports[fmt.Sprintf("127.0.0.1:%d", open)] != "connected" || scan.Ports[fmt.Sprintf("127.0.0.1:%d", shut)] != "ECONNREFUSED" {
+		t.Fatalf("%s", out)
 	}
 }
