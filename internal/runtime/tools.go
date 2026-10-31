@@ -130,6 +130,24 @@ func summarize(stderr []byte) string {
 	return clip(strings.TrimSpace(lines[len(lines)-1]), 300)
 }
 
+// tailBuffer keeps the last limit bytes written.
+type tailBuffer struct {
+	data  []byte
+	limit int
+}
+
+func (b *tailBuffer) Write(data []byte) (int, error) {
+	n := len(data)
+	if len(data) > b.limit {
+		data = data[len(data)-b.limit:]
+	}
+	b.data = append(b.data, data...)
+	if len(b.data) > b.limit {
+		b.data = append(b.data[:0], b.data[len(b.data)-b.limit:]...)
+	}
+	return n, nil
+}
+
 // clip shortens s to at most limit bytes without cutting a character in half.
 func clip(s string, limit int) string {
 	if len(s) <= limit {
@@ -168,8 +186,11 @@ func (r runner) run(ctx context.Context, timeout time.Duration, stdin []byte, ar
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	// Only the last line of the error output is used; what a sandbox makes a command print must
+	// not grow the app's memory.
+	var stdout bytes.Buffer
+	stderr := &tailBuffer{limit: 64 << 10}
+	cmd.Stdout, cmd.Stderr = &stdout, stderr
 	err := cmd.Run()
 	if err != nil {
 		action := ""
@@ -182,7 +203,7 @@ func (r runner) run(ctx context.Context, timeout time.Duration, stdin []byte, ar
 		if errors.Is(ctx.Err(), context.Canceled) {
 			return stdout.Bytes(), &commandError{filepath.Base(r.path), action, "已取消", ctx.Err()}
 		}
-		return stdout.Bytes(), &commandError{filepath.Base(r.path), action, summarize(stderr.Bytes()), nil}
+		return stdout.Bytes(), &commandError{filepath.Base(r.path), action, summarize(stderr.data), nil}
 	}
 	return stdout.Bytes(), nil
 }

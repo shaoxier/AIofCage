@@ -56,6 +56,7 @@ type conversation struct {
 	model    string
 	effort   string
 	nativeID string
+	recorded string // the native id in the saved recovery record; a failed save is tried again
 	busy     bool
 	closed   bool
 	stop     func()
@@ -125,7 +126,7 @@ func (a *App) startConversation(id, sandboxID string, agent session.Agent, recov
 	if recovery != nil {
 		nativeID, model, effort = recovery.NativeSessionID, recovery.Model, recovery.Effort
 	}
-	a.conversations.items[id] = &conversation{id: id, sandbox: sbx, provider: p, agent: agent, nativeID: nativeID, model: model, effort: effort}
+	a.conversations.items[id] = &conversation{id: id, sandbox: sbx, provider: p, agent: agent, nativeID: nativeID, recorded: nativeID, model: model, effort: effort}
 	if model == "" {
 		model = p.Model
 	}
@@ -299,6 +300,7 @@ func (a *App) SendConversationMessage(id, text string, images []TerminalImage, o
 		c.busy, c.stop = false, nil
 		a.emit("conversation:event", map[string]string{"id": id, "type": state})
 		c.mu.Unlock()
+		a.touchConversationRecovery(c)
 	}()
 	return nil
 }
@@ -374,6 +376,10 @@ func (a *App) closeConversation(id string, forget bool) error {
 	c.closed = true
 	stop, done, batches := c.stop, c.done, c.images
 	c.mu.Unlock()
+	if forget {
+		// Gone from the recovery panel at once: stopping the turn and removing attachments take seconds.
+		_ = a.removeConversationRecovery(id)
+	}
 	if stop != nil {
 		stop()
 	}
@@ -393,7 +399,7 @@ func (a *App) closeConversation(id string, forget bool) error {
 	delete(a.conversations.items, id)
 	a.conversations.mu.Unlock()
 	if forget {
-		_ = a.removeConversationRecovery(id)
+		_ = a.removeConversationRecovery(id) // in case the last turn wrote it meanwhile
 	}
 	return nil
 }
@@ -467,17 +473,40 @@ type ConversationRecoveryView struct {
 }
 
 // noteNativeSession records the agent's own session id for recovery. Claude Code repeats the id on
-// every event; only a new one is written, and reported to the interface.
+// every event; it is written when it is new, or when writing it failed before.
 func (a *App) noteNativeSession(c *conversation, nativeID string) bool {
 	c.mu.Lock()
-	if c.closed || nativeID == "" || c.nativeID == nativeID {
+	if c.closed || nativeID == "" || c.recorded == nativeID {
 		c.mu.Unlock()
 		return false
 	}
 	c.nativeID = nativeID
 	recovery := a.conversationRecoveryFrom(c)
 	c.mu.Unlock()
-	return a.saveConversationRecovery(recovery) == nil
+	return a.recordConversation(c, recovery)
+}
+
+// touchConversationRecovery writes the record again when a turn ends, so the recovery panel lists
+// the latest activity first.
+func (a *App) touchConversationRecovery(c *conversation) {
+	c.mu.Lock()
+	if c.closed || c.nativeID == "" {
+		c.mu.Unlock()
+		return
+	}
+	recovery := a.conversationRecoveryFrom(c)
+	c.mu.Unlock()
+	a.recordConversation(c, recovery)
+}
+
+func (a *App) recordConversation(c *conversation, recovery conversationRecovery) bool {
+	if a.saveConversationRecovery(recovery) != nil {
+		return false
+	}
+	c.mu.Lock()
+	c.recorded = recovery.NativeSessionID
+	c.mu.Unlock()
+	return true
 }
 
 func (a *App) conversationRecoveryFrom(c *conversation) conversationRecovery {
@@ -569,12 +598,32 @@ func (a *App) ListRecoverableConversations() ([]ConversationRecoveryView, error)
 	if err != nil {
 		return nil, err
 	}
+	// A record is dropped only for a sandbox or provider that is really gone, never because the
+	// configuration could not be read this time.
+	sandboxes, err := a.store.Sandboxes()
+	if err != nil {
+		return nil, err
+	}
+	providers, err := a.store.Providers()
+	if err != nil {
+		return nil, err
+	}
+	sandboxByID, providerByID := map[string]sandbox.Sandbox{}, map[string]provider.Provider{}
+	for _, s := range sandboxes {
+		sandboxByID[s.ID] = s
+	}
+	for _, p := range providers {
+		providerByID[p.ID] = p
+	}
 	result := []ConversationRecoveryView{}
 	var gone []string
 	for _, item := range items {
-		sbx, err := a.store.Sandbox(item.SandboxID)
-		if err != nil {
-			gone = append(gone, item.ID) // the sandbox was deleted; so is its session history
+		sbx, ok := sandboxByID[item.SandboxID]
+		p, kept := providerByID[item.ProviderID]
+		if !ok || !kept {
+			// The sandbox went with its session history; a deleted provider is never bound again
+			// (it could not be deleted while bound), so its conversations cannot continue.
+			gone = append(gone, item.ID)
 			continue
 		}
 		view := ConversationRecoveryView{ID: item.ID, SandboxID: item.SandboxID, SandboxName: sbx.Name, Agent: item.Agent, Model: item.Model, Effort: item.Effort, NativeSessionID: item.NativeSessionID, UpdatedAt: item.UpdatedAt, Ready: true}
@@ -591,11 +640,8 @@ func (a *App) ListRecoverableConversations() ([]ConversationRecoveryView, error)
 		if binding == "" || binding != item.ProviderID {
 			view.Ready = false
 			view.Reason = "供应商配置已变化，请重新启动沙箱后新建会话"
-		} else if p, providerErr := a.store.Provider(binding); providerErr == nil {
-			view.ProviderName = p.Name
 		} else {
-			view.Ready = false
-			view.Reason = "原供应商配置不可用"
+			view.ProviderName = p.Name
 		}
 		result = append(result, view)
 	}
