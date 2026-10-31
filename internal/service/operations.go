@@ -24,7 +24,7 @@ type operations struct {
 	last  map[string]OperationView
 	// closed refuses new operations once the app is quitting.
 	closed bool
-	now   func() time.Time
+	now    func() time.Time
 	// send delivers a sandbox's operation to the interface; updates of the detail are batched.
 	send func(id string, view OperationView)
 }
@@ -231,6 +231,19 @@ func (o *operations) wait(timeout time.Duration) bool {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// settingsOperations only deliver new settings to a running sandbox; sessions may go on meanwhile.
+var settingsOperations = map[string]bool{"更新 MCP": true, "更新开发环境": true}
+
+// changingContainers returns the label of a running operation that starts, stops or replaces the
+// sandbox's containers, during which sessions cannot open or receive messages.
+func (o *operations) changingContainers(id string) string {
+	label, _ := o.get(id)
+	if settingsOperations[label] {
+		return ""
+	}
+	return label
 }
 
 // get returns the running operation's label and current step.

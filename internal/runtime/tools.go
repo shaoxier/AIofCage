@@ -240,17 +240,18 @@ func (r runner) failure(ctx context.Context, err error, last string, args []stri
 	return &commandError{filepath.Base(r.path), action, clip(last, 300), nil}
 }
 
-// runLogged runs a command whose output goes to the file at path instead of to this process, so
-// the command can outlive the process: with a pipe it would die of SIGPIPE once the app quits.
-// New lines of the file reach onLine while the command runs.
-func (r runner) runLogged(ctx context.Context, timeout time.Duration, path string, onLine func(string), args ...string) error {
+// runLogged runs a command whose output is appended to the file at path instead of going to this
+// process, so the command can outlive the process: with a pipe it would die of SIGPIPE once the
+// app quits. started receives its process id; new lines of the file reach onLine while it runs.
+func (r runner) runLogged(ctx context.Context, timeout time.Duration, path string, started func(pid int), onLine func(string), args ...string) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	out, err := os.Create(path)
+	out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
+	from, _ := out.Seek(0, io.SeekEnd)
 	cmd := exec.CommandContext(ctx, r.path, append(append([]string{}, r.args...), args...)...)
 	boundCommandLifetime(cmd)
 	cmd.Env = childEnv()
@@ -258,9 +259,12 @@ func (r runner) runLogged(ctx context.Context, timeout time.Duration, path strin
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	if started != nil {
+		started(cmd.Process.Pid)
+	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
-	follow := &logFollower{path: path, onLine: onLine}
+	follow := &logFollower{path: path, onLine: onLine, offset: from}
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {

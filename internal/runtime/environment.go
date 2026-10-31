@@ -117,6 +117,16 @@ func (e *Environment) startVM(ctx context.Context, workspace string, detail func
 		}
 		defer unlock()
 	}
+	report := func(line string) {
+		if detail != nil {
+			detail(line)
+		}
+	}
+	// The lock dies with the process that held it, while colima may still be starting the VM for a
+	// process that has quit: wait for that start rather than begin another one.
+	if err := e.awaitEarlierStart(ctx, report); err != nil {
+		return err
+	}
 	vm, err := e.vm(ctx)
 	if err != nil {
 		return err
@@ -143,11 +153,6 @@ func (e *Environment) startVM(ctx context.Context, workspace string, detail func
 	default:
 		return nil
 	}
-	report := func(line string) {
-		if detail != nil {
-			detail(line)
-		}
-	}
 	if err := ctx.Err(); err != nil {
 		return err // stopped before colima started: nothing to wait for
 	}
@@ -155,8 +160,10 @@ func (e *Environment) startVM(ctx context.Context, workspace string, detail func
 	done := make(chan error, 1)
 	go func() {
 		// Output goes to a file: should the app quit meanwhile, colima finishes the start instead
-		// of dying of SIGPIPE half-way.
-		done <- e.colima.runLogged(context.WithoutCancel(ctx), timeout, e.startLog(), func(line string) { report(vmLine(line)) }, args...)
+		// of dying of SIGPIPE half-way. Its pid lets a later start wait for it.
+		recorded := func(pid int) { _ = os.WriteFile(e.startFile("vm-start.pid"), []byte(strconv.Itoa(pid)), 0o600) }
+		done <- e.colima.runLogged(context.WithoutCancel(ctx), timeout, e.startFile("vm-start.log"), recorded, func(line string) { report(vmLine(line)) }, args...)
+		_ = os.Remove(e.startFile("vm-start.pid"))
 	}()
 	select {
 	case err = <-done:
@@ -176,13 +183,49 @@ func (e *Environment) startVM(ctx context.Context, workspace string, detail func
 	return err
 }
 
-// startLog is where the output of the last VM start is kept.
-func (e *Environment) startLog() string {
+// startFile names a file about VM starts (its log, the pid of a running start) in the app's data
+// directory, which every process using the dedicated VM shares.
+func (e *Environment) startFile(name string) string {
 	dir := os.TempDir()
 	if e.store != nil {
 		dir = e.store.Dir()
 	}
-	return filepath.Join(dir, "vm-start.log")
+	return filepath.Join(dir, name)
+}
+
+// awaitEarlierStart waits while a colima start recorded in vm-start.pid still runs. Only a live
+// process whose command line is a colima start of the dedicated VM counts; it is never signalled.
+func (e *Environment) awaitEarlierStart(ctx context.Context, report func(string)) error {
+	raw, err := os.ReadFile(e.startFile("vm-start.pid"))
+	if err != nil {
+		return nil
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 1 {
+		return nil
+	}
+	starting := func() bool {
+		out, err := exec.Command("ps", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
+		command := string(out)
+		return err == nil && strings.Contains(command, "colima") && strings.Contains(command, " start ") && strings.Contains(command, ColimaProfile)
+	}
+	if !starting() {
+		return nil
+	}
+	report("上一次启动的虚拟机还在启动中，等它完成")
+	follow := &logFollower{path: e.startFile("vm-start.log"), onLine: func(line string) { report(vmLine(line)) }}
+	if info, err := os.Stat(follow.path); err == nil {
+		follow.offset = info.Size()
+	}
+	for starting() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+			follow.read(false)
+		}
+	}
+	return nil
 }
 
 var (
@@ -237,6 +280,9 @@ func (e *Environment) verify(ctx context.Context, createContext bool) error {
 	cmd.Env = append(childEnv(), "LIMA_HOME="+filepath.Join(home, ".colima", "_lima"))
 	out, err := cmd.Output()
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err() // stopped, not broken
+		}
 		return errors.New("无法读取虚拟机配置")
 	}
 	var lima struct {

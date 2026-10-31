@@ -141,6 +141,6 @@ func (m *Manager) SuspendEnvironment(ctx context.Context) error {
 	if err := m.env.Verify(ctx); err != nil {
 		return err
 	}
-	_, err = m.env.colima.run(ctx, 2*time.Minute, nil, "stop", ColimaProfile)
-	return err
+	// Like a start, the stop writes to a file, so quitting the app does not cut it short.
+	return m.env.colima.runLogged(ctx, 2*time.Minute, m.env.startFile("vm-stop.log"), nil, nil, "stop", ColimaProfile)
 }

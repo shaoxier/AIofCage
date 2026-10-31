@@ -58,6 +58,7 @@ function App() {
       setRecoverable(r ?? []);
       setDataReady(true);
     } catch (error) {
+      if (turn !== reloads.current) return;
       setDataReady(false);
       notify(error.message, true);
     }

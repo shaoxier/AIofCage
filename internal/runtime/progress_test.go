@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -17,7 +19,12 @@ import (
 
 func script(t *testing.T, body string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "tool")
+	return scriptNamed(t, "tool", body)
+}
+
+func scriptNamed(t *testing.T, name, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
 	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +104,7 @@ func TestVMLinesAreDescribed(t *testing.T) {
 func fakeColima(t *testing.T) (*Environment, string) {
 	t.Helper()
 	dir := t.TempDir()
-	colima := script(t, `dir='`+dir+`'
+	colima := scriptNamed(t, "colima", `dir='`+dir+`'
 case "$1" in
  list) if [ -f "$dir/running" ]; then s=Running; else s=Stopped; fi
        printf '{"name":"aiofcage","status":"%s","arch":"aarch64","cpus":4,"memory":6442450944,"disk":42949672960}\n' "$s" ;;
@@ -153,6 +160,26 @@ func TestStopBeforeTheVMStartStartsNothing(t *testing.T) {
 	}
 }
 
+// A start left running by a process that has quit is waited for, not doubled: the lock went with
+// that process, but its pid stayed.
+func TestEarlierStartOfAQuitProcessIsAwaited(t *testing.T) {
+	env, dir := fakeColima(t)
+	earlier := exec.Command(env.colima.path, "start", ColimaProfile)
+	if err := earlier.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer earlier.Wait()
+	if err := os.WriteFile(env.startFile("vm-start.pid"), []byte(strconv.Itoa(earlier.Process.Pid)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var details []string
+	err := env.startVM(context.Background(), t.TempDir(), func(line string) { details = append(details, line) })
+	starts, _ := os.ReadFile(filepath.Join(dir, "starts"))
+	if err != nil || strings.Count(string(starts), "start") != 1 || !strings.Contains(strings.Join(details, "|"), "上一次启动的虚拟机还在启动中") {
+		t.Fatalf("err %v, starts %q, details %q", err, starts, details)
+	}
+}
+
 // Two sandboxes starting together start the VM once.
 func TestVMStartsOnceForConcurrentStarts(t *testing.T) {
 	env, dir := fakeColima(t)
@@ -177,7 +204,7 @@ func TestVMStartsOnceForConcurrentStarts(t *testing.T) {
 func TestLoggedCommandOutlivesItsReader(t *testing.T) {
 	tool := script(t, `if [ -p /dev/stdout ]; then echo pipe; else echo file; fi; sleep 0.3; printf 'last line\n' >&2; exit 2`)
 	var lines []string
-	err := (runner{path: tool}).runLogged(context.Background(), 10*time.Second, filepath.Join(t.TempDir(), "out.log"),
+	err := (runner{path: tool}).runLogged(context.Background(), 10*time.Second, filepath.Join(t.TempDir(), "out.log"), nil,
 		func(line string) { lines = append(lines, line) })
 	if strings.Join(lines, "|") != "file|last line" || err == nil || !strings.HasSuffix(err.Error(), "last line") {
 		t.Fatalf("lines %q, err %v", lines, err)

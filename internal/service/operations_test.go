@@ -184,6 +184,27 @@ func TestNoNewOperationsWhileQuitting(t *testing.T) {
 	}
 }
 
+// Delivering new MCP or development-source settings does not hold up sessions; changing the
+// containers does.
+func TestSettingsUpdatesDoNotBlockSessions(t *testing.T) {
+	app, _, st := newApp(t)
+	st.SaveSandbox(sandbox.Sandbox{ID: "sbx-a", Name: "alpha"})
+	release := make(chan struct{})
+	result := blocked(app, "sbx-a", "更新 MCP", false, release)
+	if label := app.ops.changingContainers("sbx-a"); label != "" {
+		t.Fatalf("a settings update blocks sessions: %q", label)
+	}
+	close(release)
+	<-result
+	release = make(chan struct{})
+	result = blocked(app, "sbx-a", "启动", true, release)
+	if label := app.ops.changingContainers("sbx-a"); label != "启动" {
+		t.Fatalf("a start must block sessions: %q", label)
+	}
+	close(release)
+	<-result
+}
+
 // After a final step (replacing containers) the operation runs to its end: no stop button.
 func TestFinalStepCannotBeStopped(t *testing.T) {
 	app, _, st := newApp(t)

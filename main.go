@@ -56,11 +56,13 @@ func keepOpen(ctx context.Context, app *service.App, state *atomic.Int32) bool {
 		return false
 	case quitStopping:
 		choice, err := wailsruntime.MessageDialog(ctx, wailsruntime.MessageDialogOptions{Type: wailsruntime.QuestionDialog,
-			Title:   "正在停止操作",
-			Message: "停完后会自动退出。也可以立即退出：构建已经停止；正在启动的专用虚拟机会在后台启动完成。",
+			Title: "正在停止操作",
+			Message: "停完后会自动退出。也可以立即退出：正在启动的专用虚拟机会在后台启动完成；" +
+				"正在替换容器、重置或更新设置的沙箱可能停在一半，之后需要重新启动。",
 			Buttons: []string{"继续等待", "立即退出"}, DefaultButton: "继续等待", CancelButton: "继续等待"})
 		if err == nil && choice == "立即退出" {
 			state.Store(quitForced)
+			go exitAfter(app, 5*time.Second, 2*time.Second)
 			return false
 		}
 		return true
@@ -85,13 +87,18 @@ func keepOpen(ctx context.Context, app *service.App, state *atomic.Int32) bool {
 			return // the user chose to quit at once
 		}
 		wailsruntime.Quit(ctx)
-		// [NSApp stop:] ends the event loop only after the next event; without one, finish here.
-		time.Sleep(5 * time.Second)
-		app.Shutdown(5 * time.Second)
-		app.CloseAllTerminals()
-		os.Exit(0)
+		exitAfter(app, 5*time.Second, 5*time.Second)
 	}()
 	return true
+}
+
+// exitAfter ends the process if the app has not quit within delay: Wails quits with [NSApp stop:],
+// which ends the event loop only after the next event. The shutdown waits up to wait.
+func exitAfter(app *service.App, delay, wait time.Duration) {
+	time.Sleep(delay)
+	app.Shutdown(wait)
+	app.CloseAllTerminals()
+	os.Exit(0)
 }
 
 func run() error {
