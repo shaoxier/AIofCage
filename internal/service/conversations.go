@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -24,15 +23,18 @@ import (
 )
 
 type ConversationInfo struct {
-	ID              string        `json:"id"`
-	Agent           session.Agent `json:"agent"`
-	ProviderName    string        `json:"provider_name"`
-	ProviderID      string        `json:"provider_id"`
-	Model           string        `json:"model"`
-	Effort          string        `json:"effort"`
-	ImageInput      bool          `json:"image_input"`
-	Resumed         bool          `json:"resumed"`
-	NativeSessionID string        `json:"native_session_id,omitempty"`
+	ID           string        `json:"id"`
+	Agent        session.Agent `json:"agent"`
+	ProviderName string        `json:"provider_name"`
+	ProviderID   string        `json:"provider_id"`
+	Model        string        `json:"model"`
+	// ProviderModel is the provider's own model; requests with another model are not priced.
+	ProviderModel   string `json:"provider_model"`
+	Priced          bool   `json:"priced"`
+	Effort          string `json:"effort"`
+	ImageInput      bool   `json:"image_input"`
+	Resumed         bool   `json:"resumed"`
+	NativeSessionID string `json:"native_session_id,omitempty"`
 }
 
 type ConversationOptions struct {
@@ -130,6 +132,7 @@ func (a *App) startConversation(id, sandboxID string, agent session.Agent, recov
 		model = p.Model
 	}
 	return ConversationInfo{ID: id, Agent: agent, ProviderName: p.Name, ProviderID: p.ID, Model: model, Effort: effort,
+		ProviderModel: p.Model, Priced: p.Pricing != nil,
 		ImageInput: agent != session.DSH || p.ImageInput, Resumed: recovery != nil, NativeSessionID: nativeID}, nil
 }
 
@@ -611,56 +614,12 @@ func (a *App) RecoverConversation(id string) (ConversationInfo, error) {
 	return a.startConversation(recovery.ID, recovery.SandboxID, recovery.Agent, &recovery)
 }
 
-// ConversationModels 只读取当前会话供应商的模型列表；密钥不会返回前端。
-func (a *App) ConversationModels(id string) ([]string, error) {
+// ConversationModels 列出当前会话供应商的模型：默认用供应商页取过的列表，refresh 时重新请求，
+// 供应商页的列表也随之更新；密钥不会返回前端。
+func (a *App) ConversationModels(id string, refresh bool) (ModelList, error) {
 	c, err := a.conversation(id)
 	if err != nil {
-		return nil, err
+		return ModelList{}, err
 	}
-	p := c.provider
-	if err := p.KeyRefAllowed(); err != nil {
-		return nil, err
-	}
-	host, base, err := p.Endpoint()
-	if err != nil {
-		return nil, err
-	}
-	path := base + "/models"
-	if p.Protocol == provider.Anthropic {
-		path = base + "/v1/models"
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	key, err := a.vault.Read(ctx, p.KeyRef)
-	if err != nil {
-		return nil, errors.New("供应商密钥不可用")
-	}
-	defer func() { clear(key) }()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+host+path, nil)
-	if err != nil {
-		return nil, err
-	}
-	header, prefix := p.Injection()
-	req.Header.Set(header, prefix+string(key))
-	req.Header.Set("anthropic-version", "2023-06-01")
-	response, err := a.client.Do(req)
-	if err != nil {
-		return nil, errors.New("读取模型列表失败，可手动填写模型名称")
-	}
-	defer response.Body.Close()
-	var result struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if response.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(&result) != nil {
-		return nil, errors.New("供应商未提供模型列表，可手动填写模型名称")
-	}
-	models := []string{p.Model}
-	for _, model := range result.Data {
-		if model.ID != "" && model.ID != p.Model && len(models) < 500 {
-			models = append(models, model.ID)
-		}
-	}
-	return models, nil
+	return a.providerModels(c.provider, refresh), nil
 }
