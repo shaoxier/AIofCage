@@ -459,8 +459,11 @@ func (g *Gate) response(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Respon
 		g.finish(state, event)
 		return resp
 	}
-	// X-Aiofcage-* headers reaching the agent always come from the gatekeeper itself.
+	// X-Aiofcage-* headers reaching the agent always come from the gatekeeper itself. Trailers are
+	// not passed on at all: they arrive after the body, past every check here. goproxy writes the
+	// trailers it finds when it starts writing, so a nil map stays nil.
 	dropOwnHeaders(resp.Header)
+	resp.Trailer = nil
 	event.Status = resp.StatusCode
 	event.Decision = audit.DecisionAllow
 	if state.secretID != "" {
@@ -487,6 +490,7 @@ func (g *Gate) response(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Respon
 		// Error bodies are small and may echo the credential; decode and redact before returning them.
 		body, withheld := readErrorBody(resp, state.secret)
 		resp.Body.Close()
+		resp.Trailer = nil // reading the body to its end filled them in again
 		if withheld {
 			resp.Header.Set("Content-Type", "application/json")
 		}

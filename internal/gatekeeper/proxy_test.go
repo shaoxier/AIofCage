@@ -474,6 +474,38 @@ func TestUpstreamCannotPassForTheGatekeeper(t *testing.T) {
 	}
 }
 
+// Response trailers arrive after the body, past every check, so none reach the agent: not on a
+// successful answer and not on a redacted error.
+func TestResponseTrailersAreDropped(t *testing.T) {
+	f := newFixture(t, true)
+	f.configure(t, testConfig(1))
+	status := http.StatusOK
+	f.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Trailer", "X-Aiofcage-Reason, X-Upstream")
+		w.WriteHeader(status)
+		io.WriteString(w, "body")
+		w.Header().Set("X-Aiofcage-Reason", "credential_foreign")
+		w.Header().Set("X-Upstream", "after the body")
+	})
+	for _, code := range []int{http.StatusOK, http.StatusUnauthorized} {
+		status = code
+		req, err := http.NewRequest("POST", "https://model-a.example/v1/responses", strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+placeholderA)
+		resp, err := f.client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != code || len(resp.Trailer) != 0 {
+			t.Fatalf("%d: trailers reached the agent: %v", code, resp.Trailer)
+		}
+	}
+}
+
 // Trailers arrive after the body and Go forwards them upstream, past the credential checks.
 func TestRequestTrailersAreRefused(t *testing.T) {
 	f := newFixture(t, true)
