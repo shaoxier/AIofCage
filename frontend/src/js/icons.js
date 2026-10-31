@@ -39,6 +39,9 @@ const paths = {
   clock: "M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0ZM12 7v5l3 2",
   check: "m5 12 4 4L19 6",
   database: "M21 6c0 2-4 3-9 3S3 8 3 6s4-3 9-3 9 1 9 3Zm0 0v12c0 2-4 3-9 3s-9-1-9-3V6m0 6c0 2 4 3 9 3s9-1 9-3",
+  file: "M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8l-5-5Zm0 0v5h5",
+  link: "M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1",
+  insert: "M4 12h11m-4-4 4 4-4 4M20 5v14",
 };
 
 export const agentIcon = (agent) => ({ codex: "terminal", "claude-code": "sparkles", dsh: "layers" })[agent] || "terminal";

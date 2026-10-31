@@ -284,12 +284,20 @@ func appleScriptString(value string) string {
 }
 
 // OpenProjectFolder reveals the project folder in Finder.
+// OpenProjectFolder shows the project folder in Finder. It only reveals the folder (open -R): a
+// project inside another sandbox's project could be swapped by that sandbox's agent for an app or
+// a .command file, which a plain open would launch.
 func (a *App) OpenProjectFolder(id string) error {
 	sbx, err := a.store.Sandbox(id)
 	if err != nil {
 		return err
 	}
-	return exec.Command("/usr/bin/open", sbx.ProjectPath).Run()
+	root, err := a.openProject(id)
+	if err != nil {
+		return err
+	}
+	root.Close()
+	return exec.Command("/usr/bin/open", "-R", sbx.ProjectPath).Run()
 }
 
 func shellQuote(value string) string {

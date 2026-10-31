@@ -7,6 +7,7 @@ require (
 	github.com/elazarl/goproxy v1.9.2
 	github.com/wailsapp/wails/v2 v2.17.0
 	golang.org/x/image v0.41.0
+	golang.org/x/sys v0.46.0
 )
 
 require (
@@ -36,6 +37,5 @@ require (
 	github.com/wailsapp/go-webview2 v1.0.22 // indirect
 	golang.org/x/crypto v0.53.0 // indirect
 	golang.org/x/net v0.56.0 // indirect
-	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/text v0.39.0 // indirect
 )
