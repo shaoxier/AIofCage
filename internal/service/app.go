@@ -38,11 +38,9 @@ type App struct {
 	now           func() time.Time
 	emit          Emitter
 	terminal      TerminalOpener
-	// nativeSessionExists checks an agent's own session record inside a running sandbox.
-	nativeSessionExists func(ctx context.Context, sandboxID string, agent session.Agent, nativeID string) (bool, error)
-	monitor             *monitor
-	explain             explainCache
-	ops                 operations
+	monitor       *monitor
+	explain       explainCache
+	ops           operations
 	// root is the parent of every lifecycle operation's context; it ends when the app quits.
 	root          context.Context
 	rootCancel    context.CancelFunc
@@ -55,6 +53,8 @@ type App struct {
 	prices        pricingCatalog
 	updatesMu     sync.Mutex
 	onboardingMu  sync.Mutex
+	// nativeSessionExists checks an agent's own session record inside a running sandbox.
+	nativeSessionExists func(ctx context.Context, sandboxID string, agent session.Agent, nativeID string) (bool, error)
 }
 
 // noRedirect keeps credentials on the host they were sent to. Go would carry custom headers such
