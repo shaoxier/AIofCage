@@ -39,12 +39,14 @@ type monitor struct {
 	stats   map[string]runtime.ContainerStats
 	// oauthAlerted remembers services whose expired login was already reported.
 	oauthAlerted map[string]bool
+	// oauthPending remembers services whose renewed token did not reach every sandbox yet.
+	oauthPending map[string]bool
 }
 
 func newMonitor() *monitor {
 	return &monitor{health: map[string]runtime.SandboxHealth{}, history: map[string][]runtime.ContainerStats{}, subs: map[string]context.CancelFunc{}, rings: map[string][]audit.Event{},
 		lastID: map[string]string{}, live: map[string]runtime.GateUsage{}, stats: map[string]runtime.ContainerStats{},
-		oauthAlerted: map[string]bool{}}
+		oauthAlerted: map[string]bool{}, oauthPending: map[string]bool{}}
 }
 
 // StartMonitor runs until ctx ends. The desktop app calls it once the window exists.

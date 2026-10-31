@@ -216,7 +216,7 @@ func (a *App) SaveMCPService(request SaveMCPServiceRequest) (MCPServiceView, err
 		return view, err
 	}
 	if existing {
-		return view, a.refreshSandboxesUsing(ctx, service.ID)
+		return view, a.refreshSandboxesUsing(ctx, service.ID, true)
 	}
 	return view, nil
 }

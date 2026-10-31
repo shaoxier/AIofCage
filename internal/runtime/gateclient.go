@@ -103,7 +103,7 @@ func (c *gateClient) putConfig(ctx context.Context, config gatekeeper.Config) er
 		_ = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&problem)
 		if problem.Code == "invalid_json" {
 			// The app sends well-formed configuration; an older gatekeeper refuses fields it lacks.
-			return errors.New("门卫不认识这份配置，多半是这个沙箱还在用旧版门卫，重启沙箱后会换成新门卫")
+			return errors.New("门卫不认识这份配置（invalid_json），多半是这个沙箱还在用旧版门卫，重启沙箱后会换成新门卫")
 		}
 		return fmt.Errorf("门卫拒绝了配置：%s %s", problem.Code, problem.Detail)
 	}

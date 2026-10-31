@@ -306,7 +306,7 @@ func (m *Manager) SetMCPPermissions(ctx context.Context, id string, ids []string
 	if err != nil {
 		return err
 	}
-	return m.refresh(ctx, sbx)
+	return m.refresh(ctx, sbx, true)
 }
 
 // SetDevSources changes which development sources a sandbox may download from; a running
@@ -330,7 +330,7 @@ func (m *Manager) SetDevSources(ctx context.Context, id string, sources []string
 	if err != nil {
 		return err
 	}
-	return m.refresh(ctx, sbx)
+	return m.refresh(ctx, sbx, true)
 }
 
 func (m *Manager) servicesFor(sbx sandbox.Sandbox) (map[string]mcp.Service, error) {
@@ -898,18 +898,35 @@ func (m *Manager) Bind(ctx context.Context, id string, agent session.Agent, prov
 	return err
 }
 
-// Refresh 刷新策略与 Agent 设置，但继续使用已生效的供应商快照；新选择在启动时应用。
+// Refresh 刷新策略与 Agent 设置，但继续使用已生效的供应商快照；新选择在启动时应用。它用于
+// 可能收紧权限的修改（编辑或断开服务）：送不到门卫时，哪怕是因为别的操作占着沙箱太久，
+// 运行中的沙箱也会断网。
 func (m *Manager) Refresh(ctx context.Context, id string) error {
+	return m.refreshUnder(ctx, id, true)
+}
+
+// RefreshCredentials hands renewed or new credentials to a running sandbox. Nothing becomes
+// narrower, so a gatekeeper that misses them keeps its configuration and the caller retries.
+func (m *Manager) RefreshCredentials(ctx context.Context, id string) error {
+	return m.refreshUnder(ctx, id, false)
+}
+
+func (m *Manager) refreshUnder(ctx context.Context, id string, mayNarrow bool) error {
 	unlock, lockErr := m.lock(ctx, id)
 	if lockErr != nil {
-		return lockErr
+		sbx, err := m.store.Sandbox(id)
+		if !mayNarrow || err != nil {
+			return lockErr
+		}
+		// Waiting longer is not possible here; an empty policy is safe whoever holds the sandbox.
+		return m.offline(ctx, sbx, lockErr)
 	}
 	defer unlock()
 	sbx, err := m.store.Sandbox(id)
 	if err != nil {
 		return err
 	}
-	return m.refresh(ctx, sbx)
+	return m.refresh(ctx, sbx, mayNarrow)
 }
 
 // captureApplied 为升级前的运行容器补记配置，避免修改时误称已经生效。
@@ -942,30 +959,43 @@ func (m *Manager) CaptureApplied(ctx context.Context, id string) error {
 	return m.captureApplied(ctx, id)
 }
 
-// refresh delivers the stored settings to a running sandbox. Callers save the settings first, so
-// when the gatekeeper does not take them it may hold a wider configuration than the stored one (a
-// closed source, a revoked tool, a disconnected login); the sandbox is then taken offline.
-func (m *Manager) refresh(ctx context.Context, sbx sandbox.Sandbox) error {
-	state, err := m.state(ctx, sbx.ID)
-	if (err == nil && state.State != stateRunning) || (err != nil && m.vmStopped(ctx)) {
+// refresh delivers the stored settings to a running sandbox; one whose state Docker cannot tell is
+// treated as running. Callers save the settings first, so when the gatekeeper does not take them
+// it may hold a wider configuration than the stored one (a closed source, a revoked tool, a
+// disconnected login); if the change may narrow the settings, the sandbox is taken offline.
+func (m *Manager) refresh(ctx context.Context, sbx sandbox.Sandbox, mayNarrow bool) error {
+	if !m.mayRun(ctx, sbx.ID) {
 		return nil
 	}
-	if err == nil {
-		var applied bool
-		if applied, err = m.deliver(ctx, sbx); err == nil || applied {
-			return err
-		}
+	applied, err := m.deliver(ctx, sbx)
+	if err == nil || applied || !mayNarrow {
+		return err
 	}
 	return m.closeGate(ctx, sbx, err)
 }
 
-// vmStopped reports whether the dedicated VM is known not to run, so no container of it can.
-func (m *Manager) vmStopped(ctx context.Context) bool {
-	if m.env == nil {
-		return false
+// mayRun reports whether a sandbox could be running: it is, or Docker cannot say and the VM is
+// not known to be stopped.
+func (m *Manager) mayRun(ctx context.Context, id string) bool {
+	state, err := m.state(ctx, id)
+	if err == nil {
+		return state.State == stateRunning
 	}
-	vm, err := m.env.vm(ctx)
-	return err == nil && (vm == nil || vm.Status != "Running")
+	if m.env == nil {
+		return true
+	}
+	vm, vmErr := m.env.vm(ctx)
+	return vmErr != nil || (vm != nil && vm.Status != "Stopped")
+}
+
+// offline takes a sandbox that may be running offline without delivering anything.
+func (m *Manager) offline(ctx context.Context, sbx sandbox.Sandbox, cause error) error {
+	check, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	defer cancel()
+	if !m.mayRun(check, sbx.ID) {
+		return cause
+	}
+	return m.closeGate(ctx, sbx, cause)
 }
 
 // deliver pushes the settings to the gatekeeper, then to the agent; applied reports whether the
@@ -1003,30 +1033,41 @@ func (m *Manager) deliver(ctx context.Context, sbx sandbox.Sandbox) (bool, error
 }
 
 // closeGate takes a sandbox offline after its gatekeeper missed new settings: it clears the
-// gatekeeper's policy, or stops the gatekeeper when it cannot be reached. A later successful
-// refresh, or a restart, brings the sandbox back with the stored settings. It does not share the
-// caller's deadline, which may be what made the delivery fail.
+// gatekeeper's policy, or stops the gatekeeper when that does not work in time. A later successful
+// refresh, or a restart, brings the sandbox back with the stored settings. Each step has its own
+// deadline, unrelated to the caller's, which may be what made the delivery fail.
 func (m *Manager) closeGate(ctx context.Context, sbx sandbox.Sandbox, cause error) error {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
-	defer cancel()
+	base := context.WithoutCancel(ctx)
 	failed := fmt.Sprintf("新设置没能下发给沙箱「%s」的门卫（%v）。", sbx.Name, cause)
-	client, err := m.client(ctx, sbx.ID)
+	clearing, cancel := context.WithTimeout(base, clearTimeout)
+	client, err := m.client(clearing, sbx.ID)
 	if err == nil {
-		err = client.putConfig(ctx, emptyConfig(sbx))
+		err = clearPolicy(clearing, client, sbx)
 	}
+	cancel()
 	if err == nil {
 		return errors.New(failed + "为安全起见，已暂停这个沙箱的全部网络访问，重试成功或重启沙箱后恢复")
 	}
-	if _, err := m.docker.run(ctx, 30*time.Second, nil, "stop", "--time", "5", names(sbx.ID).gate); err == nil {
+	stop, cancel := context.WithTimeout(base, 30*time.Second)
+	defer cancel()
+	if _, err := m.docker.run(stop, 30*time.Second, nil, "stop", "--time", "5", names(sbx.ID).gate); err == nil {
 		return errors.New(failed + "为安全起见，已停止它的门卫，沙箱暂时不能联网，请重启沙箱")
 	}
 	return errors.New(failed + "也没能暂停它的网络；如果这个沙箱正在运行，请立即停止它")
 }
 
-// emptyConfig is an empty policy: the gatekeeper refuses every request and keeps no secret or
-// connector in memory.
-func emptyConfig(sbx sandbox.Sandbox) gatekeeper.Config {
-	return gatekeeper.Config{Policy: policy.Snapshot{Version: uint64(time.Now().UnixMilli()), SessionID: sbx.ID}}
+// clearTimeout bounds reaching and clearing a gatekeeper before closeGate stops it instead.
+var clearTimeout = 20 * time.Second
+
+// clearPolicy replaces the gatekeeper's configuration with an empty policy: it refuses every
+// request and keeps no secret or connector in memory. The version follows the active one even if
+// the host clock went back.
+func clearPolicy(ctx context.Context, client *gateClient, sbx sandbox.Sandbox) error {
+	version := uint64(time.Now().UnixMilli())
+	if health, err := client.health(ctx); err == nil && health.PolicyVersion >= version {
+		version = health.PolicyVersion + 1
+	}
+	return client.putConfig(ctx, gatekeeper.Config{Policy: policy.Snapshot{Version: version, SessionID: sbx.ID}})
 }
 
 // Stop saves cumulative usage so quotas survive restarts, revokes the live gatekeeper policy,
@@ -1062,7 +1103,7 @@ func (m *Manager) revokeRuntime(ctx context.Context, sbx sandbox.Sandbox) error 
 	var errs []error
 	client, err := m.client(ctx, sbx.ID)
 	if err == nil {
-		if err := client.putConfig(ctx, emptyConfig(sbx)); err != nil {
+		if err := clearPolicy(ctx, client, sbx); err != nil {
 			errs = append(errs, fmt.Errorf("清空沙箱「%s」的门卫授权失败：%w", sbx.Name, err))
 		}
 	} else if m.Status(ctx, sbx.ID).State == stateRunning {

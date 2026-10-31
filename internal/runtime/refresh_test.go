@@ -6,14 +6,17 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/shaoxier/AIofCage/internal/gatekeeper"
 	"github.com/shaoxier/AIofCage/internal/policy"
@@ -168,8 +171,9 @@ func TestOlderGatekeeperGoesOfflineInsteadOfKeepingOldRules(t *testing.T) {
 	}
 }
 
-// When Docker cannot say whether the sandbox runs, the change is not reported as done.
-func TestUnknownStateIsNotTakenForStopped(t *testing.T) {
+// When Docker cannot say whether the sandbox runs, it is treated as running: the settings still
+// reach a gatekeeper that answers, and one that does not is stopped.
+func TestUnknownStateIsTreatedAsRunning(t *testing.T) {
 	gate := &liveGate{}
 	m, _, _ := liveSandbox(t, gate)
 	ctx := context.Background()
@@ -178,13 +182,100 @@ func TestUnknownStateIsNotTakenForStopped(t *testing.T) {
 	}
 	docker, log := fakeDocker(t, "silent")
 	m.docker = runner{path: docker}
-	err := m.SetDevSources(ctx, "sbx-live0001", nil)
-	if err == nil || !strings.Contains(err.Error(), "Cannot connect") || !gate.empty() {
+	if err := m.SetDevSources(ctx, "sbx-live0001", nil); err != nil || gate.opens("github.com") || !gate.opens("api.example.com") {
 		t.Fatalf("an unanswered inspect must not count as stopped: %v %v", err, gate.rules)
 	}
-	// The gatekeeper answered on its management port, so it was cleared rather than stopped.
-	if commands, _ := os.ReadFile(log); strings.Contains(string(commands), "stop") {
-		t.Fatalf("a reachable gatekeeper is cleared, not stopped:\n%s", commands)
+	m.gates["sbx-live0001"] = newGateClient("1", "unreachable") // nothing listens on port 1
+	err := m.SetDevSources(ctx, "sbx-live0001", []string{"npm"})
+	if commands, _ := os.ReadFile(log); err == nil || !strings.Contains(string(commands), "stop --time 5 aiofcage-sbx-live0001-gate") {
+		t.Fatalf("an unreachable gatekeeper of a sandbox that may run is stopped: %v\n%s", err, commands)
+	}
+}
+
+// Docker not answering because the VM is stopped means nothing runs; any other VM state does not.
+func TestStoppedVMMeansNothingRuns(t *testing.T) {
+	for status, delivered := range map[string]bool{"Stopped": false, "Broken": true} {
+		gate := &liveGate{}
+		m, _, _ := liveSandbox(t, gate)
+		docker, _ := fakeDocker(t, "silent")
+		m.docker = runner{path: docker}
+		colima := filepath.Join(t.TempDir(), "colima")
+		script := "#!/bin/sh\necho '{\"name\":\"" + ColimaProfile + "\",\"status\":\"" + status + "\"}'\n"
+		if err := os.WriteFile(colima, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		m.env = &Environment{colima: runner{path: colima}}
+		err := m.SetDevSources(context.Background(), "sbx-live0001", []string{"github"})
+		if err != nil || gate.opens("github.com") != delivered {
+			t.Fatalf("VM %s: delivered=%v want %v (%v)", status, gate.opens("github.com"), delivered, err)
+		}
+	}
+}
+
+// A refresh that cannot wait for the sandbox's lock (its time ran out, or another operation holds
+// the sandbox) still takes the sandbox offline when the change may narrow the settings.
+func TestRefreshThatCannotWaitTakesTheSandboxOffline(t *testing.T) {
+	gate := &liveGate{}
+	m, _, _ := liveSandbox(t, gate)
+	if err := m.SetDevSources(context.Background(), "sbx-live0001", []string{"github"}); err != nil {
+		t.Fatal(err)
+	}
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := m.RefreshCredentials(expired, "sbx-live0001"); err == nil || gate.empty() {
+		t.Fatalf("a credential refresh takes nothing away and keeps the gatekeeper: %v %v", err, gate.rules)
+	}
+	if err := m.Refresh(expired, "sbx-live0001"); err == nil || !strings.Contains(err.Error(), "已暂停") || !gate.empty() {
+		t.Fatalf("a refresh that may narrow must not leave the old configuration: %v %v", err, gate.rules)
+	}
+}
+
+// Renewed credentials that miss the gatekeeper leave its configuration in place: nothing was taken
+// away, and the caller retries.
+func TestMissedCredentialsKeepTheGatekeeper(t *testing.T) {
+	gate := &liveGate{}
+	m, vault, _ := liveSandbox(t, gate)
+	if err := m.Refresh(context.Background(), "sbx-live0001"); err != nil {
+		t.Fatal(err)
+	}
+	delete(vault, "aiofcage-provider-p1")
+	if err := m.RefreshCredentials(context.Background(), "sbx-live0001"); err == nil || !gate.opens("api.example.com") {
+		t.Fatalf("got %v %v", err, gate.rules)
+	}
+}
+
+// A gatekeeper that accepts connections but never answers is stopped before closing runs out of time.
+func TestHangingGatekeeperIsStopped(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		var held []net.Conn
+		defer func() {
+			for _, conn := range held {
+				conn.Close()
+			}
+		}()
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			held = append(held, conn) // never answer
+		}
+	}()
+	m, _, log := liveSandbox(t, &liveGate{})
+	m.gates["sbx-live0001"] = newGateClient(strconv.Itoa(listener.Addr().(*net.TCPAddr).Port), "token")
+	saved := clearTimeout
+	clearTimeout = 2 * time.Second
+	defer func() { clearTimeout = saved }()
+	started := time.Now()
+	err = m.closeGate(context.Background(), sandbox.Sandbox{ID: "sbx-live0001", Name: "live"}, errors.New("门卫没有回应"))
+	commands, _ := os.ReadFile(log)
+	if err == nil || !strings.Contains(err.Error(), "已停止它的门卫") || !strings.Contains(string(commands), "stop --time 5") || time.Since(started) > 10*time.Second {
+		t.Fatalf("the gatekeeper must be stopped in time (%s): %v\n%s", time.Since(started), err, commands)
 	}
 }
 
@@ -198,7 +289,7 @@ func TestExpiredDeliveryStillTakesTheSandboxOffline(t *testing.T) {
 	expired, cancel := context.WithCancel(context.Background())
 	cancel()
 	sbx, _ := m.store.Sandbox("sbx-live0001")
-	if err := m.refresh(expired, sbx); err == nil || !strings.Contains(err.Error(), "已暂停") || !gate.empty() {
+	if err := m.refresh(expired, sbx, true); err == nil || !strings.Contains(err.Error(), "已暂停") || !gate.empty() {
 		t.Fatalf("an expired delivery must still clear the gatekeeper: %v %v", err, gate.rules)
 	}
 }

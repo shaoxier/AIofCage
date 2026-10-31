@@ -60,7 +60,7 @@ func (a *App) AuthorizeMCPService(id string) (MCPServiceView, error) {
 	if err != nil {
 		return view, err
 	}
-	return view, a.refreshSandboxesUsing(ctx, service.ID)
+	return view, a.refreshSandboxesUsing(ctx, service.ID, false)
 }
 
 func (a *App) saveLogin(ctx context.Context, service mcp.Service, data []byte) error {
@@ -105,12 +105,17 @@ func (a *App) DisconnectMCPService(id string) (MCPServiceView, error) {
 	if err != nil {
 		return view, err
 	}
-	return view, a.refreshSandboxesUsing(ctx, service.ID)
+	return view, a.refreshSandboxesUsing(ctx, service.ID, true)
 }
 
-// refreshSandboxesUsing re-delivers configuration to running sandboxes that use a service. One
-// failure does not stop the others: a revoked login must reach every gatekeeper that holds it.
-func (a *App) refreshSandboxesUsing(ctx context.Context, serviceID string) error {
+// refreshTimeout bounds the refresh of one sandbox, including waiting for its lock.
+const refreshTimeout = 2 * time.Minute
+
+// refreshSandboxesUsing re-delivers configuration to running sandboxes that use a service.
+// mayNarrow says the change may take something away (an edit, a disconnect): such sandboxes go
+// offline when the refresh fails. One failure does not stop the others, and each sandbox gets its
+// own time: a revoked login must reach every gatekeeper that holds it.
+func (a *App) refreshSandboxesUsing(ctx context.Context, serviceID string, mayNarrow bool) error {
 	if a.manager == nil {
 		return nil
 	}
@@ -118,10 +123,17 @@ func (a *App) refreshSandboxesUsing(ctx context.Context, serviceID string) error
 	if err != nil {
 		return err
 	}
+	refresh := a.manager.RefreshCredentials
+	if mayNarrow {
+		refresh = a.manager.Refresh
+	}
 	var errs []error
 	for _, sbx := range sandboxes {
 		if slices.Contains(sbx.MCP, serviceID) {
-			if err := a.manager.Refresh(ctx, sbx.ID); err != nil {
+			one, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshTimeout)
+			err := refresh(one, sbx.ID)
+			cancel()
+			if err != nil {
 				errs = append(errs, fmt.Errorf("已保存，但更新运行中的沙箱「%s」失败：%w", sbx.Name, err))
 			}
 		}
@@ -158,6 +170,7 @@ func (a *App) refreshOAuth(ctx context.Context) {
 			a.monitor.mu.Lock()
 			alerted := a.monitor.oauthAlerted[id]
 			a.monitor.oauthAlerted[id] = err != nil
+			pending := a.monitor.oauthPending[id]
 			a.monitor.mu.Unlock()
 			if err != nil {
 				if !alerted {
@@ -166,8 +179,14 @@ func (a *App) refreshOAuth(ctx context.Context) {
 				}
 				continue
 			}
-			if refreshed {
-				if err := a.refreshSandboxesUsing(ctx, id); err != nil {
+			if refreshed || pending {
+				// A renewal takes nothing away, so a missed push only leaves the old token in place;
+				// it is retried on the next check.
+				err := a.refreshSandboxesUsing(ctx, id, false)
+				a.monitor.mu.Lock()
+				a.monitor.oauthPending[id] = err != nil
+				a.monitor.mu.Unlock()
+				if err != nil && !pending {
 					a.emit("sandbox:alert", map[string]string{"id": sbx.ID, "message": err.Error()})
 				}
 			}
