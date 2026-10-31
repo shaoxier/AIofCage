@@ -72,7 +72,11 @@ func (a *App) CreateSandbox(request CreateSandboxRequest) (SandboxView, error) {
 	if _, err := a.store.Sandbox(name); err == nil {
 		return SandboxView{}, fmt.Errorf("已有同名沙箱：%s", name)
 	}
-	project, err := prepareProject(request.ProjectMode, request.ProjectPath, name)
+	existing, err := a.store.Sandboxes()
+	if err != nil {
+		return SandboxView{}, err
+	}
+	project, err := prepareProject(request.ProjectMode, request.ProjectPath, name, existing)
 	if err != nil {
 		return SandboxView{}, err
 	}
@@ -324,8 +328,9 @@ const (
 )
 
 // prepareProject returns a folder inside ~/CageWorkspace for the sandbox, copying or creating it
-// if needed. Only the workspace is visible to the VM, so other folders must be imported.
-func prepareProject(mode, path, name string) (string, error) {
+// if needed. Only the workspace is visible to the VM, so other folders must be imported. The folder
+// may not overlap the project of an existing sandbox; the store checks this again when it saves.
+func prepareProject(mode, path, name string, existing []sandbox.Sandbox) (string, error) {
 	workspace := sandbox.Workspace()
 	if err := os.MkdirAll(workspace, 0o755); err != nil {
 		return "", err
@@ -336,9 +341,12 @@ func prepareProject(mode, path, name string) (string, error) {
 		if err := sandbox.ValidateProject(path); err != nil {
 			return "", fmt.Errorf("%w（不在工作区里的文件夹请选择“复制到工作区”）", err)
 		}
+		if err := sandbox.CheckProjectOverlap("", path, existing); err != nil {
+			return "", err
+		}
 		return path, nil
 	case ProjectNew:
-		target := uniqueDir(workspace, slug(name))
+		target := uniqueDir(workspace, slug(name), existing)
 		return target, os.Mkdir(target, 0o755)
 	case ProjectCopy:
 		source, err := filepath.EvalSymlinks(filepath.Clean(path))
@@ -353,7 +361,7 @@ func prepareProject(mode, path, name string) (string, error) {
 		if err := checkCopySize(source); err != nil {
 			return "", err
 		}
-		target := uniqueDir(workspace, slug(filepath.Base(source)))
+		target := uniqueDir(workspace, slug(filepath.Base(source)), existing)
 		if err := copyTree(source, target); err != nil {
 			return "", fmt.Errorf("复制项目失败：%w", err)
 		}
@@ -379,11 +387,15 @@ func slug(name string) string {
 	return result
 }
 
-func uniqueDir(parent, base string) string {
+// uniqueDir returns a name under parent that is free. It also skips names that the project of an
+// existing sandbox still claims although that folder is gone: the new sandbox would share it.
+func uniqueDir(parent, base string, existing []sandbox.Sandbox) string {
 	candidate := filepath.Join(parent, base)
 	for i := 2; ; i++ {
 		if _, err := os.Lstat(candidate); errors.Is(err, fs.ErrNotExist) {
-			return candidate
+			if _, claimed := sandbox.OverlappingSandbox("", candidate, existing); !claimed {
+				return candidate
+			}
 		}
 		candidate = filepath.Join(parent, fmt.Sprintf("%s-%d", base, i))
 	}

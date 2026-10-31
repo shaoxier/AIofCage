@@ -65,7 +65,11 @@ func (a *App) CreateDemoSandbox(request CreateDemoRequest) (DemoSandboxResult, e
 		serviceID = view.ID
 	}
 	name := "案例-" + c.Name + "-" + a.now().Format("0102-150405.000")
-	project, err := prepareProject(ProjectNew, "", name)
+	existing, err := a.store.Sandboxes()
+	if err != nil {
+		return DemoSandboxResult{}, err
+	}
+	project, err := prepareProject(ProjectNew, "", name, existing)
 	if err != nil {
 		return DemoSandboxResult{}, err
 	}

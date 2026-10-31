@@ -209,22 +209,33 @@ func (s *Store) Sandbox(idOrName string) (sandbox.Sandbox, error) {
 	return sandbox.Sandbox{}, fmt.Errorf("沙箱 %s %w", idOrName, ErrNotFound)
 }
 
+// SaveSandbox adds or replaces a sandbox. Names are unique and projects may not overlap; both are
+// checked under the store's lock, so that two processes cannot create clashing sandboxes at once.
+// A sandbox that keeps its project is saved even if that project overlaps one saved before the
+// rule; starting such a sandbox is refused instead.
 func (s *Store) SaveSandbox(item sandbox.Sandbox) error {
 	return s.update("sandboxes.json", func(raw *[]json.RawMessage) error {
 		var items []sandbox.Sandbox
 		if err := decodeAll(*raw, &items); err != nil {
 			return err
 		}
-		replaced := false
+		index := -1
 		for i := range items {
 			if items[i].ID == item.ID {
-				items[i], replaced = item, true
+				index = i
 			} else if items[i].Name == item.Name {
 				return fmt.Errorf("已有同名沙箱：%s", item.Name)
 			}
 		}
-		if !replaced {
+		if index < 0 || items[index].ProjectPath != item.ProjectPath {
+			if err := sandbox.CheckProjectOverlap(item.ID, item.ProjectPath, items); err != nil {
+				return err
+			}
+		}
+		if index < 0 {
 			items = append(items, item)
+		} else {
+			items[index] = item
 		}
 		return encodeAll(items, raw)
 	})
