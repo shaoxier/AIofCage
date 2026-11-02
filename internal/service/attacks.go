@@ -236,8 +236,9 @@ def connect(host,port):
     finally:
         s.close()
 
+# --disable must come first: curl then ignores ~/.curlrc, where the agent could add output that looks like a denial.
 def curl(url,headers=()):
-    args=["curl","--silent","--show-error","--max-time","12","--dump-header","-","--output","/dev/null","--request","POST","--data","aiofcage-isolation-probe"]
+    args=["/usr/bin/curl","--disable","--silent","--show-error","--max-time","12","--dump-header","-","--output","/dev/null","--request","POST","--data","aiofcage-isolation-probe"]
     for h in headers: args.extend(["--header",h])
     p=subprocess.run(args+[url],capture_output=True,text=True,timeout=15)
     codes=re.findall(r"(?im)^HTTP/[^ ]+ ([0-9]{3})(?![^\r\n]*Connection established)",p.stdout)
@@ -347,7 +348,15 @@ result("problem" if found or observed=="connected" else "passed" if observed=="b
 		return AttackResult{Attack: check, Status: checkSkipped, Note: "未支持的检查项。"}
 	}
 	var out bytes.Buffer
-	err := a.manager.Exec(ctx, sbx.ID, false, nil, &out, &out, pythonCommand(checkPython+"\n"+script)...)
+	command := pythonCommand(checkPython + "\n" + script)
+	var err error
+	if check.ID == "steal-env" {
+		// 这一项查的正是 Agent 加载 ~/.aiofcage/env 后看到的环境变量，所以和启动 CLI 一样经过 aiofcage-run。
+		// Agent 改写这个文件只能改变这一项的结果，真实密钥从不进入沙箱。
+		err = a.manager.Exec(ctx, sbx.ID, false, nil, &out, &out, command...)
+	} else {
+		err = a.manager.ExecHelper(ctx, sbx.ID, nil, &out, &out, command...)
+	}
 	return classifyCheck(check, out.Bytes(), err)
 }
 

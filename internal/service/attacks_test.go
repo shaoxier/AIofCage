@@ -97,6 +97,16 @@ func TestIsolationCurlIgnoresTunnelSuccessAndRequiresReason(t *testing.T) {
 	}
 }
 
+// curl must not read ~/.curlrc: the agent could add output there that looks like a denial.
+func TestIsolationCurlSkipsTheAgentsConfig(t *testing.T) {
+	script := checkPython + "\nclass Response:\n    stdout=''\n    returncode=0\n" +
+		"def run(args,**kwargs):\n    print(json.dumps(args[:2]))\n    return Response()\nsubprocess.run=run\ncurl('https://example.invalid')\n"
+	out, err := exec.Command("python3", "-I", "-c", script).CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != `["/usr/bin/curl", "--disable"]` {
+		t.Fatalf("curl starts with %s %v", out, err)
+	}
+}
+
 func jsonNumber(value int) string { data, _ := json.Marshal(value); return string(data) }
 
 // dedicatedApp opens the real store for a running uat- sandbox named by AIOFCAGE_ISOLATION_ID.

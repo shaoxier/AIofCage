@@ -958,8 +958,9 @@ func (m *Manager) writeAgentFiles(ctx context.Context, client *gateClient, sbx s
 	if err != nil {
 		return err
 	}
-	if _, err := m.docker.run(ctx, 30*time.Second, payload, "exec", "--interactive", "--user", agentUser,
-		names(sbx.ID).agent, "python3", "/opt/aiofcage/aiofcage-init.py"); err != nil {
+	// 和其他辅助命令一样直接运行（见 ExecHelper）：-I 不加载 Agent 放进用户 site-packages 的 .pth 文件。
+	if _, err := m.docker.run(ctx, 30*time.Second, payload,
+		helperArgs(sbx.ID, "/usr/bin/python3", "-I", "/opt/aiofcage/aiofcage-init.py")...); err != nil {
 		return fmt.Errorf("写入 Agent 配置失败：%w", err)
 	}
 	return nil
@@ -1425,7 +1426,9 @@ func (m *Manager) Events(ctx context.Context, id, lastID string, handle events.H
 }
 
 // ExecArgs returns the docker arguments that run a command as the agent user inside the sandbox,
-// with the agent settings loaded. Used for terminals and the CLI.
+// with the agent settings loaded. Used for terminals and the CLI: they need the placeholders and
+// base URLs in ~/.aiofcage/env. The agent can rewrite that file, so the app's own helpers do not
+// come this way but use ExecHelper.
 func (m *Manager) ExecArgs(sbx sandbox.Sandbox, tty bool, command ...string) []string {
 	args := []string{m.docker.path, "--context", DockerContext, "exec", "--interactive"}
 	if tty {
@@ -1438,7 +1441,7 @@ func (m *Manager) ExecArgs(sbx sandbox.Sandbox, tty bool, command ...string) []s
 	return append(args, command...)
 }
 
-// Exec runs a command in the sandbox with the caller's stdio.
+// Exec runs a command in the sandbox with the caller's stdio and the agent settings (see ExecArgs).
 func (m *Manager) Exec(ctx context.Context, id string, tty bool, stdin io.Reader, stdout, stderr io.Writer, command ...string) error {
 	sbx, err := m.store.Sandbox(id)
 	if err != nil {

@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -205,27 +204,12 @@ func (a *App) CloseTerminal(id string) error {
 	return nil
 }
 
-// 只匹配随机会话标记，不输出环境内容，也不向其他终端的进程发送信号。
-const endTerminalProcesses = `import os, pathlib, signal, sys, time
-marker = ('AIOFCAGE_TERMINAL_ID=' + sys.argv[1]).encode()
-for sig in (signal.SIGHUP, signal.SIGKILL):
-    for path in pathlib.Path('/proc').glob('[0-9]*/environ'):
-        try:
-            pid = int(path.parent.name)
-            if pid > 1 and marker in path.read_bytes().split(b'\0'):
-                os.kill(pid, sig)
-        except (OSError, ValueError):
-            pass
-    if sig == signal.SIGHUP:
-        time.sleep(0.2)
-`
-
 func (a *App) closeTerminal(t *terminal) {
 	t.closeOnce.Do(func() {
 		t.closed.Store(true)
 		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 		defer cancel()
-		_ = a.manager.Exec(ctx, t.sandboxID, false, nil, io.Discard, io.Discard, "python3", "-c", endTerminalProcesses, t.id)
+		_ = a.manager.EndProcesses(ctx, t.sandboxID, t.id)
 		if t.cmd.Process != nil {
 			_ = t.cmd.Process.Signal(syscall.SIGHUP)
 			process := t.cmd.Process
