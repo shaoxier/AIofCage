@@ -51,13 +51,14 @@ function Activity({ message, busy }) {
 
 export function ConversationView({ session }) {
   const viewport = useRef(null);
-  const follow = useRef(true);
+  const follow = useRef(session.viewport?.follow ?? true);
   const message = session.messages[session.messages.length - 1];
+  useEffect(() => { if (session.viewport && viewport.current) viewport.current.scrollTop = session.viewport.top; }, []);
   useEffect(() => { if (follow.current && viewport.current) viewport.current.scrollTop = viewport.current.scrollHeight; }, [session.messages.length, message?.text, message?.thinking, message?.tools?.length, session.busy]);
   const name = agentName(session.agent);
   return html`<div class="conversation-container">
     <div class="conversation-messages" ref=${viewport} role="region" aria-label="会话消息" tabindex="0"
-      onScroll=${() => { const element = viewport.current; follow.current = element.scrollHeight - element.scrollTop - element.clientHeight < 100; }}>
+      onScroll=${() => { const element = viewport.current; follow.current = element.scrollHeight - element.scrollTop - element.clientHeight < 100; session.viewport = { top: element.scrollTop, follow: follow.current }; }}>
       <div class="conversation-column">
         ${session.error && html`<div class="conversation-notice error" role="alert">${session.error}</div>`}
         ${session.diagnostics && html`<div class="conversation-diagnostics" role="status"><strong>链路诊断${session.diagnostics.ready ? "通过" : "未通过"}</strong>

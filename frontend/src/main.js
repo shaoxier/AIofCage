@@ -1,7 +1,7 @@
 // Ai of Cage 桌面界面：左侧导航 + 各页面。样式见 main.css。
 import "./js/frames.js";
 import { render } from "preact";
-import { useEffect, useState, useCallback, useRef } from "preact/hooks";
+import { useEffect, useLayoutEffect, useState, useCallback, useRef } from "preact/hooks";
 import { html, call, Icon } from "./js/core.js";
 import { ProvidersPage } from "./js/providers.js";
 import { SandboxesPage } from "./js/sandboxes.js";
@@ -10,6 +10,7 @@ import { SettingsPage } from "./js/settings.js";
 import { LogsPage } from "./js/logs.js";
 import { MCPPage } from "./js/mcp.js";
 import { Onboarding, useOnboarding } from "./js/onboarding.js";
+import { readAppView, saveAppView } from "./js/workspace-state.js";
 
 const PAGES = [
   { id: "sandboxes", title: "沙箱", icon: "box" },
@@ -21,7 +22,7 @@ const PAGES = [
 ];
 
 function App() {
-  const [page, setPage] = useState(() => PAGES.some((p) => `#${p.id}` === location.hash) ? location.hash.slice(1) : "sandboxes");
+  const [page, setPage] = useState(() => PAGES.some((p) => `#${p.id}` === location.hash) ? location.hash.slice(1) : readAppView().page);
   const [overview, setOverview] = useState(null);
   const [providers, setProviders] = useState([]);
   const [presets, setPresets] = useState([]);
@@ -34,11 +35,20 @@ function App() {
   const [summary, setSummary] = useState({ sandboxes: [], providers: {} });
   const [logSandbox, setLogSandbox] = useState("");
   const [logFilter, setLogFilter] = useState("all");
-  const [detail, setDetail] = useState(null); // 打开的沙箱详情：{ id, tab, open? }
+  const [detail, setDetail] = useState(() => readAppView().detail); // 打开的沙箱详情：{ id, tab, open? }
   const [services, setServices] = useState([]);
   const [mcpPresets, setMcpPresets] = useState([]);
   const [recoverable, setRecoverable] = useState([]);
   const [dataReady, setDataReady] = useState(false);
+  useLayoutEffect(() => {
+    if (!dataReady) return;
+    if (detail && !sandboxes.some((s) => s.id === detail.id)) {
+      setDetail(null);
+      saveAppView(page, null);
+      return;
+    }
+    saveAppView(page, detail);
+  }, [page, detail, dataReady, sandboxes]);
   // 启动这类操作可能要几分钟，完成后先看用户还在不在原来的页面，不在就不跳转。
   const view = useRef(null);
   view.current = { page, detail };
@@ -49,8 +59,13 @@ function App() {
 
   const notify = useCallback((message, isError = false) => {
     setToast({ message, isError });
-    if (!isError) setTimeout(() => setToast((current) => (current?.message === message ? null : current)), 5000);
   }, []);
+
+  useEffect(() => {
+    if (!toast || toast.isError) return;
+    const timer = setTimeout(() => setToast(null), 5000);
+    return () => clearTimeout(timer);
+  }, [toast]);
 
   const reload = useCallback(async () => {
     const turn = ++reloads.current;
@@ -130,7 +145,28 @@ function App() {
     };
     const observer = new MutationObserver(syncDialog);
     observer.observe(document.body, { childList: true, subtree: true });
+    // 原生 details 不会自行收起：点击外部或另一个菜单时关闭当前菜单。
+    const dismissActionMenus = (e) => {
+      document.querySelectorAll("details.action-menu[open]").forEach((menu) => {
+        if (!menu.contains(e.target)) menu.open = false;
+      });
+    };
+    const onMenuClick = (e) => {
+      dismissActionMenus(e); // 同时覆盖键盘触发的 click。
+      const button = e.target.closest(".action-menu .menu-items button:not(:disabled)");
+      if (button) button.closest("details.action-menu").open = false;
+    };
     const onKey = (e) => {
+      if (e.key === "Escape" && !e.defaultPrevented) {
+        const menus = [...document.querySelectorAll("details.action-menu[open]")];
+        if (menus.length) {
+          const focusedMenu = menus.find((menu) => menu.contains(document.activeElement));
+          menus.forEach((menu) => { menu.open = false; });
+          focusedMenu?.querySelector("summary")?.focus();
+          e.preventDefault();
+          return;
+        }
+      }
       // 对话框里的控件（例如模型下拉）已经用 Esc 收起了自己，就不再关闭对话框。
       if (e.key === "Escape" && topDialog && !e.defaultPrevented) {
         topDialog.querySelector("[data-dismiss], [aria-label='关闭']")?.click();
@@ -155,8 +191,15 @@ function App() {
         e.preventDefault(); items[next].focus(); items[next].click();
       }
     };
+    document.addEventListener("pointerdown", dismissActionMenus, true);
+    document.addEventListener("click", onMenuClick);
     document.addEventListener("keydown", onKey);
-    return () => { offEvent?.(); offStats?.(); offAlert?.(); offQuitting?.(); offRecovery?.(); offProgress?.(); observer.disconnect(); document.removeEventListener("keydown", onKey); };
+    return () => {
+      offEvent?.(); offStats?.(); offAlert?.(); offQuitting?.(); offRecovery?.(); offProgress?.(); observer.disconnect();
+      document.removeEventListener("pointerdown", dismissActionMenus, true);
+      document.removeEventListener("click", onMenuClick);
+      document.removeEventListener("keydown", onKey);
+    };
 
   }, []);
 
@@ -202,7 +245,7 @@ function App() {
     </aside>
     <main id="main-content" tabindex="-1">
       ${quitting && html`<div class="feedback" role="status"><span>正在停止进行中的操作，停完后自动退出。</span></div>`}
-      ${toast && html`<div class=${toast.isError ? "feedback error" : "feedback"} role=${toast.isError ? "alert" : "status"}>
+      ${toast && html`<div class=${toast.isError ? "feedback toast error" : "feedback toast"} role=${toast.isError ? "alert" : "status"} aria-atomic="true">
         <span>${toast.message}</span><button class="icon-button" aria-label="关闭通知" onClick=${() => setToast(null)}><${Icon} name="x" /></button></div>`}
       <${Onboarding} tutorial=${tutorial} page=${page} detail=${detail} notify=${notify} />
       ${content}

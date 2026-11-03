@@ -7,6 +7,7 @@ import { html, call, agentName } from "./core.js";
 import { addAttachments, createDraft, disposeDraft, pasteKind } from "./terminal-draft.js";
 import { applyConversationEvent, tabTitle } from "./conversation-state.js";
 import { ConversationView } from "./conversation-view.js";
+import { readWorkspace, saveWorkspace } from "./workspace-state.js";
 
 const sessions = new Map(); // id → { id, sandboxId, agent, title, term, fit, element, exited, code }
 const listeners = new Set();
@@ -122,11 +123,13 @@ const forgotten = new Set();
 export async function openTerminal(sandbox, agent, recovery = null) {
   wire();
   const id = recovery?.id ?? newID();
+  if (recovery && sessions.has(id) && !sessions.get(id).exited) return id;
   if (agent) {
     // 恢复一个已结束的标签时，沿用它的标题和没发出的草稿。
     const previous = sessions.get(id);
-    const session = { id, sandboxId: sandbox.id, agent, title: previous?.title ?? titleFor(sandbox.id, agentName(agent)), kind: "conversation", resumed: Boolean(recovery),
-      draft: previous?.draft ?? createDraft(), messages: [], models: [], model: "", effort: "", busy: false, started: false, status: "" };
+    const saved = readWorkspace(sandbox.id).terminals.find((t) => t.id === id);
+    const session = { id, sandboxId: sandbox.id, agent, title: previous?.title ?? saved?.title ?? titleFor(sandbox.id, agentName(agent)), kind: "conversation", resumed: Boolean(recovery),
+      draft: previous?.draft ?? createDraft(), messages: previous?.messages ?? [], viewport: previous?.viewport, models: [], model: "", effort: "", busy: false, started: false, status: "" };
     sessions.set(id, session); notifyChange();
     try {
       session.info = recovery
@@ -177,16 +180,18 @@ export async function openTerminal(sandbox, agent, recovery = null) {
 export function closeTerminal(id) {
   const s = sessions.get(id);
   if (!s) return;
-  if (!s.exited) call(s.kind === "conversation" ? "CloseConversation" : "CloseTerminal", id).catch(() => {});
-  if (!s.exited && s.kind === "conversation") forgotten.add(id);
+  if (s.kind === "conversation" || !s.exited) call(s.kind === "conversation" ? "CloseConversation" : "CloseTerminal", id).catch(() => {});
+  if (s.kind === "conversation") forgotten.add(id);
   disposeDraft(s.draft);
   s.term?.dispose();
   s.element?.remove();
   sessions.delete(id);
+  const workspace = readWorkspace(s.sandboxId);
+  saveWorkspace(s.sandboxId, { terminals: workspace.terminals.filter((t) => t.id !== id), active: workspace.active === id ? null : workspace.active });
   notifyChange();
 }
 
-// recoveryHidden 是恢复面板不列出的会话：还开着的，以及刚关掉、记录正在删除的。
+// 自动恢复时跳过还开着的，以及刚关掉、记录正在删除的会话。
 export function recoveryHidden(sandboxId) {
   return [...sandboxTerminals(sandboxId).filter((s) => !s.exited).map((s) => s.id), ...forgotten];
 }

@@ -14,6 +14,7 @@ export function useOnboarding({ providers, sandboxes, dataReady, navigate, reloa
   const [testResult, setTestResult] = useState(null);
   const current = useRef(null);
   const queue = useRef(Promise.resolve());
+  const advancedSandbox = useRef(null);
   const load = useCallback(async () => {
     setError("");
     try {
@@ -48,6 +49,18 @@ export function useOnboarding({ providers, sandboxes, dataReady, navigate, reloa
   useEffect(() => {
     if (active && dataReady) go();
   }, [active, step, state?.sandbox_id, dataReady]);
+
+  // 启动完成后保存对话步骤，让教程和终端页同步。每次就绪只推进一次，
+  // 用户主动点“上一步”时仍可回看启动说明；再次启停后重新判断。
+  useEffect(() => {
+    if (!active || !dataReady || !resources.running) {
+      advancedSandbox.current = null;
+      return;
+    }
+    if (saving || error || step < 3 || advancedSandbox.current === resources.sandbox.id) return;
+    advancedSandbox.current = resources.sandbox.id;
+    if (step === 3) save({ step: 4 });
+  }, [active, dataReady, resources.running, resources.sandbox?.id, step, saving, error, save]);
 
   const begin = async (restart = false) => {
     const saved = await save({ status: "active", step: restart ? 0 : step, ...(restart ? { conversation_verified: false } : {}) });

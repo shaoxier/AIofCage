@@ -8,6 +8,7 @@ import { useTerminals } from "./terminal.js";
 import { SandboxDetail } from "./sandbox-detail.js";
 import { OperationProgress } from "./progress.js";
 import { activityRunning } from "./progress-state.js";
+import { readWorkspace } from "./workspace-state.js";
 
 // 开着对话框时不切换页面：对话框会随页面重建，已经勾选、填写的内容会被重置。
 const dialogOpen = () => Boolean(document.querySelector('[aria-modal="true"]'));
@@ -36,8 +37,9 @@ export function SandboxesPage({ sandboxes, providers, services, recoverable, ove
       notify(stopped ? `「${sandbox.name}」${error.message}` : `「${sandbox.name}」${label}失败：${error.message}`, !stopped);
       return false;
     } finally {
-      setBusy((current) => ({ ...current, [sandbox.id]: undefined }));
-      await reload();
+      // 先同步运行状态再解除操作锁，避免停止完成后的旧 running 状态触发自动恢复。
+      try { await reload(); }
+      finally { setBusy((current) => ({ ...current, [sandbox.id]: undefined })); }
     }
   };
 
@@ -188,12 +190,12 @@ function SandboxRow({ sandbox, providers, usage, busy, run, notify, onReset, onD
       const here = page === "sandboxes" && (!detail || (detail.id === sandbox.id && detail.tab === "terminal"));
       if (!here || dialogOpen()) { notify(`「${sandbox.name}」已启动`); return; }
     }
-    onOpen({ tab: "terminal", open: openTerminals.length ? undefined : { agent: sandbox.bindings.find((b) => b.provider_id)?.agent ?? "", nonce: Date.now() } });
+    onOpen({ tab: readWorkspace(sandbox.id).tab ?? "terminal", open: { agent: sandbox.bindings.find((b) => b.provider_id)?.agent ?? "", resume: true, nonce: Date.now() } });
   };
   return html`<article class="panel sandbox-row">
     <div class="sandbox-identity"><span class=${`sandbox-avatar ${running ? "running" : ""}`}><${Icon} name="box" size=${28} /></span><div class="sandbox-main">
       <div class="sandbox-title"><span class=${`status-dot ${state.tone}`} aria-hidden="true"></span>
-        <button class="title-link" onClick=${() => onOpen({ tab: "overview" })}><h3>${sandbox.name}</h3></button>
+        <button class="title-link" onClick=${() => onOpen({ tab: readWorkspace(sandbox.id).tab ?? "overview" })}><h3>${sandbox.name}</h3></button>
         <span class=${`pill ${busy ? "warn" : state.tone}`}>${busy ? `${busy}中…` : state.label}</span></div>
       <p class="mono project-path" title=${sandbox.project_path}>${sandbox.project_path}</p>
       <div class="agent-summary">${sandbox.bindings.length ? sandbox.bindings.map((b) => html`<span class="binding"><${Icon} name=${agentIcon(b.agent)} size=${16} />${agentName(b.agent)}<span class="muted"> · ${b.provider_name || "待配置"}</span></span>`) : html`<span class="caption">空白沙箱</span>`}</div>

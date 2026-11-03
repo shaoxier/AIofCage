@@ -53,7 +53,8 @@ nav { display: grid; justify-items: center; gap: 4px; }
 .environment-status:focus-visible { outline-offset: 0; }
 .dot { display: inline-block; width: 8px; height: 8px; background: #b58a40; border-radius: 50%; }
 .dot.ok { background: var(--ok); }
-main { margin-left: var(--sidebar-width); max-width: 1640px; padding: 28px 32px 40px; min-width: 0; }
+/* 随窗口填满侧栏外的空间，避免大窗口右侧留下固定宽度限制产生的空白。 */
+main { margin-left: var(--sidebar-width); padding: 28px 32px 40px; min-width: 0; }
 main:focus { outline: none; }
 
 /* 实操教程沿用真实页面；卡片参与布局，不遮挡表单和会话。 */
@@ -110,6 +111,10 @@ main:focus { outline: none; }
 .caption { font-size: var(--text-sm); color: var(--faint); margin-top: 9px; line-height: 1.65; }
 .feedback { display: flex; justify-content: space-between; align-items: center; gap: 14px; padding: 12px 16px; border: 1px solid #d0e3d7; background: #f4faf6; border-radius: 10px; color: #3c624c; margin: 0 0 20px; font-size: var(--text-sm); }
 .feedback.error { border-color: #e6c3ba; background: var(--bad-bg); color: var(--bad); }
+/* 全局通知悬浮在窗口顶部，不参与页面布局，出现和消失时不推挤内容。 */
+.toast { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 50; width: max-content; max-width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow-y: auto; margin: 0; box-shadow: var(--popover-shadow); }
+.toast > span { min-width: 0; overflow-wrap: anywhere; }
+.toast > button { flex-shrink: 0; }
 .pill { display: inline-flex; align-items: center; gap: 5px; border-radius: 999px; font-size: var(--text-xs); font-weight: 500; line-height: 1.5; padding: 4px 10px; white-space: nowrap; background: var(--idle-bg); color: var(--muted); }
 .pill.ok { background: var(--ok-bg); color: var(--ok); }
 .pill.warn { background: var(--warn-bg); color: var(--warn); }
@@ -135,7 +140,7 @@ main:focus { outline: none; }
 .sandbox-toolbar { justify-content: space-between; }
 
 /* 沙箱列表与详情。 */
-.sandbox-list { display: grid; gap: 16px; }
+.sandbox-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
 .sandbox-row { display: grid; grid-template-columns: minmax(0, 1fr) 150px auto; gap: 22px; align-items: center; padding: 24px; overflow: visible; }
 .sandbox-identity { display: flex; align-items: flex-start; gap: 16px; min-width: 0; }
 .sandbox-avatar { display: grid; place-items: center; flex-shrink: 0; width: 48px; height: 48px; border-radius: 14px; background: #f0f3f4; color: #697d80; }
@@ -143,6 +148,7 @@ main:focus { outline: none; }
 .sandbox-main { min-width: 0; }
 .sandbox-title { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 .sandbox-title h3 { font-size: 1.0625rem; }
+.sandbox-title .title-link { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #b4bfbb; flex-shrink: 0; }
 .status-dot.ok { background: #4b996a; box-shadow: 0 0 0 3px #4b996a19; }
 .status-dot.warn { background: #c08d3e; }
@@ -413,13 +419,6 @@ details.advanced label:first-of-type { margin-top: 12px; }
 .terminal-panel .terminal-empty { flex: 1; border: 0; box-shadow: none; padding: 32px 20px; background: transparent; }
 .terminal-choices { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
 .terminal-drop-hint { position: absolute; inset: 10px; display: grid; place-items: center; pointer-events: none; border: 2px dashed #9dbdb0; border-radius: 14px; color: var(--brand-dark); background: #f7fbf9ee; font-size: 1.125rem; }
-.conversation-recovery { display: grid; gap: 4px; margin: 8px 10px 0; padding: 10px 12px; border-radius: 12px; box-shadow: none; flex-shrink: 0; background: #fbfcfc; }
-.conversation-recovery strong { font-size: var(--text-sm); }
-.conversation-recovery .caption { margin-top: 2px; font-size: var(--text-xs); }
-.conversation-recovery-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding-top: 6px; border-top: 1px solid var(--line-soft); font-size: var(--text-sm); }
-.conversation-recovery-row button { min-height: 30px; padding: 4px 14px; font-size: var(--text-sm); }
-.conversation-recovery-row > span { display: inline-flex; align-items: center; gap: 7px; min-width: 0; overflow-wrap: anywhere; }
-.recovery-diagnostics { margin: 6px 14px 2px; font-size: var(--text-xs); }
 
 /* 项目文件栏：浅色侧栏，宽度和行为不变。 */
 .project-files { flex: 0 0 280px; min-width: 0; display: flex; flex-direction: column; border-left: 1px solid var(--line-soft); background: #fbfcfc; color: var(--ink); font-size: var(--text-sm); }

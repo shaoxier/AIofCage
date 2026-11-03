@@ -1,22 +1,20 @@
 // 沙箱详情页（参考 Docker Desktop 点开容器）：终端、概览、日志三个标签。
-import { useCallback, useEffect, useRef, useState } from "preact/hooks";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { DevSourceLine } from "./dev-sources.js";
 import { html, call, AGENTS, agentName, STATES, ConfirmDialog, Icon, agentIcon } from "./core.js";
 import { BindingSelects, MCPLine, UsageStats } from "./sandboxes.js";
 import { HealthPanel } from "./health.js";
 import { UsagePage } from "./usage.js";
 import { LogsPage } from "./logs.js";
-import { TerminalView, openTerminal, closeTerminal, useTerminals, recoveryHidden, updateTerminalDraft, addTerminalAttachments, handleTerminalPaste, handleTerminalImageKey } from "./terminal.js";
+import { TerminalView, openTerminal, closeTerminal, useTerminals, sandboxTerminals, recoveryHidden, updateTerminalDraft, addTerminalAttachments, handleTerminalPaste, handleTerminalImageKey } from "./terminal.js";
 import { TerminalComposer } from "./composer.js";
 import { SandboxAgentUpdates } from "./agent-versions.js";
 import { OperationProgress } from "./progress.js";
-import { recoveryPanel } from "./conversation-state.js";
+import { readWorkspace, saveWorkspace, orderedRecoveries } from "./workspace-state.js";
 import { DemoTask } from "./demo-cases.js";
 import { placeTerminalMenu, terminalMenuKey } from "./terminal-menu.js";
 import { ProjectFiles } from "./project-files.js";
 import { insertAt, insertable, shellQuote } from "./project-paths.js";
-
-const activeTerminals = new Map();
 
 // 文件栏按沙箱记住展开状态；窗口窄时总是先收起，展开后浮在终端上，不挤占对话区。
 const filesKey = (id) => `aiofcage.files.${id}`;
@@ -39,6 +37,7 @@ export function SandboxDetail({ sandbox, detail, setDetail, providers, services,
   onAddAgents, onEditMCP, onAttack, onReset, onDelete, onLogs, dialogs, devSources, onEditDev }) {
   const [restartConfirm, setRestartConfirm] = useState(false);
   const tab = detail.tab ?? "overview";
+  useLayoutEffect(() => { saveWorkspace(sandbox.id, { tab }); }, [sandbox.id, tab]);
   const state = STATES[sandbox.state] ?? STATES.unknown;
   const running = sandbox.state === "running";
   const openFolder = () => call("OpenProjectFolder", sandbox.id).catch((e) => notify(e.message, true));
@@ -104,7 +103,11 @@ export function SandboxDetail({ sandbox, detail, setDetail, providers, services,
 
 function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, notify }) {
   const sessions = useTerminals(sandbox.id);
-  const [active, updateActive] = useState(() => activeTerminals.get(sandbox.id));
+  const savedWorkspace = useRef(readWorkspace(sandbox.id));
+  const [active, updateActive] = useState(savedWorkspace.current.active);
+  const selected = useRef(active);
+  const restoredTabs = useRef(false);
+  const handledRequest = useRef(null);
   const [dragging, setDragging] = useState(false);
   const [creating, setCreating] = useState(false);
   const [filesOpen, setFilesOpen] = useState(() => filesPreference(sandbox.id));
@@ -130,7 +133,11 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
       observer.disconnect();
     };
   }, []);
-  const setActive = (id) => { activeTerminals.set(sandbox.id, id); updateActive(id); };
+  const remember = (id) => saveWorkspace(sandbox.id, {
+    active: id,
+    terminals: sandboxTerminals(sandbox.id).map((s) => ({ id: s.id, agent: s.agent, title: s.title, hasHistory: Boolean(s.started || s.resumed) })),
+  });
+  const setActive = (id) => { selected.current = id; updateActive(id); remember(id); };
   const open = async (agent) => {
     if (creating) return;
     setCreating(true);
@@ -138,46 +145,66 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
     try { setActive(await openTerminal(sandbox, agent)); }
     finally { setCreating(false); }
   };
-  const recovering = useRef(false); // 同步加锁：第一次调用返回之前，重复点击不会再恢复一次
-  const recover = async (item) => {
-    if (creating || recovering.current || !item.ready) return;
-    recovering.current = true;
-    setCreating(true);
-    try {
-      // 先确认记录还在、还能恢复，再决定要不要启动沙箱。
-      const current = (await call("ListRecoverableConversations").catch(() => [])).find((record) => record.id === item.id);
-      if (!current?.ready) {
-        notify(current ? `这条会话不能恢复：${current.reason}` : "这条会话记录已经不在了", true);
-        return;
-      }
-      if (!running && !await run(sandbox, "启动", "StartSandbox", sandbox.id)) return;
-      setActive(await openTerminal(sandbox, item.agent, item));
-    } finally { recovering.current = false; setCreating(false); }
-  };
-  // 面板只列出真能恢复的会话；不能恢复的旧记录只作为诊断信息，不出现“恢复”字样。
-  const { ready, stale } = recoveryPanel(recoverable, sandbox.id, recoveryHidden(sandbox.id));
-  const recoveries = html`${ready.length > 0 && html`<div class="conversation-recovery panel" role="status">
-      <div><strong>可恢复会话</strong><p class="caption">这些记录只保存原生会话元数据，不保存消息正文。${running ? "" : "恢复时会先启动沙箱。"}</p></div>
-      ${ready.map((item) => html`<div class="conversation-recovery-row" key=${item.id}>
-        <span><${Icon} name="sparkles" size=${17} />${agentName(item.agent)} · ${item.provider_name} · ${item.model}</span>
-        <button class="primary" onClick=${() => recover(item)} disabled=${Boolean(busy) || creating}>恢复</button>
-      </div>`)}</div>`}
-    ${stale.length > 0 && html`<details class="caption recovery-diagnostics"><summary>${stale.length} 条旧会话记录不能继续</summary>
-      <ul>${stale.map((item) => html`<li key=${item.id}>${agentName(item.agent)} · ${item.model}：${item.reason}</li>`)}</ul></details>`}`;
-
-  // 从沙箱列表点“打开终端”过来时，按选中的 Agent 新开一个标签。
+  // 进入终端后直接续接已有会话；恢复动作只建立会话，不发送消息。
+  // openTerminal 同步注册标签，重复刷新/切页不会同时恢复同一 ID。
   useEffect(() => {
-    if (request && running) {
-      const existing = request.reuse && sessions.findLast((s) => !s.exited && s.agent === request.agent && s.info?.provider_id === sandbox.bindings.find((b) => b.agent === request.agent)?.active_provider_id);
-      if (existing) setActive(existing.id);
-      else open(request.agent);
+    if (!running || busy || creating) return;
+    const before = sandboxTerminals(sandbox.id);
+    const hidden = new Set(recoveryHidden(sandbox.id));
+    const pending = [];
+    for (const item of orderedRecoveries(recoverable, sandbox.id, savedWorkspace.current)) {
+      const previous = before.find((s) => s.id === item.id);
+      if (hidden.has(item.id) || previous?.error) continue;
+      pending.push(openTerminal(sandbox, item.agent, item));
     }
-  }, [request?.nonce]);
+    // Shell 和尚未发送消息的空白会话没有原生记录，重开原标签；已存在时直接复用。
+    if (!restoredTabs.current) {
+      restoredTabs.current = true;
+      for (const item of savedWorkspace.current.terminals.filter((t) => !t.agent || t.hasHistory === false)) {
+        if (before.some((s) => s.id === item.id) || recoverable.some((r) => r.id === item.id)) continue;
+        if (item.agent && !sandbox.bindings.some((b) => b.agent === item.agent && b.active_provider_id)) continue;
+        pending.push(openTerminal(sandbox, item.agent));
+        const restored = sandboxTerminals(sandbox.id).at(-1);
+        restored.title = item.title;
+        if (selected.current === item.id) selected.current = restored.id;
+      }
+    }
+    const available = sandboxTerminals(sandbox.id);
+    let next = available.find((s) => s.id === selected.current) ?? available[0];
+    if (request && handledRequest.current !== request.nonce) {
+      handledRequest.current = request.nonce;
+      const existing = request.resume ? next : request.reuse && available.findLast((s) => !s.exited && s.agent === request.agent && (!s.info || s.info.provider_id === sandbox.bindings.find((b) => b.agent === request.agent)?.active_provider_id));
+      if (existing) next = existing;
+      else {
+        pending.push(openTerminal(sandbox, request.agent));
+        next = sandboxTerminals(sandbox.id).at(-1);
+      }
+    }
+    if (next) setActive(next.id);
+    if (pending.length) {
+      setCreating(true);
+      Promise.all(pending).catch((error) => notify(error.message, true)).finally(() => setCreating(false));
+    }
+  }, [running, busy, creating, recoverable, request?.nonce]);
 
   const current = sessions.find((s) => s.id === active) ?? sessions[sessions.length - 1];
   const close = (id) => {
     closeTerminal(id);
-    if (id === current?.id) setActive(null);
+    if (id === current?.id) setActive(sandboxTerminals(sandbox.id).at(-1)?.id ?? null);
+    else remember(selected.current);
+  };
+  const reopen = async () => {
+    if (creating) return;
+    const item = current.resumed && recoverable.find((r) => r.id === current.id && r.ready);
+    if (item) {
+      setCreating(true);
+      try { setActive(await openTerminal(sandbox, current.agent, item)); }
+      finally { setCreating(false); }
+    } else {
+      const agent = current.agent;
+      close(current.id);
+      await open(agent);
+    }
   };
   const choices = [...sandbox.bindings.map((b) => ({ agent: b.agent, label: agentName(b.agent) })), { agent: "", label: "Shell" }];
   // 路径插入当前会话：对话插到输入框光标处（项目内的相对路径），Shell 当作键入、不带回车
@@ -218,7 +245,7 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
   const emptyChat = conversation && current.info && !current.exited && running && !current.messages.length && !current.started && !current.error;
 
   if (!running && sessions.length === 0) {
-    return html`<div>${recoveries}<div class="panel empty">
+    return html`<div><div class="panel empty">
       <span class="empty-icon"><${Icon} name="terminal" size=${40} /></span><h3>沙箱还没有启动</h3>
       <p>启动沙箱后，打开智能体或 Shell 开始工作。</p>
       <button class="primary" onClick=${() => run(sandbox, "启动", "StartSandbox", sandbox.id)} disabled=${Boolean(busy)}>启动沙箱</button>
@@ -228,7 +255,6 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
   return html`<div class="terminal-panel"
     onDragOver=${(e) => { if (!e.defaultPrevented && e.dataTransfer.types.includes("Files")) { e.preventDefault(); e.dataTransfer.dropEffect = "none"; } }}
     onDrop=${(e) => e.preventDefault()}>
-    ${recoveries}
     <div class="terminal-tabs">
       ${sessions.length > 0 && html`<div class="terminal-session-tabs" role="tablist" aria-label="终端会话">${sessions.map((s) => html`<div class=${`terminal-tab ${s.id === current?.id ? "active" : ""} ${s.exited ? "exited" : ""}`} key=${s.id}>
         <button role="tab" aria-selected=${s.id === current?.id} tabindex=${s.id === current?.id ? 0 : -1} onClick=${() => setActive(s.id)}><${Icon} name=${agentIcon(s.agent)} size=${15} />${s.title}${s.exited ? "（已结束）" : ""}</button>
@@ -260,7 +286,7 @@ function TerminalTab({ sandbox, request, recoverable = [], running, busy, run, n
     ${current
       ? html`<${TerminalView} key=${current.id} id=${current.id} />
           ${current.exited && running && html`<div class="terminal-exited">
-            <button onClick=${() => { const agent = current.agent; close(current.id); open(agent); }}>重新打开 ${current.title}</button></div>`}`
+            <button onClick=${reopen} disabled=${creating || Boolean(busy)}>重新打开 ${current.title}</button></div>`}`
       : html`<div class="panel empty terminal-empty"><h3>开始工作</h3>
           <p>打开智能体，或使用 Shell 管理项目。</p>
           <div class="terminal-choices">${choices.map((c) => html`<button class="primary" onClick=${() => open(c.agent)}><${Icon} name=${agentIcon(c.agent)} size=${18} />${c.label}</button>`)}</div>
