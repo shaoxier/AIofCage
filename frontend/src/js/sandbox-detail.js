@@ -54,7 +54,7 @@ export function SandboxDetail({ sandbox, detail, setDetail, providers, services,
         <div class="detail-actions">
           <div class="detail-tabs" role="tablist" aria-label="沙箱详情">
             ${TABS.map((t) => html`<button role="tab" aria-selected=${t.id === tab} tabindex=${t.id === tab ? 0 : -1} class=${t.id === tab ? "segment active" : "segment"}
-              onClick=${() => setDetail({ ...detail, tab: t.id, open: undefined })}>${t.label}</button>`)}
+              onClick=${() => setDetail({ ...detail, tab: t.id, open: undefined, logFilter: undefined })}>${t.label}</button>`)}
           </div>
           <div class="row-actions">
             ${running
@@ -89,10 +89,11 @@ export function SandboxDetail({ sandbox, detail, setDetail, providers, services,
         <div><h3>开发环境</h3><${DevSourceLine} sandbox=${sandbox} sources=${devSources ?? []} busy=${busy} onEdit=${onEditDev} /></div>
         <div><h3>用量</h3><${UsageStats} sandbox=${sandbox} usage=${usage} /></div>
       </div>`}
-      ${tab === "health" && html`<${HealthPanel} sandbox=${sandbox} vm=${vm} events=${events} />`}
+      ${tab === "health" && html`<${HealthPanel} sandbox=${sandbox} vm=${vm} events=${events}
+        onDenied=${() => setDetail({ ...detail, tab: "logs", open: undefined, logFilter: "deny" })} />`}
       ${tab === "usage" && html`<${UsagePage} sandboxId=${sandbox.id} providers=${providers} embedded=${true} />`}
-      ${tab === "logs" && html`<${LogsPage} events=${events} sandboxes=${[sandbox]} providers=${providers} notify=${notify}
-        sandboxFilter=${sandbox.id} setSandboxFilter=${() => {}} embedded=${true} />`}
+      ${tab === "logs" && html`<${LogsPage} key=${detail.logFilter ?? "all"} events=${events} sandboxes=${[sandbox]} providers=${providers} notify=${notify}
+        sandboxFilter=${sandbox.id} setSandboxFilter=${() => {}} embedded=${true} initialFilter=${detail.logFilter ?? "all"} />`}
       ${restartConfirm && html`<${ConfirmDialog} title="重启并应用配置？" message="当前终端会话将结束，项目文件和智能体历史会保留。" confirmLabel="重启并应用" onClose=${() => setRestartConfirm(false)} onConfirm=${async () => {
         setRestartConfirm(false);
         if (await run(sandbox, "停止", "StopSandbox", sandbox.id)) await run(sandbox, "启动", "StartSandbox", sandbox.id);

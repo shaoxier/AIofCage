@@ -311,10 +311,26 @@ input[type="radio"], input[type="checkbox"] { width: 16px; height: 16px; min-hei
 .mcp-tool-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 12px; }
 .mcp-tool-actions { display: inline-flex; gap: 12px; }
 .mcp-tool-scroll { display: grid; gap: 4px; max-height: 240px; overflow-y: auto; }
-.security-diagnostics { display: grid; gap: 12px; margin-bottom: 18px; }
-.security-grid, .security-mcp { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-.security-item { display: grid; gap: 4px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
-.security-item small { color: var(--faint); line-height: 1.45; }
+/* 安全诊断中心：标题行放门卫状态和拦截次数；四条隔离边界排成一行浅色卡片，MCP 权限是一张列表。 */
+.security-diagnostics { display: grid; gap: 14px; margin-bottom: 18px; padding: 18px 20px; }
+.security-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.security-head-spacer { flex: 1; }
+.security-head .link { font-size: var(--text-sm); }
+.security-head .caption, .security-mcp-list .caption { margin: 0; }
+.security-controls { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.security-control { display: flex; align-items: flex-start; gap: 10px; min-width: 0; padding: 12px; border-radius: 12px; background: #f5f7f7; }
+.security-control-icon { display: grid; place-items: center; width: 32px; height: 32px; flex: none; border-radius: 9px; background: var(--brand-soft); color: var(--brand); }
+.security-control strong { display: block; font-size: var(--text-sm); font-weight: 600; }
+.security-control p { margin-top: 2px; font-size: var(--text-xs); line-height: 1.55; color: var(--muted); }
+.security-subhead { margin-top: 2px; font-size: var(--text-sm); font-weight: 600; }
+.security-mcp-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line-soft); border-radius: 12px; }
+.security-mcp-list li { display: flex; align-items: center; gap: 6px 12px; flex-wrap: wrap; padding: 10px 14px; }
+.security-mcp-list li + li { border-top: 1px solid var(--line-soft); }
+.security-mcp-name { display: inline-flex; align-items: center; gap: 6px; font-size: var(--text-sm); font-weight: 500; }
+.security-mcp-list .pill { margin-left: auto; }
+.security-foot { display: flex; align-items: center; gap: 6px; margin: 0; }
+@media (max-width: 1100px) { .security-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 540px) { .security-controls { grid-template-columns: 1fr; } }
 .conversation-diagnostics { display: grid; gap: 8px; margin: 12px 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
 .conversation-check { display: flex; gap: 8px; align-items: flex-start; font-size: var(--text-sm); }
 .agent-line { display: grid; grid-template-columns: 180px minmax(0,1fr); gap: 12px; align-items: center; }
