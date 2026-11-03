@@ -534,7 +534,7 @@ func (c *agentController) executeAttempt(ctx context.Context, task *controlTask,
 		}
 		killCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = c.app.manager.Exec(killCtx, s.ID, false, nil, io.Discard, io.Discard, "python3", "-c", endTerminalProcesses, marker)
+		_ = c.app.manager.EndProcesses(killCtx, s.ID, marker)
 	}()
 	scanner := bufio.NewScanner(out)
 	var reportedError string

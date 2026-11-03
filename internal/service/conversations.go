@@ -115,7 +115,7 @@ func (a *App) startConversation(id, sandboxID string, agent session.Agent, recov
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := a.manager.Exec(ctx, sandboxID, false, nil, io.Discard, io.Discard,
+	if err := a.manager.ExecHelper(ctx, sandboxID, nil, io.Discard, io.Discard,
 		"test", "-f", "/opt/aiofcage/agent-turn.py"); err != nil {
 		return ConversationInfo{}, errors.New("沙箱需要更新会话组件，请停止后重新启动沙箱")
 	}
@@ -285,7 +285,7 @@ func (a *App) SendConversationMessage(id, text string, images []TerminalImage, o
 		stopOnce.Do(func() {
 			killCtx, killCancel := context.WithTimeout(context.Background(), 4*time.Second)
 			defer killCancel()
-			_ = a.manager.Exec(killCtx, c.sandbox.ID, false, nil, io.Discard, io.Discard, "python3", "-c", endTerminalProcesses, marker)
+			_ = a.manager.EndProcesses(killCtx, c.sandbox.ID, marker)
 			cancel()
 		})
 	}

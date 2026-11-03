@@ -13,7 +13,8 @@ import (
 	"github.com/shaoxier/AIofCage/internal/session"
 )
 
-// ConversationCommand 只在容器内启动官方 CLI，正文及公开配置通过标准输入交付。
+// ConversationCommand 只在容器内启动官方 CLI，正文及公开配置通过标准输入交付。它经过 aiofcage-run：
+// CLI 需要 ~/.aiofcage/env 里的占位符和接口地址。停止本轮用的 EndProcesses 不经过这里。
 func (m *Manager) ConversationCommand(ctx context.Context, sbx sandbox.Sandbox, id string) *exec.Cmd {
 	args := m.ExecArgs(sbx, false, "env", "AIOFCAGE_TERMINAL_ID="+id, "python3", "/opt/aiofcage/agent-turn.py")
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
@@ -50,8 +51,9 @@ func (m *Manager) NativeSessionExists(ctx context.Context, id string, agent sess
 		return false, errors.New("沙箱未运行")
 	}
 	// No shell: the id is a single find argument. A missing directory means no session either.
-	out, err := m.docker.run(ctx, 15*time.Second, nil, "exec", "--user", agentUser, names(id).agent,
-		"find", dir, "-maxdepth", "6", "-name", "*"+nativeID+"*", "-print", "-quit")
+	// Run like the other helpers (see ExecHelper), from / rather than the project.
+	out, err := m.docker.run(ctx, 15*time.Second, nil,
+		helperArgs(id, "find", dir, "-maxdepth", "6", "-name", "*"+nativeID+"*", "-print", "-quit")...)
 	if err != nil && len(out) == 0 && !strings.Contains(err.Error(), "No such file") {
 		return false, err
 	}

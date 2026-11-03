@@ -161,14 +161,12 @@ func (m *Manager) RemoveTerminalImages(ctx context.Context, id, batchID string) 
 	return m.attachmentScript(ctx, id, nil, "remove", batchID)
 }
 
-// attachmentScript 以 Agent 用户（与智能体相同的 1000:1000）直接运行附件脚本：不经过 aiofcage-run，
-// 因为它会加载 Agent 可写的 ~/.aiofcage/env；python 以 -I 隔离模式运行，工作目录、PYTHON* 变量和
-// 用户 site-packages 都不参与模块查找。脚本的输出不回到宿主，只看退出码。
+// attachmentScript 以 Agent 用户直接运行附件脚本（ExecHelper、PythonHelper），不加载 Agent 可写的
+// ~/.aiofcage/env，工作目录、PYTHON* 变量和用户 site-packages 都不参与模块查找。脚本的输出不回到宿主，只看退出码。
 func (m *Manager) attachmentScript(ctx context.Context, id string, stdin io.Reader, operation, batchID string) error {
 	script, err := assets.ReadFile("assets/agent/terminal-images.py")
 	if err != nil {
 		return err
 	}
-	return m.docker.stream(ctx, stdin, io.Discard, io.Discard, "exec", "--interactive", "--user", agentUser,
-		"--workdir", "/", names(id).agent, "/usr/bin/python3", "-I", "-c", string(script), operation, batchID)
+	return m.ExecHelper(ctx, id, stdin, io.Discard, io.Discard, PythonHelper(string(script), operation, batchID)...)
 }

@@ -30,11 +30,12 @@ func probeNonce() string {
 	return hex.EncodeToString(raw[:])
 }
 
-// pythonCommand runs a check script with Python isolated from its surroundings: no PYTHON*
-// variables, no site packages or sitecustomize, and neither the working directory nor the script's
-// directory on the import path (a project could hold its own json.py).
+// pythonCommand runs a check script with Python isolated from its surroundings: the image's own
+// interpreter whatever PATH says, no PYTHON* variables, no site packages or sitecustomize, and
+// neither the working directory nor the script's directory on the import path (a project could
+// hold its own json.py).
 func pythonCommand(script string, args ...string) []string {
-	return append([]string{"python3", "-I", "-S", "-c", script}, args...)
+	return append([]string{"/usr/bin/python3", "-I", "-S", "-c", script}, args...)
 }
 
 // waitForProbe waits until a background probe printed marker, e.g. that it is listening.
@@ -56,10 +57,13 @@ func (a *App) waitForProbe(ctx context.Context, name, marker string) bool {
 // to see the check report the problem.
 type probeRunner func(ctx context.Context, script string, args ...string) ([]byte, error)
 
+// inAgent runs the script in the agent's container as the agent user, but without the agent's
+// settings (runtime.ExecHelper): the agent can rewrite ~/.aiofcage/env to report whatever it likes,
+// and none of these checks needs anything from it.
 func (a *App) inAgent(sbx sandbox.Sandbox) probeRunner {
 	return func(ctx context.Context, script string, args ...string) ([]byte, error) {
 		var out bytes.Buffer
-		err := a.manager.Exec(ctx, sbx.ID, false, nil, &out, &out, pythonCommand(script, args...)...)
+		err := a.manager.ExecHelper(ctx, sbx.ID, nil, &out, &out, pythonCommand(script, args...)...)
 		return out.Bytes(), err
 	}
 }

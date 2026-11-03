@@ -10,8 +10,8 @@ import (
 	"github.com/shaoxier/AIofCage/internal/session"
 )
 
-// The check runs find inside the agent container, with the id as one argument, and says whether
-// the agent's own session record is still there.
+// The check runs find inside the agent container as a helper (from /, without the agent's
+// settings), with the id as one argument, and says whether the agent's own session record is still there.
 func TestNativeSessionLookup(t *testing.T) {
 	dir := t.TempDir()
 	log := filepath.Join(dir, "commands")
@@ -48,7 +48,7 @@ func TestNativeSessionLookup(t *testing.T) {
 		t.Fatal("a stopped sandbox cannot be checked")
 	}
 	commands, _ := os.ReadFile(log)
-	if !strings.Contains(string(commands), "exec --user 1000:1000 aiofcage-sbx-native01-agent find /home/agent/.codex/sessions -maxdepth 6 -name *present-0001* -print -quit") {
+	if !strings.Contains(string(commands), "exec --interactive --user 1000:1000 --workdir / aiofcage-sbx-native01-agent find /home/agent/.codex/sessions -maxdepth 6 -name *present-0001* -print -quit") {
 		t.Fatalf("commands:\n%s", commands)
 	}
 }

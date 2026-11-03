@@ -88,7 +88,7 @@ func (a *App) DiagnoseConversation(sandboxID string, agent session.Agent) (Conve
 	} else {
 		add("credential", "供应商凭据", "passed", "宿主已找到密钥，沙箱只使用占位符。")
 	}
-	if err := a.manager.Exec(ctx, sandboxID, false, nil, io.Discard, io.Discard, "test", "-f", "/opt/aiofcage/agent-turn.py"); err != nil {
+	if err := a.manager.ExecHelper(ctx, sandboxID, nil, io.Discard, io.Discard, "test", "-f", "/opt/aiofcage/agent-turn.py"); err != nil {
 		add("session", "会话组件", "problem", "沙箱会话组件不可用，请停止后重新启动以更新镜像。")
 	} else {
 		add("session", "会话组件", "passed", "会话桥接组件已安装。")
