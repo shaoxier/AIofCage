@@ -7,7 +7,10 @@ const COMPONENT_STATES = { running: "运行中", exited: "已停止", created: "
 const date = (value) => value && !value.startsWith("0001") ? new Date(value).toLocaleString() : "—";
 const bytes = (value) => value ? formatBytes(value) : "0 B";
 
-export function HealthPanel({ sandbox, vm, events = [] }) {
+// 安全诊断里四条隔离边界各配一个图标。
+const CONTROL_ICONS = { project: "folder", network: "external", credentials: "shield", audit: "list" };
+
+export function HealthPanel({ sandbox, vm, events = [], onDenied }) {
   const [report, setReport] = useState(null);
   const [security, setSecurity] = useState(null);
   const [error, setError] = useState("");
@@ -43,14 +46,25 @@ export function HealthPanel({ sandbox, vm, events = [] }) {
     ${!h ? html`<div class="panel empty">正在读取运行状态…</div>` : html`
       <p class="caption health-stamp">${stale ? "样本已过期 · " : ""}采集于 ${date(h.collected_at)} · 耗时 ${(h.duration_ms/1000).toFixed(1)} 秒 · 约每 5 秒更新</p>
       ${(h.error || stale || s.error) && html`<p class="feedback ${h.state === "stopped" || h.state === "not_created" ? "" : "error"}" role="status">${h.error || (stale ? "暂未收到新样本，以下资源值不可用。" : s.error)}</p>`}
-      ${security && html`<div class="panel security-diagnostics" aria-label="安全诊断中心">
-        <div class="card-top"><h3>安全诊断中心</h3><span class=${`pill ${security.gatekeeper_ready ? "ok" : security.gatekeeper_running ? "warn" : "idle"}`}>${security.gatekeeper_ready ? "门卫已就绪" : security.gatekeeper_running ? "门卫未确认" : "门卫未运行"}</span></div>
+      ${security && html`<section class="panel security-diagnostics" aria-label="安全诊断中心">
+        <div class="security-head"><h3>安全诊断中心</h3>
+          <span class=${`pill ${security.gatekeeper_ready ? "ok" : security.gatekeeper_running ? "warn" : "idle"}`}>${security.gatekeeper_ready ? "门卫已就绪" : security.gatekeeper_running ? "门卫未确认" : "门卫未运行"}</span>
+          <span class="security-head-spacer"></span>
+          ${onDenied && security.recent_denied > 0
+            ? html`<button class="link" onClick=${onDenied} title="在日志里只看被拦截的请求">最近拦截 ${security.recent_denied} 次</button>`
+            : html`<span class="caption">最近拦截 ${security.recent_denied} 次</span>`}</div>
         ${security.gatekeeper_error && html`<p class="caption">${security.gatekeeper_error}</p>`}
-        <div class="security-grid">${security.controls.map((item) => html`<div class="security-item"><strong>${item.name}</strong><span class="pill idle">边界说明</span><small>${item.detail}</small></div>`)}</div>
-        <div class="section-heading compact"><h4>MCP 权限</h4><span class="caption">最近拒绝 ${security.recent_denied} 次</span></div>
-        ${security.mcp.length ? html`<div class="security-mcp">${security.mcp.map((item) => html`<div class="security-item"><strong>${item.name}</strong><small>${item.connector ? "连接器" : "远程服务"}工具 ${item.granted_tools.length}/${item.catalog_tools.length}${item.explicit_grant ? "（沙箱专属）" : item.connector ? "（默认目录）" : "（默认只读）"} · ${item.key_saved ? "凭据可用" : "需要登录或配置"}</small></div>`)}</div>` : html`<p class="caption">当前沙箱未启用 MCP 服务。</p>`}
-        ${security.last_isolation && html`<p class="caption">最近一次隔离检查：${new Date(security.last_isolation.finished_at).toLocaleString()}，${checkCountsText(security.last_isolation.results)}。</p>`}
-      </div>`}
+        <div class="security-controls">${security.controls.map((item) => html`<div class="security-control" key=${item.id}>
+          <span class="security-control-icon"><${Icon} name=${CONTROL_ICONS[item.id] ?? "shield"} size=${17} /></span>
+          <div><strong>${item.name}</strong><p>${item.detail}</p></div></div>`)}</div>
+        <h4 class="security-subhead">MCP 权限</h4>
+        ${security.mcp.length ? html`<ul class="security-mcp-list">${security.mcp.map((item) => html`<li key=${item.id}>
+          <span class="security-mcp-name"><${Icon} name=${item.connector ? "database" : "plug"} size=${16} />${item.name}</span>
+          <span class="caption">${item.connector ? "连接器" : "远程服务"} · 工具 ${item.granted_tools.length}/${item.catalog_tools.length} · ${item.explicit_grant ? "沙箱专属" : item.connector ? "默认目录" : "默认只读"}</span>
+          <span class=${`pill ${item.key_saved ? "ok" : "warn"}`}>${item.key_saved ? "凭据可用" : "需要登录或配置"}</span></li>`)}</ul>`
+          : html`<p class="caption">当前沙箱未启用 MCP 服务。</p>`}
+        ${security.last_isolation && html`<p class="caption security-foot"><${Icon} name="clock" size=${15} />最近一次隔离检查：${new Date(security.last_isolation.finished_at).toLocaleString()}，${checkCountsText(security.last_isolation.results)}。</p>`}
+      </section>`}
       <div class="metric-grid">
         <div class="panel metric"><span><${Icon} name="cpu" />CPU</span><strong>${valid ? `${s.cpu_percent.toFixed(1)}%` : "—"}</strong><small>100% = 1 个核心</small></div>
         <div class="panel metric"><span><${Icon} name="memory" />内存</span><strong>${valid ? bytes(s.memory_bytes) : "—"}</strong><small>所有运行组件之和</small></div>
