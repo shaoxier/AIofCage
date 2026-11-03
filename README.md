@@ -25,7 +25,7 @@ brew install colima docker
 下载 `AiofCage-版本号-arm64.dmg` 和同名的 `.sha256` 文件，放在同一个文件夹，在终端里核对（把版本号换成实际下载的）：
 
 ```bash
-cd ~/Downloads && shasum -a 256 -c AiofCage-0.1.2-arm64.dmg.sha256
+cd ~/Downloads && shasum -a 256 -c AiofCage-0.1.3-arm64.dmg.sha256
 ```
 
 显示 `OK` 再继续。
