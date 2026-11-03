@@ -55,7 +55,7 @@
 ## 未验证
 
 - **另一台 Mac 或新账户试装**：浏览器下载后打开、放行，再完成新手教程，这一步需要用户来做。系统提示的原话以实际看到的为准。
-- **发布到 GitHub Releases**：写这份记录时没有发布。之后按用户要求发布了 [v0.1.0](https://github.com/shaoxier/AIofCage/releases/tag/v0.1.0)（10-31，构建自 3d1bb4c）、v0.1.1（11-02，含决赛前实测问题的修复和思考强度改动）和 v0.1.2（11-02，含对话页改版、左侧图标导航和任意文件附件），安装包和 SHA256 文件见 [Releases](https://github.com/shaoxier/AIofCage/releases) 页面。
+- **发布到 GitHub Releases**：写这份记录时没有发布。之后按用户要求发布了 [v0.1.0](https://github.com/shaoxier/AIofCage/releases/tag/v0.1.0)（10-31，构建自 3d1bb4c）、v0.1.1（11-02，含决赛前实测问题的修复和思考强度改动）、v0.1.2（11-02，含对话页改版、左侧图标导航和任意文件附件）和 v0.1.3（11-03，含自动恢复工作区、安全诊断中心排版和停止加固），安装包和 SHA256 文件见 [Releases](https://github.com/shaoxier/AIofCage/releases) 页面。
 - **本机试运行**：没有在本机打开安装包里的应用，因为会弹出窗口并读写用户正在用的数据。安装包里的应用就是 `make app` 的产物，只多写了版本号。
 
 ## 限制
